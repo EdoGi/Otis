@@ -273,7 +273,11 @@ class MenuBarApp:
     # =====================================================================
     def run(self) -> None:
         """Start detection + the rumps event loop. Blocks until Quit."""
-        logger.info("Starting MenuBarApp (working dir=%s).", os.getcwd())
+        n_pollers = len(getattr(self._detector, "calendar_pollers", ()))
+        logger.info(
+            "Starting MenuBarApp (cwd=%s, pollers=%d, icons=%s).",
+            os.getcwd(), n_pollers, self._icons_dir,
+        )
         self._detector.start()
         try:
             self._app.run()
@@ -445,15 +449,19 @@ class MenuBarApp:
         self._detector.on_process_disappeared(self._cb_process_gone)
 
     def _cb_approaching(self, ctx: MeetingContext) -> None:
+        logger.debug("detector → approaching: %s", ctx.title)
         self._events.put(("approaching", ctx))
 
     def _cb_detected(self, ctx: MeetingContext) -> None:
+        logger.debug("detector → detected: app=%s title=%s", ctx.app, ctx.title)
         self._events.put(("detected", ctx))
 
     def _cb_ended(self, ctx: MeetingContext) -> None:
+        logger.debug("detector → ended: %s", ctx.title or ctx.app)
         self._events.put(("ended", ctx))
 
     def _cb_process_gone(self, app_name: str) -> None:
+        logger.debug("detector → process gone: %s", app_name)
         self._events.put(("process_gone", app_name))
 
     # =====================================================================
@@ -473,6 +481,10 @@ class MenuBarApp:
     def _handle_event(self, event_type: str, payload: Any) -> None:
         if event_type == "approaching":
             ctx: MeetingContext = payload
+            logger.info(
+                "UI ← APPROACHING (%s, link=%s)",
+                ctx.title or "(untitled)", ctx.meeting_link or "-",
+            )
             self._set_state(UiState.APPROACHING, current_meeting=ctx)
             self._notifications.notify(
                 NotificationType.MEETING_APPROACHING,
@@ -481,6 +493,10 @@ class MenuBarApp:
             )
         elif event_type == "detected":
             ctx = payload
+            logger.info(
+                "UI ← DETECTED (app=%s, title=%s)",
+                ctx.app, ctx.title or "(no calendar)",
+            )
             self._set_state(UiState.DETECTED, current_meeting=ctx)
             self._start_blink()
             self._notifications.notify(
@@ -661,12 +677,26 @@ class MenuBarApp:
             elif state in (UiState.IDLE, UiState.OFF_HOURS):
                 self._snapshot.recording_started_monotonic = None
                 self._snapshot.current_meeting = None
+
         self._set_icon(state)
+        # Clear the menu-bar title text whenever we leave RECORDING. The
+        # duration tick handler also clears it, but it only fires while the
+        # timer is running — once we stop the timer (in _do_stop_if_recording)
+        # no further ticks happen, so the last MM:SS value would otherwise
+        # stay glued next to the icon. Clearing here is the authoritative path.
+        if state != UiState.RECORDING:
+            try:
+                self._app.title = ""
+            except Exception:
+                logger.exception("Could not clear menu-bar title")
+
         self._refresh_menu_visibility()
 
     def _set_icon(self, state: str) -> None:
+        path = self._icons.get(state, self._icons["idle"])
         try:
-            self._app.icon = str(self._icons.get(state, self._icons["idle"]))
+            self._app.icon = str(path)
+            logger.debug("icon → %s (%s)", state, path.name)
         except Exception:  # pragma: no cover
             logger.exception("Could not set icon for state %s", state)
 

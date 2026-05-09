@@ -28,12 +28,44 @@ logger = logging.getLogger("otis")
 
 
 def _configure_logging(level: str) -> None:
+    """Set up console + ~/.otis/otis.log file logging.
+
+    The file handler is critical for the menu-bar app: when launched from a
+    Login Item there's no terminal attached, so the log file is the only way
+    to see what detection saw and what the menu-bar reacted to.
+    """
+    from logging.handlers import RotatingFileHandler
+
     numeric = getattr(logging, level.upper(), logging.INFO)
-    logging.basicConfig(
-        level=numeric,
-        format="%(asctime)s [%(levelname)-7s] %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)-7s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
+
+    root = logging.getLogger()
+    root.setLevel(numeric)
+    # Clear any handlers added by a previous call (re-runs in tests / REPL).
+    for h in list(root.handlers):
+        root.removeHandler(h)
+
+    # Console
+    console = logging.StreamHandler()
+    console.setFormatter(fmt)
+    root.addHandler(console)
+
+    # File — keep five 1 MB rotations under ~/.otis/otis.log.
+    try:
+        log_dir = Path("~/.otis").expanduser()
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / "otis.log"
+        file_handler = RotatingFileHandler(
+            log_file, maxBytes=1_000_000, backupCount=5, encoding="utf-8"
+        )
+        file_handler.setFormatter(fmt)
+        root.addHandler(file_handler)
+        logger.info("Logging to %s (level=%s).", log_file, level.upper())
+    except Exception as exc:  # pragma: no cover (e.g. read-only HOME)
+        logger.warning("Could not enable file logging: %s", exc)
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
