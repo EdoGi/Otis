@@ -9,6 +9,14 @@ worrying about:
   ``rate_limit_seconds`` window),
 * failures bubbling up — Notification Center can be disabled per-app and we
   don't want that to crash the daemon.
+
+Limitations (V1)
+----------------
+* **No action buttons.** ``rumps.notification`` doesn't support clickable
+  actions — the user always has to click the menu-bar icon to act. Adding
+  rich notifications via ``UNUserNotificationCenter`` (pyobjc) is a V2
+  enhancement. That's why "Stop recording?" prompts deliver as plain text
+  rather than as a button.
 """
 
 from __future__ import annotations
@@ -115,7 +123,13 @@ def format_transcription_complete(meeting_title: str, duration_minutes: float) -
 
 
 def format_process_disappeared(app_name: str) -> tuple[str, str]:
-    return "Meeting app exited", f"{app_name} closed — Stop recording?"
+    """Title + body for the advisory 'process exited mid-recording' nudge.
+
+    Wording deliberately phrased as a question to match the Phase 3 review
+    spec ("Meeting seems to have ended — Stop recording?") — though we can't
+    actually offer a clickable Stop button (see V1 limitations above).
+    """
+    return "Meeting seems to have ended", f"{app_name} closed. Stop recording?"
 
 
 def silent_backend(_title: str, _subtitle: str, _message: str) -> None:  # pragma: no cover

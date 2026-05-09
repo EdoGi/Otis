@@ -124,7 +124,9 @@ def test_format_transcription_complete_rounds_zero_for_short() -> None:
     assert body == "ad-hoc (0 min)"
 
 
-def test_format_process_disappeared() -> None:
+def test_format_process_disappeared_matches_phase3_wording() -> None:
+    """Phase 3 review wants the question 'Meeting seems to have ended — Stop recording?'."""
     title, body = format_process_disappeared("zoom.us")
-    assert "exited" in title.lower()
+    assert "seems to have ended" in title.lower()
     assert "zoom.us" in body
+    assert "stop recording" in body.lower()

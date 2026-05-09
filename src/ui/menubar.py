@@ -260,7 +260,9 @@ class MenuBarApp:
         self._events: queue.Queue[tuple[str, Any]] = queue.Queue()
         self._lock = threading.RLock()
 
-        self._snapshot = UiSnapshot()
+        self._snapshot = UiSnapshot(
+            selected_language_code=config.get("transcription", "language"),
+        )
         self._recorder: DualStreamRecorder | None = None
         self._blink_phase = 0  # 0 / 1, used by blink timer
 
@@ -278,11 +280,53 @@ class MenuBarApp:
             "Starting MenuBarApp (cwd=%s, pollers=%d, icons=%s).",
             os.getcwd(), n_pollers, self._icons_dir,
         )
-        self._detector.start()
+        self._warn_if_blackhole_missing()
+
+        # Honour the working-hours window from the very first tick — otherwise
+        # we'd run detection for up to ``SCHEDULE_CHECK_INTERVAL`` seconds even
+        # though we're outside the window.
+        in_window = is_within_working_hours(
+            datetime.now(),
+            working_days=self._config.get("app", "working_days", default=[0, 1, 2, 3, 4]),
+            start_hhmm=self._config.get("app", "working_hours", "start", default="08:00"),
+            end_hhmm=self._config.get("app", "working_hours", "end", default="20:00"),
+        )
+        if in_window:
+            self._detector.start()
+        else:
+            logger.info("Launched outside working hours; detection paused.")
+            self._set_state(UiState.OFF_HOURS)
+
         try:
             self._app.run()
         finally:
             self._teardown()
+
+    def _warn_if_blackhole_missing(self) -> None:
+        """Surface a one-time warning if BlackHole + Multi-Output isn't set up.
+
+        Fully non-fatal — recording still works mic-only. We just nudge the
+        user so they know why the system audio file is empty.
+        """
+        try:
+            from src.audio.blackhole_check import verify_blackhole_setup
+
+            status = verify_blackhole_setup()
+        except Exception:  # pragma: no cover (defensive)
+            logger.exception("BlackHole check raised on startup")
+            return
+        if status.ok:
+            return
+        logger.warning(
+            "BlackHole / Multi-Output not configured: %s",
+            "; ".join(status.issues) or "see check-audio output",
+        )
+        self._notifications.notify(
+            NotificationType.ERROR,
+            "BlackHole not configured",
+            "System audio won't be captured. Run scripts/setup_blackhole.sh.",
+            force=True,
+        )
 
     # ---- read-only views, mostly for tests ----
     @property
@@ -553,6 +597,12 @@ class MenuBarApp:
         with self._lock:
             self._snapshot.selected_language_code = code
         self._update_language_menu(code)
+        # Persist so the choice survives restart and Phase 4's transcription
+        # pipeline picks it up via load_user_config().
+        write_user_config_override(
+            self._user_config_path,
+            {"transcription": {"language": code}},
+        )
 
     def _on_model_picked(self, sender: Any) -> None:
         model = sender.title
@@ -635,6 +685,14 @@ class MenuBarApp:
         self._app.title = self._snapshot.title_text()
 
     def _on_schedule_tick(self, _timer: Any) -> None:
+        """Move into / out of OFF_HOURS based on the working-hours window.
+
+        Critical: an active recording must NEVER be interrupted by this. If the
+        user starts recording during off-hours (manually) we leave the state
+        machine alone so the recorder UI keeps working. The off-hours
+        transition only happens from neutral states (IDLE / APPROACHING /
+        DETECTED).
+        """
         in_window = is_within_working_hours(
             datetime.now(),
             working_days=self._config.get("app", "working_days", default=[0, 1, 2, 3, 4]),
@@ -642,7 +700,15 @@ class MenuBarApp:
             end_hhmm=self._config.get("app", "working_hours", "end", default="20:00"),
         )
         with self._lock:
-            currently_off = self._snapshot.state == UiState.OFF_HOURS
+            current_state = self._snapshot.state
+
+        # Don't fiddle with state during active recording / paused / processing —
+        # transitioning to OFF_HOURS would clear recorder context and hide the
+        # Stop button.
+        if current_state in (UiState.RECORDING, UiState.PAUSED, UiState.PROCESSING):
+            return
+
+        currently_off = current_state == UiState.OFF_HOURS
         if not in_window and not currently_off:
             logger.info("Entering off-hours; pausing detector.")
             try:
