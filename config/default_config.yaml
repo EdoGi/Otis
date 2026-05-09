@@ -1,0 +1,73 @@
+app:
+  name: "Otis"
+  launch_at_login: true
+  working_days: [0, 1, 2, 3, 4]  # 0=Monday, 1=Tuesday, ..., 6=Sunday (matches Python datetime.weekday())
+  working_hours:
+    start: "08:00"
+    end: "20:00"
+
+audio:
+  mic_device: null  # null = system default
+  system_audio_device: "BlackHole 2ch"
+  sample_rate: 16000
+  channels: 1  # mono per stream
+  format: "wav"
+
+detection:
+  process_monitor:
+    enabled: true
+    poll_interval_seconds: 5
+    whitelisted_apps:
+      - "zoom.us"
+      - "Microsoft Teams"
+      - "Webex"
+      - "Slack"
+      - "FaceTime"
+    blacklisted_apps:
+      - "SuperWhisper"
+  calendar:
+    enabled: true
+    poll_interval_seconds: 60
+    pre_meeting_alert_minutes: 2
+    provider: "google"
+    # One poller per Google account you want to watch.
+    # ─ Single personal account: leave one entry below (label: "personal").
+    # ─ Personal + work (Workspace): add a second entry with a different label
+    #   and run `./scripts/setup_google_cal.sh work` to authenticate it.
+    # The OAuth client (credentials.json) can be shared across all accounts;
+    # tokens are per-account and stored separately.
+    accounts:
+      - label: "personal"
+        credentials_path: "~/.otis/credentials.json"
+        token_path: "~/.otis/google_token.json"
+        # IDs of the calendars to read on this account. "primary" is the
+        # account's main calendar (your @gmail.com address). Run
+        # `python scripts/list_calendars.py` to discover others.
+        calendar_ids:
+          - "primary"
+      - label: "work"
+        credentials_path: "~/.otis/credentials.json"
+        token_path: "~/.otis/google_token_work.json"
+        calendar_ids:
+          - "primary"
+  mic_activation:
+    enabled: true
+    trigger_apps_only: true  # only trigger if mic is grabbed by a whitelisted app
+
+transcription:
+  engine: "mlx-whisper"  # mlx-whisper (recommended, native Apple Silicon)
+  model: "small"  # tiny, base, small, medium, large-v3
+  language: null  # null = auto-detect
+
+storage:
+  transcript_dir: "~/Otis/transcripts"
+  audio_dir: "~/Otis/audio"
+  audio_retention_days: 30
+
+web:
+  port: 8765
+  host: "127.0.0.1"
+
+mcp:
+  enabled: true
+  port: 8766

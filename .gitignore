@@ -1,0 +1,72 @@
+# ---------------------------------------------------------------- Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+build/
+dist/
+pip-wheel-metadata/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.cache/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.hypothesis/
+
+# ------------------------------------------------------------- venvs
+.venv/
+.venv-*/
+venv/
+env/
+ENV/
+
+# ------------------------------------------------------------- macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+
+# ------------------------------------------------------- Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+
+# ------------------------------------------------- Otis runtime artifacts
+# Local recordings and any per-machine output. NEVER commit audio.
+smoke_out/
+*.wav
+*.flac
+*.m4a
+*_metadata.json
+
+# Local Claude Code project settings (per-user permissions).
+.claude/settings.local.json
+
+# User-specific config overrides created by the menu bar at runtime —
+# the bundled config/default_config.yaml is what ships in the repo.
+config/local.yaml
+config/*.local.yaml
+
+# Anything that looks like a secret. Belt-and-braces — no credentials should
+# ever be inside the project tree (they live in ~/.otis/), but if someone
+# slips up, this catches it.
+credentials.json
+*credentials*.json
+*token*.json
+*.pem
+*.key
+.env
+.env.*
+secrets/

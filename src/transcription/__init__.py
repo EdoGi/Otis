@@ -1,0 +1,1 @@
+"""Whisper-based transcription pipeline."""
