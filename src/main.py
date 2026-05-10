@@ -231,6 +231,7 @@ def _run_menubar(cfg: Config) -> int:
         recorder_factory=recorder_factory,
         notifications=notifications,
         transcription_handler=transcription_handler,
+        transcript_store=store,
     )
     try:
         app.run()

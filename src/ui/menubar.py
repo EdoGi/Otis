@@ -54,6 +54,7 @@ from src.detection.detector import (
     MeetingDetector,
     MeetingState,
 )
+from src.storage.transcript_store import TranscriptStore
 from src.ui.icons import ensure_icons
 from src.ui.notifications import (
     NotificationManager,
@@ -241,6 +242,7 @@ class MenuBarApp:
         recorder_factory: Callable[[Config], DualStreamRecorder],
         notifications: NotificationManager | None = None,
         transcription_handler: TranscriptionHandler | None = None,
+        transcript_store: TranscriptStore | None = None,
         icons_dir: Path | None = None,
         user_config_path: Path | None = None,
         rumps_app_factory: Callable[..., Any] | None = None,
@@ -250,6 +252,7 @@ class MenuBarApp:
         self._recorder_factory = recorder_factory
         self._notifications = notifications or NotificationManager()
         self._transcribe = transcription_handler or _default_transcription_handler
+        self._store = transcript_store
         self._icons_dir = (icons_dir or Path("~/.otis/icons")).expanduser()
         self._user_config_path = (
             user_config_path or Path("~/.otis/config.yaml")
@@ -401,9 +404,10 @@ class MenuBarApp:
         self._mi["settings_root"] = rumps.MenuItem("Settings")
         self._build_settings_submenu(self._mi["settings_root"])
 
-        # Recent transcripts (populated lazily; placeholder for now)
+        # Recent transcripts — populated from disk now and refreshed after
+        # each transcription completes.
         self._mi["recent_root"] = rumps.MenuItem("Recent Transcripts")
-        self._mi["recent_root"].add(rumps.MenuItem("(no transcripts yet)"))
+        self._refresh_recent_menu()
 
         # About / Quit
         self._mi["about"] = rumps.MenuItem("About Otis", callback=self._on_about)
@@ -564,6 +568,10 @@ class MenuBarApp:
             # Used by background threads (e.g. the transcription worker) to
             # request a state change on the main thread.
             self._set_state(payload)
+        elif event_type == "refresh_recent":
+            # The transcription worker just landed (or failed); reload the
+            # Recent Transcripts submenu so the new item shows up.
+            self._refresh_recent_menu()
 
     # =====================================================================
     # User-clicked menu callbacks (main-thread, courtesy of rumps)
@@ -812,6 +820,71 @@ class MenuBarApp:
         except Exception:  # pragma: no cover (older rumps)
             menu_item.set_callback(menu_item._callback if visible else None)
 
+    def _refresh_recent_menu(self, *, limit: int = 5) -> None:
+        """Rebuild the Recent Transcripts submenu from the store.
+
+        Called once at startup and again after every transcription completes.
+        Falls back to a "(no transcripts yet)" placeholder when the store
+        isn't wired (tests) or is genuinely empty.
+        """
+        import rumps
+
+        root = self._mi.get("recent_root")
+        if root is None:
+            return
+
+        # Clear whatever's there. rumps.MenuItem supports dict-style key access.
+        try:
+            for key in list(root.keys()):
+                del root[key]
+        except Exception:  # pragma: no cover (older rumps)
+            pass
+
+        entries: list[dict[str, Any]] = []
+        if self._store is not None:
+            try:
+                entries = self._store.list_transcripts(limit=limit)
+            except Exception:
+                logger.exception("Could not list transcripts for the Recent menu")
+                entries = []
+
+        if not entries:
+            root.add(rumps.MenuItem("(no transcripts yet)"))
+            return
+
+        for fm in entries:
+            label = self._format_recent_label(fm)
+            item = rumps.MenuItem(label, callback=self._on_recent_picked)
+            item._otis_transcript_id = fm.get("id")  # type: ignore[attr-defined]
+            root.add(item)
+
+    @staticmethod
+    def _format_recent_label(fm: dict[str, Any]) -> str:
+        date = str(fm.get("date") or "")
+        time_ = str(fm.get("start_time") or "")
+        title = str(fm.get("title") or "(untitled)")
+        prefix = f"{date} {time_}".strip() or "—"
+        # Cap length so wide menus don't push off the screen.
+        max_title = 50
+        if len(title) > max_title:
+            title = title[: max_title - 1] + "…"
+        return f"{prefix}  {title}"
+
+    def _on_recent_picked(self, sender: Any) -> None:
+        transcript_id = getattr(sender, "_otis_transcript_id", None)
+        if not transcript_id or self._store is None:
+            return
+        record = self._store.get_transcript(transcript_id)
+        if record is None:
+            self._notifications.notify(
+                NotificationType.ERROR,
+                "Transcript not found",
+                "The file may have been moved or deleted.",
+                force=True,
+            )
+            return
+        self._open_in_finder(record["path"])
+
     def _update_language_menu(self, code: str | None) -> None:
         title = "Auto-detect"
         for label, c in SUPPORTED_LANGUAGES:
@@ -920,6 +993,11 @@ class MenuBarApp:
         except Exception as exc:
             succeeded = False
             logger.exception("Transcription handler raised")
+            # Save a placeholder transcript so the user can SEE the failure
+            # in the Recent menu / web UI later, instead of having to grep
+            # the log file. Best-effort — if the store is unavailable we
+            # just notify and move on.
+            self._save_failure_placeholder(metadata, exc)
             self._notifications.notify(
                 NotificationType.ERROR, "Transcription failed", str(exc), force=True
             )
@@ -941,6 +1019,33 @@ class MenuBarApp:
             logger.exception("Detector transcription_finished raised")
         # Back to IDLE on the main thread via the queue (we're in a bg thread).
         self._events.put(("force_state", UiState.IDLE))
+        # Whether we succeeded or not, the Recent menu has new content to show.
+        self._events.put(("refresh_recent", None))
+
+    def _save_failure_placeholder(
+        self, metadata: dict[str, Any], error: BaseException,
+    ) -> None:
+        if self._store is None:
+            return
+        meeting = metadata.get("_meeting") or {}
+        try:
+            self._store.save_failure(
+                session_id=str(metadata.get("session_id") or "unknown"),
+                error=error,
+                title=meeting.get("title"),
+                app=meeting.get("app"),
+                participants=[
+                    _participant_to_str(p) for p in (meeting.get("participants") or [])
+                ],
+                model=str(self._config.get("transcription", "model", default="small")),
+                audio_files={
+                    "mic": metadata.get("mic_wav"),
+                    "system": metadata.get("system_wav"),
+                },
+                language=metadata.get("_language"),
+            )
+        except Exception:
+            logger.exception("Could not save failure placeholder transcript")
 
     @staticmethod
     def _meeting_title_for(metadata: dict[str, Any]) -> str:
@@ -992,3 +1097,16 @@ def _default_transcription_handler(metadata: dict[str, Any]) -> None:
         "(Phase 4 will replace this with mlx-whisper.)",
         metadata.get("mic_wav"),
     )
+
+
+def _participant_to_str(p: Any) -> str:
+    """Format a participant entry (dict or str) into ``"Name <email>"``."""
+    if isinstance(p, str):
+        return p
+    if isinstance(p, dict):
+        name = p.get("name") or ""
+        email = p.get("email") or ""
+        if name and email:
+            return f"{name} <{email}>"
+        return name or email or "unknown"
+    return str(p)

@@ -289,3 +289,61 @@ def test_mark_audio_unavailable_updates_frontmatter(tmp_path: Path) -> None:
     store.mark_audio_unavailable("x")
     fresh = store.get_transcript("x")["metadata"]
     assert fresh["audio_available"] is False
+
+
+# ---------------------------------------------------------------------------
+# Failure placeholders
+# ---------------------------------------------------------------------------
+def test_save_failure_writes_status_failed_transcript(tmp_path: Path) -> None:
+    store = TranscriptStore(tmp_path)
+    err = RuntimeError("network unreachable")
+    path = store.save_failure(
+        session_id="abc-123",
+        error=err,
+        title="Customer Sync",
+        app="zoom.us",
+        participants=["Alice <alice@x.com>"],
+        model="medium",
+        audio_files={"mic": "2026/05/2026-05-12_0312_mic.wav", "system": None},
+        language="en",
+    )
+    assert path.exists()
+    rec = store.get_transcript("abc-123")
+    assert rec is not None
+    fm = rec["metadata"]
+    assert fm["status"] == "failed"
+    assert fm["error_type"] == "RuntimeError"
+    assert fm["error"] == "network unreachable"
+    assert fm["tags"] == ["failed"]
+    assert "failed" in fm["title"].lower()
+    # Audio paths preserved so the user can retranscribe later.
+    assert fm["audio_files"]["mic"].endswith("_mic.wav")
+    # Body has the retry instruction.
+    body = rec["body"]
+    assert "retranscribe" in body.lower()
+    assert "RuntimeError" in body
+
+
+def test_save_failure_appears_in_listing_with_failed_tag(tmp_path: Path) -> None:
+    store = TranscriptStore(tmp_path)
+    store.save(_fm(session_id="ok-1"), "## Transcript")
+    store.save_failure(
+        session_id="bad-1",
+        error=ValueError("bad audio"),
+        title="Sprint Planning",
+    )
+    listed_failed = store.list_transcripts(tag="failed")
+    assert {fm["id"] for fm in listed_failed} == {"bad-1"}
+    listed_all = store.list_transcripts()
+    assert {fm["id"] for fm in listed_all} == {"ok-1", "bad-1"}
+
+
+def test_save_failure_with_unknown_audio_paths_uses_placeholder_text(tmp_path: Path) -> None:
+    store = TranscriptStore(tmp_path)
+    path = store.save_failure(
+        session_id="no-audio",
+        error=RuntimeError("oom"),
+        title="Pre-recording crash",
+    )
+    body = path.read_text()
+    assert "Audio file path unknown" in body

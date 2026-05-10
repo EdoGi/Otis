@@ -36,7 +36,7 @@ import os
 import re
 import shutil
 from collections.abc import Iterable
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -351,6 +351,95 @@ class TranscriptStore:
         Called by :class:`AudioRetentionManager` after deleting WAV files.
         """
         return self.update_frontmatter(session_id, {"audio_available": False})
+
+    # =====================================================================
+    # Failure placeholders
+    # =====================================================================
+    def save_failure(
+        self,
+        *,
+        session_id: str,
+        error: BaseException,
+        title: str | None = None,
+        app: str | None = None,
+        participants: list[str] | None = None,
+        model: str | None = None,
+        audio_files: dict[str, str | None] | None = None,
+        start_wall_clock: datetime | None = None,
+        language: str | None = None,
+    ) -> Path:
+        """Save a placeholder transcript for a failed transcription.
+
+        The placeholder lives in the same ``YYYY/MM/`` tree as successful
+        transcripts so it shows up in listings — but with ``status: failed``
+        and a tag of ``failed`` so the user can find / filter / retry. The
+        body explains the error and tells them how to retry.
+        """
+        when = (start_wall_clock or datetime.now(timezone.utc)).astimezone()
+        clean_title = (title or "").strip() or "Recording"
+        fm: dict[str, Any] = {
+            "id": session_id,
+            "title": f"{clean_title} — failed",
+            "date": when.strftime("%Y-%m-%d"),
+            "start_time": when.strftime("%H:%M"),
+            "end_time": when.strftime("%H:%M"),
+            "duration_minutes": 0,
+            "language": language,
+            "app": app,
+            "participants": list(participants or []),
+            "tags": ["failed"],
+            "audio_files": dict(audio_files or {"mic": None, "system": None}),
+            "audio_available": True,
+            "model": model,
+            "status": "failed",
+            "error_type": type(error).__name__,
+            "error": str(error),
+        }
+        body = self._render_failure_body(
+            session_id=session_id,
+            title=clean_title,
+            error=error,
+            audio_files=fm["audio_files"],
+            when=when,
+        )
+        return self.save(fm, body)
+
+    @staticmethod
+    def _render_failure_body(
+        *,
+        session_id: str,
+        title: str,
+        error: BaseException,
+        audio_files: dict[str, str | None],
+        when: datetime,
+    ) -> str:
+        timestamp = when.strftime("%Y-%m-%d %H:%M")
+        lines: list[str] = [
+            f"# {title} — failed ({timestamp})",
+            "",
+            f"**`{type(error).__name__}`**: {error}",
+            "",
+            "## Recording",
+            "",
+        ]
+        mic = audio_files.get("mic")
+        sysw = audio_files.get("system")
+        if mic:
+            lines.append(f"- mic: `{mic}`")
+        if sysw:
+            lines.append(f"- system: `{sysw}`")
+        if not mic and not sysw:
+            lines.append("_Audio file path unknown — check `~/Otis/audio/`._")
+        lines += [
+            "",
+            "## Retry",
+            "",
+            "```sh",
+            f"python scripts/retranscribe.py {session_id[:8]}",
+            "```",
+            "",
+        ]
+        return "\n".join(lines)
 
     # =====================================================================
     # Internals
