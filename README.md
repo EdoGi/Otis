@@ -54,6 +54,16 @@ After running `./scripts/setup.sh` once, build the bundle:
 mv dist/Otis.app /Applications/
 ```
 
+**First launch only — bypass Gatekeeper.** Otis is locally built (no Apple
+Developer ID), so macOS blocks `open` by default. You need to right-click the
+.app once:
+
+1. Open `/Applications/` in Finder.
+2. **Right-click** (or Ctrl-click) on `Otis.app` → **Open**.
+3. Click **Open** in the "unidentified developer" dialog.
+
+After that, double-click and Spotlight work normally.
+
 Now Otis is a real first-class macOS app:
 
 - Open it from **Spotlight** (`⌘+Space` → "Otis" ⏎) or **Launchpad**.
