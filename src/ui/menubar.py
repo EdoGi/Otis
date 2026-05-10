@@ -839,6 +839,22 @@ class MenuBarApp:
         metadata = self._do_stop_if_recording()
         if not metadata:
             return
+        # Decorate the recorder metadata with everything the transcription
+        # handler needs: the user's chosen Whisper language and the live
+        # meeting context (title, app, attendees) from the detector.
+        with self._lock:
+            metadata["_language"] = self._snapshot.selected_language_code
+            current = self._snapshot.current_meeting
+        if current is not None:
+            metadata["_meeting"] = {
+                "title": current.title,
+                "app": current.app,
+                "participants": list(current.participants),
+                "meeting_link": current.meeting_link,
+                "calendar_event_id": current.calendar_event_id,
+            }
+        else:
+            metadata["_meeting"] = {"title": None, "app": None, "participants": []}
         self._set_state(UiState.PROCESSING)
         # Run the transcription handler in a background thread so the menu bar
         # stays responsive.
@@ -877,20 +893,28 @@ class MenuBarApp:
             self._detector.transcription_started()
         except Exception:  # pragma: no cover
             logger.exception("Detector transcription_started raised")
+
+        succeeded = True
         try:
             self._transcribe(metadata)
         except Exception as exc:
+            succeeded = False
             logger.exception("Transcription handler raised")
             self._notifications.notify(
                 NotificationType.ERROR, "Transcription failed", str(exc), force=True
             )
-        title, body = format_transcription_complete(
-            self._meeting_title_for(metadata),
-            duration_minutes=self._estimate_duration_min(metadata),
-        )
-        self._notifications.notify(
-            NotificationType.TRANSCRIPTION_COMPLETE, title, body, force=True
-        )
+
+        # Only fire the "Transcript ready" toast on actual success — earlier
+        # versions sent it even after a failure, which was misleading.
+        if succeeded:
+            title, body = format_transcription_complete(
+                self._meeting_title_for(metadata),
+                duration_minutes=self._estimate_duration_min(metadata),
+            )
+            self._notifications.notify(
+                NotificationType.TRANSCRIPTION_COMPLETE, title, body, force=True
+            )
+
         try:
             self._detector.transcription_finished()
         except Exception:  # pragma: no cover

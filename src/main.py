@@ -18,6 +18,7 @@ import argparse
 import logging
 import sys
 from pathlib import Path
+from typing import Any
 
 from src.audio.blackhole_check import format_setup_instructions, verify_blackhole_setup
 from src.audio.devices import DeviceManager
@@ -136,9 +137,18 @@ def _run_menubar(cfg: Config) -> int:
     from src.detection.calendar_poller import build_pollers_from_config
     from src.detection.detector import MeetingDetector
     from src.detection.process_monitor import ProcessMonitor
+    from src.storage.audio_retention import AudioRetentionManager
+    from src.storage.transcript_store import TranscriptStore
+    from src.transcription.processor import (
+        MeetingSnapshot,
+        RecordingSession,
+        TranscriptProcessor,
+    )
+    from src.transcription.whisper_engine import WhisperEngine
     from src.ui.menubar import MenuBarApp
     from src.ui.notifications import NotificationManager
 
+    # ---- detection ---------------------------------------------------------
     pm_cfg = cfg.get("detection", "process_monitor", default={}) or {}
     process_monitor = None
     if pm_cfg.get("enabled", True):
@@ -161,8 +171,10 @@ def _run_menubar(cfg: Config) -> int:
         calendar_pollers=calendar_pollers,
     )
 
+    # ---- audio recording ---------------------------------------------------
+    audio_dir = Path(cfg.get("storage", "audio_dir", default="~/Otis/audio")).expanduser()
+
     def recorder_factory(_cfg: Config) -> DualStreamRecorder:
-        audio_dir = Path(_cfg.get("storage", "audio_dir", default="~/Otis/audio"))
         return DualStreamRecorder(
             audio_dir=audio_dir,
             sample_rate=int(_cfg.get("audio", "sample_rate", default=16000)),
@@ -171,13 +183,60 @@ def _run_menubar(cfg: Config) -> int:
             system_device=_cfg.get("audio", "system_audio_device", default="BlackHole 2ch"),
         )
 
+    # ---- transcription pipeline -------------------------------------------
+    transcript_dir = Path(
+        cfg.get("storage", "transcript_dir", default="~/Otis/transcripts")
+    ).expanduser()
+    store = TranscriptStore(transcript_dir)
+    engine = WhisperEngine(
+        model_name=str(cfg.get("transcription", "model", default="small")),
+    )
+    processor = TranscriptProcessor(
+        engine=engine,
+        store=store,
+        audio_dir=audio_dir,
+        model_name=engine.model_name,
+    )
+
+    # ---- audio retention ---------------------------------------------------
+    retention = AudioRetentionManager(
+        audio_dir=audio_dir,
+        transcript_store=store,
+        retention_days=int(cfg.get("storage", "audio_retention_days", default=30)),
+    )
+    retention.start_periodic()
+
+    # ---- transcription handler the menu bar calls on Stop ------------------
+    notifications = NotificationManager()
+
+    def transcription_handler(metadata: dict[str, Any]) -> None:
+        """Bridge from the menu bar's Stop & Transcribe to the real pipeline."""
+        session = RecordingSession.from_recorder_metadata(metadata, audio_dir=audio_dir)
+        meeting_dict = metadata.get("_meeting") or {}
+        meeting = MeetingSnapshot(
+            title=meeting_dict.get("title"),
+            app=meeting_dict.get("app"),
+            participants=list(meeting_dict.get("participants") or []),
+            meeting_link=meeting_dict.get("meeting_link"),
+            calendar_event_id=meeting_dict.get("calendar_event_id"),
+        )
+        language = metadata.get("_language")
+        # process() is synchronous; the menu bar already runs us in a worker
+        # thread, so we stay there to keep PROCESSING state coherent.
+        processor.process(session, meeting=meeting, language=language)
+
     app = MenuBarApp(
         config=cfg,
         detector=detector,
         recorder_factory=recorder_factory,
-        notifications=NotificationManager(),
+        notifications=notifications,
+        transcription_handler=transcription_handler,
     )
-    app.run()
+    try:
+        app.run()
+    finally:
+        retention.stop()
+        engine.shutdown()
     return 0
 
 
