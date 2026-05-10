@@ -7,6 +7,7 @@ __pycache__/
 *.egg-info/
 *.egg
 build/
+# scripts/build_app.sh writes the bundled .app here; per-machine, never tracked.
 dist/
 pip-wheel-metadata/
 .coverage

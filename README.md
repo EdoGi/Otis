@@ -45,6 +45,26 @@ idempotent — re-run it any time to verify your environment.
 
 ## Run
 
+### Daily use — double-click an `.app` (recommended)
+
+After running `./scripts/setup.sh` once, build the bundle:
+
+```bash
+./scripts/build_app.sh
+mv dist/Otis.app /Applications/
+```
+
+Now Otis is a real first-class macOS app:
+
+- Open it from **Spotlight** (`⌘+Space` → "Otis" ⏎) or **Launchpad**.
+- The Otis face shows up in the About dialog, force-quit window, and Notification Center.
+- Auto-launch at login: **System Settings → General → Login Items → `+` → /Applications/Otis.app**.
+
+Re-run `./scripts/build_app.sh` if you move the project folder. The `.app`
+itself is per-machine — not committed to the repo.
+
+### From the terminal
+
 ```bash
 ./scripts/run.sh                # menu-bar app (default)
 ./scripts/run.sh check-audio    # one-shot: BlackHole + audio device list
@@ -94,13 +114,13 @@ per 30 s.
 
 ## Auto-launch at login
 
-System Settings → General → Login Items → `+` → choose:
+After running `./scripts/build_app.sh`:
 
-```
-~/Documents/Otis/scripts/run.sh
-```
+System Settings → General → **Login Items** → `+` → `/Applications/Otis.app`.
 
-(Adjust the path if you cloned somewhere else.)
+(If you prefer not to build the bundle, you can also point Login Items at
+`~/Documents/Otis/scripts/run.sh` directly — works the same, just lacks the
+icon and Spotlight entry.)
 
 ## Permissions
 

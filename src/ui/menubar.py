@@ -272,6 +272,12 @@ class MenuBarApp:
         self._icons = ensure_icons(self._icons_dir)
         self._app = self._build_app(rumps_app_factory)
         self._wire_detector_callbacks()
+        # Brand the *application* icon (used in the About box, the force-quit
+        # window, Notification Center, etc.) so it isn't the Python framework
+        # logo when we run via `python -m src.main`. When we run from Otis.app
+        # the bundle's CFBundleIconFile already wins; calling this is a no-op
+        # there.
+        self._brand_application_icon()
 
     # =====================================================================
     # Public API
@@ -785,6 +791,30 @@ class MenuBarApp:
                 logger.exception("Could not clear menu-bar title")
 
         self._refresh_menu_visibility()
+
+    def _brand_application_icon(self) -> None:
+        """Override the global app icon (About dialog, notifications, etc.)
+        with the bundled :file:`OtisIcon.png` if it's available.
+
+        Wrapped in try/except — any pyobjc / AppKit failure should not stop
+        the menu bar from running.
+        """
+        try:
+            from src.ui.icons import DEFAULT_SOURCE_PATH
+
+            source = DEFAULT_SOURCE_PATH if DEFAULT_SOURCE_PATH.exists() else None
+            if source is None:
+                return
+            from AppKit import NSApplication, NSImage
+
+            image = NSImage.alloc().initWithContentsOfFile_(str(source))
+            if image is None:
+                logger.debug("Could not load app icon from %s", source)
+                return
+            NSApplication.sharedApplication().setApplicationIconImage_(image)
+            logger.debug("Application icon set to %s", source)
+        except Exception:  # pragma: no cover (non-macOS / pyobjc missing)
+            logger.exception("Could not set NSApplication icon")
 
     def _set_icon(self, state: str) -> None:
         path = self._icons.get(state, self._icons["idle"])
