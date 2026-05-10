@@ -272,8 +272,12 @@ def test_process_applies_monotonic_offset_to_system_segments(tmp_path: Path) -> 
     assert me_idx < them_idx
 
 
-def test_process_dedupes_echo_via_processor(tmp_path: Path) -> None:
-    """End-to-end: identical text from both tracks → only mic version remains."""
+def test_process_dedupes_echo_when_opted_in(tmp_path: Path) -> None:
+    """When ``dedup_echoes=True``, identical text from both tracks → only mic stays.
+
+    Default (False) preserves both streams; this test asserts the optional
+    dedup path still works for callers that explicitly want it.
+    """
     session = _make_recording_session(tmp_path)
     engine = _engine_returning(
         mic_segments=[(0.0, 2.0, "good morning everyone")],
@@ -281,13 +285,32 @@ def test_process_dedupes_echo_via_processor(tmp_path: Path) -> None:
     )
     store = TranscriptStore(tmp_path / "transcripts")
     processor = TranscriptProcessor(
-        engine=engine, store=store, audio_dir=session.audio_dir
+        engine=engine, store=store, audio_dir=session.audio_dir,
+        dedup_echoes=True,
     )
 
     result = processor.process(session, meeting=MeetingSnapshot())
     assert result.echo_dropped == 1
     assert "Participant: good morning everyone" not in result.body
     assert "Me: good morning everyone" in result.body
+
+
+def test_process_keeps_both_streams_by_default(tmp_path: Path) -> None:
+    """Default behaviour: same content on both tracks → both kept (no dedup)."""
+    session = _make_recording_session(tmp_path)
+    engine = _engine_returning(
+        mic_segments=[(0.0, 2.0, "good morning everyone")],
+        system_segments=[(0.05, 2.05, "good morning everyone")],
+    )
+    store = TranscriptStore(tmp_path / "transcripts")
+    processor = TranscriptProcessor(
+        engine=engine, store=store, audio_dir=session.audio_dir,
+    )
+
+    result = processor.process(session, meeting=MeetingSnapshot())
+    assert result.echo_dropped == 0
+    assert "Me: good morning everyone" in result.body
+    assert "Participant: good morning everyone" in result.body
 
 
 def test_process_handles_missing_system_audio(tmp_path: Path) -> None:

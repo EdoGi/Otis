@@ -177,6 +177,48 @@ def test_silent_wav_short_circuits_before_calling_whisper(tmp_path: Path) -> Non
     assert result.segments == []
 
 
+def test_quiet_head_then_audio_is_NOT_skipped(tmp_path: Path) -> None:
+    """Files with a silent head followed by audio must NOT be skipped.
+
+    Real-world bug: a system-audio recording where the user hit Start before
+    YouTube began playing — the first 5 s were dead silence, the rest was
+    normal speech. The earlier head-only RMS check skipped the file and
+    Whisper never ran on it. The peak-window scan fixes this.
+    """
+    import math
+    import struct
+
+    p = tmp_path / "quiet_head.wav"
+    rate = 16000
+    silence_seconds = 6
+    audible_seconds = 4
+    amp = 12000  # ~RMS 0.26, well above any threshold
+    frames = bytearray()
+    # 6 s of dead silence …
+    frames += b"\x00\x00" * (silence_seconds * rate)
+    # … then 4 s of a 440 Hz sine.
+    for i in range(audible_seconds * rate):
+        sample = int(amp * math.sin(2 * math.pi * 440.0 * i / rate))
+        frames += struct.pack("<h", sample)
+    with wave.open(str(p), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(rate)
+        wf.writeframes(bytes(frames))
+
+    called = {"hit": False}
+
+    def fake(*_a, **_kw):
+        called["hit"] = True
+        return {"text": "hello", "segments": [{"start": 0, "end": 1, "text": "hi"}]}
+
+    engine = WhisperEngine(transcribe_fn=fake)
+    engine.transcribe(p)
+    assert called["hit"] is True, (
+        "Pre-check must scan the whole file — a silent head shouldn't kill the run"
+    )
+
+
 def test_quiet_but_audible_wav_is_NOT_skipped(tmp_path: Path) -> None:
     """RMS ~0.003 (real-world quiet speech) must still be transcribed.
 

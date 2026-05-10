@@ -159,11 +159,19 @@ class TranscriptProcessor:
         store: TranscriptStore,
         audio_dir: str | Path,
         model_name: str | None = None,
+        dedup_echoes: bool = False,
     ) -> None:
         self._engine = engine
         self._store = store
         self._audio_dir = Path(audio_dir).expanduser()
         self._model_name = model_name or engine.model_name
+        # Echo dedup off by default. Real meetings often have both streams
+        # carrying the other person's voice (mic picks up speakers / earphone
+        # leak), and our heuristic was preferring the mic copy and dropping
+        # the system one — labeling the other speaker as "Me:". Keeping both
+        # tracks unfiltered is the safer default; ``[overlap]`` markers in
+        # the rendered Markdown still show when concurrent segments happen.
+        self._dedup_echoes = dedup_echoes
 
     # ------------------------------------------------------------------ sync
     def process(
@@ -226,7 +234,10 @@ class TranscriptProcessor:
         sys_segments = sys_result.segments if sys_result is not None else []
         offset = _compute_offset(mic_anchor, sys_anchor)
         sys_segments = apply_offset(sys_segments, offset)
-        deduped_sys, dropped = deduplicate_echo(sys_segments, mic_result.segments)
+        if self._dedup_echoes:
+            deduped_sys, dropped = deduplicate_echo(sys_segments, mic_result.segments)
+        else:
+            deduped_sys, dropped = sys_segments, 0
 
         labelled_mic = [_LabelledSegment(s, "Me") for s in mic_result.segments]
         labelled_sys = [_LabelledSegment(s, "Participant") for s in deduped_sys]

@@ -201,10 +201,12 @@ class WhisperEngine:
         # Whisper entirely. The threshold is module-level (SILENCE_RMS_THRESHOLD)
         # so it can be tuned without re-reading argument plumbing. The post-
         # transcription hallucination filter handles the rest.
+        # Peak window RMS across the whole file — see _wav_rms docstring.
         rms = _wav_rms(path)
         if rms is not None and rms < SILENCE_RMS_THRESHOLD:
             logger.info(
-                "Transcribe skipped — %s is essentially silent (RMS=%.4f, threshold=%.4f).",
+                "Transcribe skipped — %s is essentially silent "
+                "(peak-window RMS=%.4f, threshold=%.4f).",
                 path.name, rms, SILENCE_RMS_THRESHOLD,
             )
             return TranscriptionResult(
@@ -426,8 +428,15 @@ def _safe_wav_duration_seconds(path: Path) -> float:
         return 0.0
 
 
-def _wav_rms(path: Path) -> float | None:
-    """Cheap RMS of the first ~5 s of a WAV file, normalised to ``[0, 1]``.
+def _wav_rms(path: Path, *, window_seconds: float = 5.0) -> float | None:
+    """Return the **peak** RMS across non-overlapping windows of the WAV file.
+
+    Earlier versions only sampled the first 5 seconds. That was enough for
+    "completely silent" detection but mis-fired on real recordings where the
+    audio stream had a quiet head — e.g. the user hit Start before YouTube
+    started playing, so the first 5 s of system audio is dead but the rest
+    is normal speech. We now scan the whole file in chunks, keep the loudest
+    window, and decide based on that. O(1) memory, O(file_size) time.
 
     Returns ``None`` on any failure so the caller falls through to normal
     transcription instead of skipping a recording we couldn't measure.
@@ -436,22 +445,24 @@ def _wav_rms(path: Path) -> float | None:
         with wave.open(str(path), "rb") as wf:
             sampwidth = wf.getsampwidth()
             rate = wf.getframerate() or 16000
-            n = min(wf.getnframes(), rate * 5)
-            raw = wf.readframes(n)
-    except Exception:
-        return None
-    if not raw:
-        return 0.0
-    if sampwidth != 2:
-        return None  # only int16 expected from our recorder
+            if sampwidth != 2:
+                return None  # only int16 expected from our recorder
+            chunk = max(1, int(window_seconds * rate))
 
-    try:
-        import numpy as np
+            import numpy as np
 
-        arr = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-        if arr.size == 0:
-            return 0.0
-        return float(np.sqrt(np.mean(arr * arr)))
+            best = 0.0
+            while True:
+                raw = wf.readframes(chunk)
+                if not raw:
+                    break
+                arr = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+                if arr.size == 0:
+                    continue
+                rms = float(np.sqrt(np.mean(arr * arr)))
+                if rms > best:
+                    best = rms
+            return best
     except Exception:
         return None
 

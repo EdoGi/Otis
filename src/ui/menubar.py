@@ -36,6 +36,7 @@ Phase 4 (transcription) replaces the stub with the real pipeline.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import queue
@@ -243,6 +244,7 @@ class MenuBarApp:
         notifications: NotificationManager | None = None,
         transcription_handler: TranscriptionHandler | None = None,
         transcript_store: TranscriptStore | None = None,
+        audio_dir: Path | None = None,
         icons_dir: Path | None = None,
         user_config_path: Path | None = None,
         rumps_app_factory: Callable[..., Any] | None = None,
@@ -253,6 +255,10 @@ class MenuBarApp:
         self._notifications = notifications or NotificationManager()
         self._transcribe = transcription_handler or _default_transcription_handler
         self._store = transcript_store
+        self._audio_dir = (
+            audio_dir
+            or Path(config.get("storage", "audio_dir", default="~/Otis/audio"))
+        ).expanduser()
         self._icons_dir = (icons_dir or Path("~/.otis/icons")).expanduser()
         self._user_config_path = (
             user_config_path or Path("~/.otis/config.yaml")
@@ -410,6 +416,12 @@ class MenuBarApp:
         self._mi["settings_root"] = rumps.MenuItem("Settings")
         self._build_settings_submenu(self._mi["settings_root"])
 
+        # Generate Transcript — populated with audio sessions on disk that
+        # don't yet have a transcript (e.g. recordings whose Stop & Transcribe
+        # crashed mid-flight, leaving orphan WAVs on disk).
+        self._mi["generate_root"] = rumps.MenuItem("Generate Transcript")
+        self._refresh_generate_menu()
+
         # Recent transcripts — populated from disk now and refreshed after
         # each transcription completes.
         self._mi["recent_root"] = rumps.MenuItem("Recent Transcripts")
@@ -432,6 +444,7 @@ class MenuBarApp:
             None,
             self._mi["settings_root"],
             None,
+            self._mi["generate_root"],
             self._mi["recent_root"],
             None,
             self._mi["about"],
@@ -578,6 +591,9 @@ class MenuBarApp:
             # The transcription worker just landed (or failed); reload the
             # Recent Transcripts submenu so the new item shows up.
             self._refresh_recent_menu()
+            # Same trigger refreshes the orphan list so a successful run
+            # disappears from "Generate Transcript".
+            self._refresh_generate_menu()
 
     # =====================================================================
     # User-clicked menu callbacks (main-thread, courtesy of rumps)
@@ -849,6 +865,161 @@ class MenuBarApp:
             menu_item.hidden = not visible  # rumps proxies to NSMenuItem.setHidden_
         except Exception:  # pragma: no cover (older rumps)
             menu_item.set_callback(menu_item._callback if visible else None)
+
+    def _refresh_generate_menu(self, *, limit: int = 10) -> None:
+        """Rebuild the "Generate Transcript" submenu from disk.
+
+        Lists every audio session under ``audio_dir`` that does NOT yet have
+        a saved transcript, so the user can manually re-trigger transcription
+        for orphan WAVs (e.g. when the auto-flow crashed mid-recording).
+        """
+        import rumps
+
+        root = self._mi.get("generate_root")
+        if root is None:
+            return
+        try:
+            for key in list(root.keys()):
+                del root[key]
+        except Exception:  # pragma: no cover (older rumps)
+            pass
+
+        sessions = self._find_orphan_sessions(limit=limit)
+        if not sessions:
+            placeholder = rumps.MenuItem("(no orphan recordings)")
+            placeholder.set_callback(None)  # render disabled
+            root.add(placeholder)
+            return
+
+        for entry in sessions:
+            label = entry["label"]
+            item = rumps.MenuItem(label, callback=self._on_generate_clicked)
+            item._otis_session_id = entry["session_id"]  # type: ignore[attr-defined]
+            item._otis_metadata_path = str(entry["metadata_path"])  # type: ignore[attr-defined]
+            item._otis_mic_path = str(entry["mic_path"])  # type: ignore[attr-defined]
+            item._otis_system_path = (
+                str(entry["system_path"]) if entry["system_path"] else None
+            )  # type: ignore[attr-defined]
+            root.add(item)
+
+    def _find_orphan_sessions(self, *, limit: int = 10) -> list[dict[str, Any]]:
+        """Convenience: pull audio_dir / store / current-session from self."""
+        with self._lock:
+            current_sid = (
+                self._recorder.session_id
+                if self._recorder is not None
+                else None
+            )
+        return find_orphan_sessions(
+            audio_dir=self._audio_dir,
+            store=self._store,
+            current_recording_session_id=current_sid,
+            limit=limit,
+        )
+
+    def _on_generate_clicked(self, sender: Any) -> None:
+        """User picked an orphan/untranscribed session → fire transcription."""
+        sid = getattr(sender, "_otis_session_id", None)
+        meta_str = getattr(sender, "_otis_metadata_path", None)
+        mic_str = getattr(sender, "_otis_mic_path", None)
+        sys_str = getattr(sender, "_otis_system_path", None)
+        if not sid or not mic_str:
+            return
+
+        # If the user is in the middle of a real recording / transcription,
+        # don't queue a competing one — the WhisperEngine isn't designed to
+        # process two streams concurrently and the icon would lie.
+        with self._lock:
+            current = self._snapshot.state
+        if current in (UiState.RECORDING, UiState.PAUSED, UiState.PROCESSING):
+            self._notifications.notify(
+                NotificationType.ERROR,
+                "Busy",
+                "Wait for the current recording / transcription to finish.",
+                force=True,
+            )
+            return
+
+        metadata = self._build_recorder_metadata(
+            session_id=sid,
+            metadata_path=Path(meta_str) if meta_str else None,
+            mic_path=Path(mic_str),
+            system_path=Path(sys_str) if sys_str else None,
+        )
+        # The transcription_handler in main.py expects these decorations.
+        metadata["_meeting"] = {"title": None, "app": None, "participants": []}
+        metadata["_language"] = self._snapshot.selected_language_code
+
+        self._set_state(UiState.PROCESSING)
+        self._notifications.notify(
+            NotificationType.RECORDING_STARTED,
+            "Generating transcript",
+            _format_session_label(
+                Path(meta_str) if meta_str else None, Path(mic_str)
+            ),
+            force=True,
+        )
+        threading.Thread(
+            target=self._run_transcription,
+            args=(metadata,),
+            name="otis-on-demand-transcribe",
+            daemon=True,
+        ).start()
+
+    def _build_recorder_metadata(
+        self,
+        *,
+        session_id: str,
+        metadata_path: Path | None,
+        mic_path: Path,
+        system_path: Path | None,
+    ) -> dict[str, Any]:
+        """Assemble a recorder-style metadata dict for the transcription handler.
+
+        Reads the existing metadata.json if present; otherwise synthesises one
+        with reasonable defaults (zero monotonic anchors, mtime as wall clock).
+        """
+        if metadata_path is not None and metadata_path.exists():
+            try:
+                meta = json.loads(metadata_path.read_text(encoding="utf-8"))
+                if isinstance(meta, dict):
+                    meta = dict(meta)
+                else:
+                    meta = {}
+            except Exception:
+                meta = {}
+        else:
+            meta = {}
+
+        meta.setdefault("session_id", session_id)
+        # Express paths relative to audio_dir so the processor's session
+        # builder resolves them to the right files even if audio_dir moves.
+        try:
+            meta["mic_wav"] = str(mic_path.relative_to(self._audio_dir))
+        except ValueError:
+            meta["mic_wav"] = mic_path.name
+        if system_path is not None:
+            try:
+                meta["system_wav"] = str(system_path.relative_to(self._audio_dir))
+            except ValueError:
+                meta["system_wav"] = system_path.name
+        else:
+            meta["system_wav"] = None
+        meta.setdefault("mic_start_monotonic", 0.0)
+        meta.setdefault("system_start_monotonic", 0.0)
+        meta.setdefault("sample_rate", int(
+            self._config.get("audio", "sample_rate", default=16000)
+        ))
+        if not meta.get("start_wall_clock"):
+            from datetime import datetime, timezone
+
+            try:
+                ts = datetime.fromtimestamp(mic_path.stat().st_mtime, tz=timezone.utc)
+                meta["start_wall_clock"] = ts.isoformat()
+            except Exception:
+                meta["start_wall_clock"] = datetime.now(timezone.utc).isoformat()
+        meta.setdefault("pauses", [])
+        return meta
 
     def _refresh_recent_menu(self, *, limit: int = 5) -> None:
         """Rebuild the Recent Transcripts submenu from the store.
@@ -1140,3 +1311,166 @@ def _participant_to_str(p: Any) -> str:
             return f"{name} <{email}>"
         return name or email or "unknown"
     return str(p)
+
+
+# ============================================================================
+# Orphan-session discovery — pure functions so they're testable without rumps
+# ============================================================================
+def find_orphan_sessions(
+    *,
+    audio_dir: Path,
+    store: TranscriptStore | None = None,
+    current_recording_session_id: str | None = None,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """Return audio sessions on disk without a corresponding transcript.
+
+    Three on-disk layouts are accepted:
+
+    * ``{uuid}_metadata.json`` next to ``{uuid}_*.wav`` — fresh recorder
+      output (typically at ``audio_dir`` root).
+    * ``YYYY-MM-DD_HHMM_metadata.json`` under ``audio_dir/YYYY/MM/`` —
+      already renamed by a successful :class:`TranscriptProcessor` run.
+    * Orphan ``{uuid}_*.wav`` at the audio root with **no** metadata.json
+      — recorder.stop() crashed mid-write. The caller can still transcribe
+      these via a synthesised metadata dict.
+
+    ``current_recording_session_id`` excludes the session being actively
+    recorded right now — its WAV files are still being written and would
+    otherwise show up as a tempting (but corrupted) orphan.
+    """
+    if not audio_dir.exists():
+        return []
+
+    results: list[dict[str, Any]] = []
+    seen_session_ids: set[str] = set()
+    # We also track resolved WAV paths from Pass 1 so Pass 2 doesn't list
+    # the same physical files under a filename-derived "session id" that
+    # differs from the metadata's id (e.g. renamed YYYY/MM/HH-MM_mic.wav
+    # belongs to a UUID session, but the filename itself looks like a date).
+    seen_audio_paths: set[Path] = set()
+    if current_recording_session_id:
+        seen_session_ids.add(current_recording_session_id)
+
+    # Pass 1 — sessions with explicit metadata.json (preferred).
+    for meta_path in sorted(audio_dir.rglob("*_metadata.json"), reverse=True):
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(meta, dict):
+            continue
+        sid = str(meta.get("session_id") or "")
+        if not sid or sid in seen_session_ids:
+            continue
+        mic_relative = meta.get("mic_wav") or f"{sid}_mic.wav"
+        sys_relative = meta.get("system_wav")
+        mic_path, sys_path = _resolve_session_audio(
+            meta_path=meta_path,
+            declared_mic=mic_relative,
+            declared_sys=sys_relative,
+            sid=sid,
+        )
+        if mic_path is None:
+            continue
+        seen_audio_paths.add(mic_path)
+        if sys_path is not None:
+            seen_audio_paths.add(sys_path)
+        if _session_has_transcript(store, sid):
+            seen_session_ids.add(sid)
+            continue
+        seen_session_ids.add(sid)
+        results.append({
+            "session_id": sid,
+            "label": _format_session_label(meta_path, mic_path),
+            "metadata_path": meta_path,
+            "mic_path": mic_path,
+            "system_path": sys_path,
+        })
+        if len(results) >= limit:
+            return results
+
+    # Pass 2 — orphan WAVs anywhere (rglob, in case a partial recording
+    # ended up inside the YYYY/MM tree somehow). Skip the actively-recording
+    # session, anything already covered by Pass 1, and anything that
+    # already has a transcript.
+    for mic_path in sorted(audio_dir.rglob("*_mic.wav"), reverse=True):
+        if mic_path in seen_audio_paths:
+            continue
+        sid = mic_path.stem.removesuffix("_mic")
+        if sid in seen_session_ids:
+            continue
+        if _session_has_transcript(store, sid):
+            seen_session_ids.add(sid)
+            continue
+        seen_session_ids.add(sid)
+        sys_path = mic_path.with_name(f"{sid}_system.wav")
+        results.append({
+            "session_id": sid,
+            "label": _format_session_label(mic_path, mic_path) + "  (orphan)",
+            "metadata_path": None,
+            "mic_path": mic_path,
+            "system_path": sys_path if sys_path.exists() else None,
+        })
+        if len(results) >= limit:
+            return results
+    return results
+
+
+def _resolve_session_audio(
+    *,
+    meta_path: Path,
+    declared_mic: str,
+    declared_sys: str | None,
+    sid: str,
+) -> tuple[Path | None, Path | None]:
+    """Match the three on-disk layouts retranscribe.py also handles."""
+    candidates_mic = [
+        meta_path.parent / declared_mic,
+        meta_path.with_name(meta_path.name.replace("_metadata.json", "_mic.wav")),
+        meta_path.parent / f"{sid}_mic.wav",
+    ]
+    mic = next((c for c in candidates_mic if c.exists()), None)
+    if mic is None:
+        return None, None
+    sys_path: Path | None = None
+    if declared_sys:
+        cands = [
+            meta_path.parent / declared_sys,
+            meta_path.with_name(meta_path.name.replace("_metadata.json", "_system.wav")),
+            meta_path.parent / f"{sid}_system.wav",
+        ]
+        sys_path = next((c for c in cands if c.exists()), None)
+    else:
+        sibling = meta_path.with_name(
+            meta_path.name.replace("_metadata.json", "_system.wav")
+        )
+        if sibling.exists():
+            sys_path = sibling
+    return mic, sys_path
+
+
+def _session_has_transcript(store: TranscriptStore | None, session_id: str) -> bool:
+    if store is None:
+        return False
+    try:
+        return store.path_for(session_id) is not None
+    except Exception:
+        return False
+
+
+def _format_session_label(meta_path: Path | None, mic_path: Path) -> str:
+    """Pretty label for the submenu — best-effort timestamp + size."""
+    anchor = meta_path or mic_path
+    from datetime import datetime
+    try:
+        mtime = datetime.fromtimestamp(anchor.stat().st_mtime)
+        ts = mtime.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        ts = "unknown"
+    try:
+        mb = mic_path.stat().st_size / (1024 * 1024)
+        size = f"  ({mb:.1f} MB)"
+    except Exception:
+        size = ""
+    return f"{ts}{size}"
