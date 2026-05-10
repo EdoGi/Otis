@@ -125,16 +125,76 @@ class TranscriptStore:
 
         Path is computed from the frontmatter:
         ``YYYY/MM/YYYY-MM-DD_HHMM_{slug}.md``.
+
+        Collisions are resolved **atomically** so concurrent saves never
+        clobber each other:
+
+        * If the target already exists with the **same** ``id`` as the new
+          frontmatter, this is a re-save (tag toggle, retranscribe, etc.) —
+          we overwrite in place.
+        * Otherwise we try to claim ``foo.md``, ``foo_2.md``, ``foo_3.md`` …
+          using ``O_CREAT | O_EXCL`` so two threads never resolve to the same
+          target.
         """
         path = self._compute_path(frontmatter)
         path.parent.mkdir(parents=True, exist_ok=True)
-        content = render_with_frontmatter(frontmatter, body)
-        # Atomic-ish: write to a temp neighbour first, then rename.
+        new_id = frontmatter.get("id")
+
+        # Re-save: same id at the same logical slot → overwrite in place.
+        if path.exists() and new_id:
+            existing_id = self._read_frontmatter_fast(path).get("id")
+            if existing_id == new_id:
+                self._atomic_write(path, render_with_frontmatter(frontmatter, body))
+                logger.info("Saved transcript (re-save): %s", path)
+                return path
+
+        # Otherwise atomically claim a free filename.
+        target = self._claim_free_path(path, owner_id=new_id)
+        self._atomic_write(target, render_with_frontmatter(frontmatter, body))
+        if target != path:
+            logger.info(
+                "Save collision avoided: %s already taken, used %s instead.",
+                path.name, target.name,
+            )
+        else:
+            logger.info("Saved transcript: %s", target)
+        return target
+
+    @staticmethod
+    def _atomic_write(path: Path, content: str) -> None:
+        """Write ``content`` to ``path`` via a tmp neighbour + rename."""
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(content, encoding="utf-8")
         tmp.replace(path)
-        logger.info("Saved transcript: %s", path)
-        return path
+
+    def _claim_free_path(self, path: Path, *, owner_id: Any) -> Path:
+        """Atomically reserve ``path`` (or a numeric variant) for ``owner_id``.
+
+        Uses ``O_CREAT | O_EXCL`` so two callers racing into the same logical
+        slot end up on different filenames. The reserved file is created
+        empty; the caller follows up with ``_atomic_write`` to fill it.
+        """
+        stem = path.stem
+        suffix = path.suffix
+        parent = path.parent
+        attempt = 1
+        while True:
+            candidate = path if attempt == 1 else parent / f"{stem}_{attempt}{suffix}"
+            try:
+                # O_EXCL: fail if the file exists. This is what makes the
+                # claim atomic across threads / processes.
+                fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            except FileExistsError:
+                # Already reserved. If it's an in-place re-save of the same
+                # owner, accept the slot; otherwise advance to the next suffix.
+                if owner_id is not None and candidate.exists():
+                    existing_id = self._read_frontmatter_fast(candidate).get("id")
+                    if existing_id == owner_id:
+                        return candidate
+                attempt += 1
+                continue
+            os.close(fd)
+            return candidate
 
     def update_frontmatter(self, transcript_id: str, updates: dict[str, Any]) -> Path | None:
         """Merge ``updates`` into an existing transcript's frontmatter."""
@@ -188,6 +248,11 @@ class TranscriptStore:
                 fm = self._read_frontmatter_fast(path)
             except Exception as exc:
                 logger.warning("Skipping %s: %s", path, exc)
+                continue
+            # Empty / unparseable frontmatter ⇒ corrupt or in-progress write.
+            # Don't surface these in listings.
+            if not fm or not fm.get("id"):
+                logger.debug("Skipping %s — frontmatter missing or has no id.", path)
                 continue
 
             date_str = str(fm.get("date") or "")

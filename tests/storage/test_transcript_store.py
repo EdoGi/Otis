@@ -122,6 +122,35 @@ def test_save_atomic_no_partial_files_on_disk(tmp_path: Path) -> None:
     assert leftover == []
 
 
+def test_save_re_save_overwrites_when_id_matches(tmp_path: Path) -> None:
+    """Saving the same id twice (e.g. after a tag toggle) must update in place."""
+    store = TranscriptStore(tmp_path)
+    fm = _fm(session_id="dup-id")
+    p1 = store.save(fm, "## Transcript\n\nfirst")
+    p2 = store.save(fm, "## Transcript\n\nsecond")
+    assert p1 == p2
+    assert "second" in p1.read_text()
+
+
+def test_save_with_collision_uses_suffix_when_ids_differ(tmp_path: Path) -> None:
+    """Two distinct sessions at the same date+time+title must NOT clobber."""
+    store = TranscriptStore(tmp_path)
+    fm_a = _fm(session_id="aaa")
+    fm_b = _fm(session_id="bbb")
+    p_a = store.save(fm_a, "## Transcript\n\nA")
+    p_b = store.save(fm_b, "## Transcript\n\nB")
+    assert p_a != p_b
+    # First write keeps the canonical name; the second gets _2 appended.
+    assert p_a.name == "2026-05-09_1400_sprint-planning.md"
+    assert p_b.name == "2026-05-09_1400_sprint-planning_2.md"
+    # Both files exist with the correct content.
+    assert "A" in p_a.read_text()
+    assert "B" in p_b.read_text()
+    # And both are listable.
+    listed = store.list_transcripts()
+    assert {fm["id"] for fm in listed} == {"aaa", "bbb"}
+
+
 # ---------------------------------------------------------------------------
 # list_transcripts
 # ---------------------------------------------------------------------------

@@ -662,6 +662,26 @@ class MenuBarApp:
 
     def _on_quit_clicked(self, _sender: Any) -> None:
         import rumps
+
+        # If a transcription is mid-flight, the worker is a daemon thread —
+        # it will be killed the moment we exit, losing the transcript. Warn
+        # the user explicitly so they can wait it out.
+        with self._lock:
+            in_processing = self._snapshot.state == UiState.PROCESSING
+        if in_processing:
+            response = rumps.alert(
+                title="Transcription in progress",
+                message=(
+                    "A transcription is running. Quitting now will discard it. "
+                    "Wait for it to finish, or quit anyway?"
+                ),
+                ok="Quit anyway",
+                cancel="Wait",
+            )
+            # rumps.alert returns 1 for the OK button, 0 for cancel.
+            if not response:
+                return
+
         # Stop recording cleanly first; teardown happens in run()'s finally.
         self._do_stop_if_recording()
         rumps.quit_application()

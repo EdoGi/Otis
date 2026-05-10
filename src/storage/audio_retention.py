@@ -80,7 +80,17 @@ class AudioRetentionManager:
     # Public API
     # =====================================================================
     def start_periodic(self) -> None:
-        """Run a sweep now and schedule one every 24 h."""
+        """Run a sweep now and schedule one every 24 h.
+
+        Idempotent: if a previous timer is already running (e.g. a second
+        ``start_periodic()`` call after a config reload), it's cancelled
+        first so we don't accumulate daemon timers.
+        """
+        with self._lock:
+            if self._timer is not None:
+                logger.debug("start_periodic called while a timer was active; replacing it.")
+                self._timer.cancel()
+                self._timer = None
         self.cleanup_now()
         self._schedule_next()
 

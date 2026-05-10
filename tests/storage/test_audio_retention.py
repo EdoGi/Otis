@@ -177,3 +177,22 @@ def test_start_periodic_runs_initial_sweep(tmp_path: Path) -> None:
             assert not p.exists(), "initial sweep should have run synchronously"
     finally:
         rm.stop()
+
+
+def test_start_periodic_double_call_does_not_leak_timers(tmp_path: Path) -> None:
+    """Calling start_periodic twice must replace the old timer, not stack them."""
+    audio_dir = tmp_path / "audio"
+    rm = AudioRetentionManager(
+        audio_dir=audio_dir, retention_days=30, interval_seconds=86400
+    )
+    rm.start_periodic()
+    first_timer = rm._timer
+    rm.start_periodic()
+    second_timer = rm._timer
+    try:
+        assert first_timer is not second_timer, "second start should create a fresh timer"
+        # The first timer must be cancelled (not is_alive) so it doesn't leak.
+        assert not first_timer.is_alive(), "first timer should have been cancelled"
+        assert second_timer.is_alive()
+    finally:
+        rm.stop()

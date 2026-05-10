@@ -65,18 +65,18 @@ def test_each_icon_has_correct_dimensions(tmp_path: Path) -> None:
 def test_programmatic_icon_colour_appears_in_pixels(tmp_path: Path) -> None:
     """Each programmatic icon should contain its palette colour somewhere."""
     pytest.importorskip("PIL")
+    import numpy as np
     from PIL import Image
 
     ensure_icons(tmp_path, source_path=tmp_path / "missing.png")
     for state, (color, _filled, _glyph) in _PALETTE.items():
         with Image.open(tmp_path / f"{state}@2x.png") as img:
-            rgba = img.convert("RGBA")
-            pixels = list(rgba.getdata())
-        match = any(
-            all(abs(pixel[i] - color[i]) <= 10 for i in range(3)) and pixel[3] > 0
-            for pixel in pixels
+            arr = np.asarray(img.convert("RGBA"), dtype=np.int16)
+        rgb_diff = np.abs(arr[..., :3] - np.array(color, dtype=np.int16)).max(axis=-1)
+        visible = arr[..., 3] > 0
+        assert ((rgb_diff <= 10) & visible).any(), (
+            f"state {state!r}: palette colour {color} never appears"
         )
-        assert match, f"state {state!r}: palette colour {color} never appears"
 
 
 # ============================================================================
@@ -105,6 +105,7 @@ def test_avatar_pipeline_creates_every_state(tmp_path: Path) -> None:
 def test_avatar_state_badge_colour_is_present(tmp_path: Path) -> None:
     """Each state with a badge colour must have that colour in the @2x icon."""
     pytest.importorskip("PIL")
+    import numpy as np
     from PIL import Image
 
     icons_dir = tmp_path / "icons"
@@ -115,17 +116,18 @@ def test_avatar_state_badge_colour_is_present(tmp_path: Path) -> None:
         if color is None:
             continue
         with Image.open(icons_dir / f"{state}@2x.png") as img:
-            pixels = list(img.convert("RGBA").getdata())
-        match = any(
-            all(abs(p[i] - color[i]) <= 12 for i in range(3)) and p[3] > 200
-            for p in pixels
+            arr = np.asarray(img.convert("RGBA"), dtype=np.int16)
+        rgb_diff = np.abs(arr[..., :3] - np.array(color, dtype=np.int16)).max(axis=-1)
+        visible = arr[..., 3] > 200
+        assert ((rgb_diff <= 12) & visible).any(), (
+            f"state {state!r}: badge colour {color} not visible"
         )
-        assert match, f"state {state!r}: badge colour {color} not visible"
 
 
 def test_avatar_idle_has_no_badge_colour(tmp_path: Path) -> None:
     """The idle icon should be the avatar untouched (no orange/red/yellow blob)."""
     pytest.importorskip("PIL")
+    import numpy as np
     from PIL import Image
 
     icons_dir = tmp_path / "icons"
@@ -133,11 +135,10 @@ def test_avatar_idle_has_no_badge_colour(tmp_path: Path) -> None:
     ensure_icons(icons_dir, source_path=src)
 
     with Image.open(icons_dir / "idle@2x.png") as img:
-        pixels = list(img.convert("RGBA").getdata())
-    # No "recording red" pixels in the idle icon.
-    red = (229, 57, 53)
-    has_red = any(
-        all(abs(p[i] - red[i]) <= 12 for i in range(3)) and p[3] > 200
-        for p in pixels
+        arr = np.asarray(img.convert("RGBA"), dtype=np.int16)
+    red = np.array((229, 57, 53), dtype=np.int16)
+    rgb_diff = np.abs(arr[..., :3] - red).max(axis=-1)
+    visible = arr[..., 3] > 200
+    assert not ((rgb_diff <= 12) & visible).any(), (
+        "idle icon should not contain the recording-red badge colour"
     )
-    assert not has_red, "idle icon should not contain the recording-red badge colour"
