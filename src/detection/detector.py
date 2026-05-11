@@ -266,9 +266,31 @@ class MeetingDetector:
                 # Different upcoming event arrived — update the context.
                 self._context = _context_from_event(event, MeetingState.APPROACHING)
                 ctx = _copy_context(self._context)
+            elif self._context.state in (
+                MeetingState.DETECTED, MeetingState.RECORDING,
+            ):
+                # Back-to-back meeting: we're already in/around meeting A and
+                # meeting B's 2-min alert just fired. Fire a heads-up so the
+                # UI can notify the user, but keep the current context intact
+                # (the UI also won't demote state — see menubar guard).
+                # Skip if the event id matches the meeting we're already
+                # tracking — that's just the calendar alert for our current
+                # call, not a new one.
+                same_meeting = (
+                    self._context.calendar_event_id is not None
+                    and self._context.calendar_event_id == event.id
+                )
+                if same_meeting:
+                    ctx = None
+                else:
+                    ctx = _context_from_event(event, MeetingState.APPROACHING)
+                    logger.info(
+                        "Concurrent APPROACHING during %s: %s",
+                        self._context.state.value, event.title,
+                    )
             else:
-                # We're already DETECTED/RECORDING/etc. Don't overwrite, but
-                # remember the event in case we need to enrich later.
+                # ENDED / PROCESSING — suppress entirely. The transcription is
+                # finishing up; a "Meeting in 2 min" toast here is noise.
                 ctx = None
         if ctx is not None:
             _safe_call_each(self._on_approaching, ctx)

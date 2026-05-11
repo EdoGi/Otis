@@ -559,23 +559,42 @@ class MenuBarApp:
                 logger.exception("Error handling main-thread event %s", event_type)
 
     def _handle_event(self, event_type: str, payload: Any) -> None:
-        # Don't let a background detector signal demote the UI out of an
+        # Background detector signals must never demote the UI out of an
         # active "user task" state. Without this guard, a routine 30s process
         # rescan or a 2-min calendar alert mid-transcription would flip the
         # icon from PROCESSING (blue) to DETECTED (orange ticking) and hide
         # the Stop button — even though the recorder/transcription worker is
-        # still running. The orphan-recovery flow in particular leaves the
-        # *detector's* state at IDLE, so it has no way to suppress these
-        # signals on its own.
-        busy_ui_states = (UiState.RECORDING, UiState.PAUSED, UiState.PROCESSING)
+        # still running.
+        #
+        # During RECORDING/PAUSED, we still want the heads-up notification
+        # for a NEW back-to-back meeting (so the user knows another call is
+        # coming), but we don't change the icon or menu visibility.
+        # During PROCESSING, we suppress entirely — a "Meeting detected"
+        # toast mid-transcription is noise.
         if event_type in ("approaching", "detected"):
             with self._lock:
-                ui_busy = self._snapshot.state in busy_ui_states
-            if ui_busy:
+                ui_state = self._snapshot.state
+            if ui_state == UiState.PROCESSING:
                 logger.debug(
-                    "Ignoring detector %s event while UI is in %s.",
-                    event_type, self._snapshot.state,
+                    "Suppressing detector %s event while UI is PROCESSING.",
+                    event_type,
                 )
+                return
+            if ui_state in (UiState.RECORDING, UiState.PAUSED):
+                # Heads-up only: notify, don't change state.
+                ctx = payload
+                if event_type == "approaching":
+                    self._notifications.notify(
+                        NotificationType.MEETING_APPROACHING,
+                        "Meeting in 2 min",
+                        ctx.title or "(untitled)",
+                    )
+                else:
+                    self._notifications.notify(
+                        NotificationType.MEETING_DETECTED,
+                        "Meeting detected",
+                        ctx.title or ctx.app or "(unknown app)",
+                    )
                 return
 
         if event_type == "approaching":
@@ -1219,6 +1238,15 @@ class MenuBarApp:
             self._notifications.notify(
                 NotificationType.ERROR, "Save failed", str(exc), force=True
             )
+            # Recorder is gone and we couldn't flush — the UI must not stay
+            # in RECORDING forever. Force back to IDLE so the user can try
+            # again (Start becomes visible, the duration timer winds down).
+            self._timer_duration.stop()
+            try:
+                self._detector.user_stopped_recording()
+            except Exception:  # pragma: no cover
+                logger.exception("Detector user_stopped_recording raised")
+            self._events.put(("force_state", UiState.IDLE))
             return None
         try:
             self._detector.user_stopped_recording()

@@ -275,6 +275,108 @@ def test_process_exit_during_detected_returns_to_idle_silently() -> None:
     assert ended_calls == []  # only fires when we were actually RECORDING
 
 
+def test_concurrent_calendar_alert_fires_heads_up_during_recording() -> None:
+    """When the user is RECORDING meeting A and a 2-min calendar alert for a
+    DIFFERENT meeting B arrives, the detector must still fire
+    ``on_meeting_approaching`` for B so the UI can notify "Meeting in 2 min"
+    — but must NOT demote state from RECORDING.
+
+    Regression: prior to this, the upcoming handler stored the event but set
+    ``ctx = None`` for any non-IDLE/APPROACHING state, silently dropping the
+    notification for back-to-back meetings.
+    """
+    now = datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc)
+    detector, _, cp = _make(now=now)
+
+    # First meeting is already underway (manual start, no calendar correlation).
+    detector.user_started_recording()
+    assert detector.get_state() == MeetingState.RECORDING
+
+    approaching: list[MeetingContext] = []
+    detector.on_meeting_approaching(approaching.append)
+
+    # A new calendar event for meeting B fires its 2-min alert.
+    cp.fire_upcoming(_evt(now + timedelta(minutes=2), eid="meet-b", title="Meeting B"))
+
+    # Heads-up callback fires with B's context (so the UI can notify).
+    assert len(approaching) == 1
+    assert approaching[0].title == "Meeting B"
+    # State must stay at RECORDING — we don't demote an active recording.
+    assert detector.get_state() == MeetingState.RECORDING
+
+
+def test_concurrent_calendar_alert_during_detected_still_fires() -> None:
+    """Same protection for DETECTED: a new meeting alert while we're tracking
+    a process-detected meeting should still produce a heads-up event.
+    """
+    now = datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc)
+    detector, pm, cp = _make(now=now)
+
+    pm.fire_detected("zoom.us")
+    assert detector.get_state() == MeetingState.DETECTED
+
+    approaching: list[MeetingContext] = []
+    detector.on_meeting_approaching(approaching.append)
+
+    cp.fire_upcoming(_evt(now + timedelta(minutes=2), eid="b", title="Next meeting"))
+
+    assert len(approaching) == 1
+    assert approaching[0].title == "Next meeting"
+    # DETECTED context for the first meeting is preserved.
+    assert detector.get_state() == MeetingState.DETECTED
+
+
+def test_concurrent_calendar_alert_for_same_meeting_is_suppressed() -> None:
+    """If the new APPROACHING event's id matches the current context, it's the
+    calendar's own 2-min alert for the meeting we're already tracking — not a
+    new back-to-back meeting. Don't double-notify.
+    """
+    now = datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc)
+    detector, pm, cp = _make(now=now)
+
+    # Detected through calendar+process correlation (so the context carries
+    # the calendar_event_id of meeting A).
+    cp.fire_upcoming(_evt(now + timedelta(minutes=1), eid="meet-a", title="A"))
+    pm.fire_detected("zoom.us")
+    assert detector.get_state() == MeetingState.DETECTED
+
+    detector.user_started_recording()
+    assert detector.get_state() == MeetingState.RECORDING
+
+    approaching: list[MeetingContext] = []
+    detector.on_meeting_approaching(approaching.append)
+
+    # Calendar's own alert for meeting A fires again (e.g. a second poller).
+    cp.fire_upcoming(_evt(now + timedelta(minutes=1), eid="meet-a", title="A"))
+
+    # No spurious heads-up — same meeting.
+    assert approaching == []
+    assert detector.get_state() == MeetingState.RECORDING
+
+
+def test_concurrent_calendar_alert_during_processing_is_suppressed() -> None:
+    """While a transcript is PROCESSING, suppress new-meeting heads-ups —
+    they'd be misleading mid-transcription, and the user has explicitly
+    delayed scheduling-driven notifications.
+    """
+    now = datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc)
+    detector, _, cp = _make(now=now)
+
+    detector.user_started_recording()
+    detector.user_stopped_recording()
+    detector.transcription_started()
+    assert detector.get_state() == MeetingState.PROCESSING
+
+    approaching: list[MeetingContext] = []
+    detector.on_meeting_approaching(approaching.append)
+
+    cp.fire_upcoming(_evt(now + timedelta(minutes=2), eid="b", title="Later"))
+
+    # No heads-up while we're locked in PROCESSING.
+    assert approaching == []
+    assert detector.get_state() == MeetingState.PROCESSING
+
+
 def test_calendar_alert_during_recording_does_not_demote_state() -> None:
     """Regression: an upcoming calendar alert that fires mid-recording, followed
     by a routine process re-detection, must NOT demote state from RECORDING to
