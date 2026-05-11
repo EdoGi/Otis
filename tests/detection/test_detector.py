@@ -275,6 +275,40 @@ def test_process_exit_during_detected_returns_to_idle_silently() -> None:
     assert ended_calls == []  # only fires when we were actually RECORDING
 
 
+def test_calendar_alert_during_recording_does_not_demote_state() -> None:
+    """Regression: an upcoming calendar alert that fires mid-recording, followed
+    by a routine process re-detection, must NOT demote state from RECORDING to
+    DETECTED. (Pre-fix, the process handler unconditionally overwrote context
+    when a calendar event correlated, silently losing the recording state while
+    the recorder thread kept writing audio.)
+    """
+    now = datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc)
+    detector, pm, cp = _make(now=now)
+
+    # Recording underway via manual start.
+    detector.user_started_recording()
+    assert detector.get_state() == MeetingState.RECORDING
+
+    detected_calls: list[MeetingContext] = []
+    detector.on_meeting_detected(detected_calls.append)
+
+    # A new calendar event's 2-min upcoming alert fires while we're recording.
+    cp.fire_upcoming(_evt(now + timedelta(minutes=1), title="Surprise call"))
+    # State must stay RECORDING — the upcoming handler is a no-op here.
+    assert detector.get_state() == MeetingState.RECORDING
+
+    # The process monitor's routine 30s rescan fires again. With the old bug
+    # this would correlate against the just-stored calendar event and rewrite
+    # state to DETECTED. Now it must remain RECORDING.
+    pm.fire_detected("zoom.us")
+    assert detector.get_state() == MeetingState.RECORDING
+    # And no on_meeting_detected callback should fire — we're already recording.
+    assert detected_calls == []
+    # The app name should still be recorded onto the context as a side note.
+    ctx = detector.get_current_meeting()
+    assert ctx is not None and ctx.app == "zoom.us"
+
+
 def test_calendar_ended_clears_approaching_when_no_process_came() -> None:
     now = datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc)
     detector, _, cp = _make(now=now)

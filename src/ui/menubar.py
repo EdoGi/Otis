@@ -501,10 +501,23 @@ class MenuBarApp:
             wl_root.add(it)
         self._mi["settings_whitelist_root"] = wl_root
 
+        # Mic-activated browser detection — turn off if a dictation tool
+        # (e.g. SuperWhisper) keeps the mic permanently open and every
+        # running browser would otherwise look like a meeting.
+        mic_item = rumps.MenuItem(
+            "Detect browser meetings (via mic)",
+            callback=self._on_mic_activation_toggled,
+        )
+        mic_item.state = bool(self._config.get(
+            "detection", "mic_activation", "enabled", default=True
+        ))
+        self._mi["settings_mic_activation"] = mic_item
+
         root.add(model_root)
         root.add(days_root)
         root.add(hours_root)
         root.add(wl_root)
+        root.add(mic_item)
 
     # =====================================================================
     # Detector callback wiring (background-thread side)
@@ -546,6 +559,25 @@ class MenuBarApp:
                 logger.exception("Error handling main-thread event %s", event_type)
 
     def _handle_event(self, event_type: str, payload: Any) -> None:
+        # Don't let a background detector signal demote the UI out of an
+        # active "user task" state. Without this guard, a routine 30s process
+        # rescan or a 2-min calendar alert mid-transcription would flip the
+        # icon from PROCESSING (blue) to DETECTED (orange ticking) and hide
+        # the Stop button — even though the recorder/transcription worker is
+        # still running. The orphan-recovery flow in particular leaves the
+        # *detector's* state at IDLE, so it has no way to suppress these
+        # signals on its own.
+        busy_ui_states = (UiState.RECORDING, UiState.PAUSED, UiState.PROCESSING)
+        if event_type in ("approaching", "detected"):
+            with self._lock:
+                ui_busy = self._snapshot.state in busy_ui_states
+            if ui_busy:
+                logger.debug(
+                    "Ignoring detector %s event while UI is in %s.",
+                    event_type, self._snapshot.state,
+                )
+                return
+
         if event_type == "approaching":
             ctx: MeetingContext = payload
             logger.info(
@@ -667,6 +699,19 @@ class MenuBarApp:
             NotificationType.ERROR,
             "Whitelist saved",
             "Restart Otis for whitelist changes to take effect.",
+            force=True,
+        )
+
+    def _on_mic_activation_toggled(self, sender: Any) -> None:
+        sender.state = not sender.state
+        write_user_config_override(
+            self._user_config_path,
+            {"detection": {"mic_activation": {"enabled": bool(sender.state)}}},
+        )
+        self._notifications.notify(
+            NotificationType.ERROR,
+            "Setting saved",
+            "Restart Otis for the mic-activation change to take effect.",
             force=True,
         )
 

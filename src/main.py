@@ -150,12 +150,14 @@ def _run_menubar(cfg: Config) -> int:
 
     # ---- detection ---------------------------------------------------------
     pm_cfg = cfg.get("detection", "process_monitor", default={}) or {}
+    mic_cfg = cfg.get("detection", "mic_activation", default={}) or {}
     process_monitor = None
     if pm_cfg.get("enabled", True):
         process_monitor = ProcessMonitor(
             whitelisted_apps=list(pm_cfg.get("whitelisted_apps", [])),
             blacklisted_apps=list(pm_cfg.get("blacklisted_apps", [])),
             poll_interval_seconds=float(pm_cfg.get("poll_interval_seconds", 5)),
+            mic_activation_enabled=bool(mic_cfg.get("enabled", True)),
         )
 
     cal_cfg = cfg.get("detection", "calendar", default={}) or {}
@@ -221,9 +223,25 @@ def _run_menubar(cfg: Config) -> int:
             calendar_event_id=meeting_dict.get("calendar_event_id"),
         )
         language = metadata.get("_language")
+
+        # Log progress at every integer-percent change. The underlying
+        # estimator ticks every 0.5s, so we throttle to avoid spamming the
+        # log file — but still get a clear "still alive" heartbeat the user
+        # can tail to gauge how far along a multi-hour transcription is.
+        last_logged_pct = [-1]
+        sid = metadata.get("session_id") or "unknown"
+
+        def on_progress(pct: float) -> None:
+            current = int(pct)
+            if current != last_logged_pct[0]:
+                last_logged_pct[0] = current
+                logger.info("Transcription progress: %d%% (session=%s)", current, sid)
+
         # process() is synchronous; the menu bar already runs us in a worker
         # thread, so we stay there to keep PROCESSING state coherent.
-        processor.process(session, meeting=meeting, language=language)
+        processor.process(
+            session, meeting=meeting, language=language, on_progress=on_progress,
+        )
 
     app = MenuBarApp(
         config=cfg,

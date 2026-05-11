@@ -112,11 +112,13 @@ class OtisDaemon:
 
         process_monitor: ProcessMonitor | None = None
         pm_cfg = cfg.get("detection", "process_monitor", default={})
+        mic_cfg = cfg.get("detection", "mic_activation", default={}) or {}
         if pm_cfg.get("enabled", True):
             process_monitor = ProcessMonitor(
                 whitelisted_apps=list(pm_cfg.get("whitelisted_apps", [])),
                 blacklisted_apps=list(pm_cfg.get("blacklisted_apps", [])),
                 poll_interval_seconds=float(pm_cfg.get("poll_interval_seconds", 5)),
+                mic_activation_enabled=bool(mic_cfg.get("enabled", True)),
             )
 
         calendar_pollers: list[GoogleCalendarPoller] = []

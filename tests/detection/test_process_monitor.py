@@ -100,6 +100,49 @@ def test_browser_alone_with_mic_idle_is_ignored() -> None:
     assert detected == []
 
 
+def test_mic_activation_disabled_skips_browser_detection() -> None:
+    """When mic_activation_enabled=False, browsers must never fire — even if
+    the mic probe says active. Use case: a dictation tool (e.g. SuperWhisper)
+    holds the mic open continuously, making the mic-active heuristic useless.
+    """
+    detected: list[str] = []
+    probe_calls: list[bool] = []
+
+    def probe() -> bool:
+        probe_calls.append(True)
+        return True
+
+    pm = ProcessMonitor(
+        whitelisted_apps=[],
+        process_iter=lambda: _procs(("Safari", 1), ("Arc", 2)),
+        browser_apps=["Safari", "Arc"],
+        mic_probe=probe,
+        mic_activation_enabled=False,
+    )
+    pm.on_meeting_detected(detected.append)
+    pm.poll_once()
+    assert detected == []
+    # And we shouldn't even bother probing the mic when the feature is off.
+    assert probe_calls == []
+
+
+def test_mic_activation_disabled_still_fires_whitelisted_apps() -> None:
+    """Disabling mic activation must NOT disable detection of real meeting
+    apps like Zoom — only the mic-based browser fallback is affected.
+    """
+    detected: list[str] = []
+    pm = ProcessMonitor(
+        whitelisted_apps=["zoom.us"],
+        process_iter=lambda: _procs(("zoom.us", 11), ("Safari", 22)),
+        browser_apps=["Safari"],
+        mic_probe=lambda: True,
+        mic_activation_enabled=False,
+    )
+    pm.on_meeting_detected(detected.append)
+    pm.poll_once()
+    assert detected == ["zoom.us"]
+
+
 def test_browser_mic_probe_failure_treated_as_inactive() -> None:
     """Mic probe raising must not prevent the monitor from running."""
     detected: list[str] = []

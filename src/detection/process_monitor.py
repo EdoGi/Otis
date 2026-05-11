@@ -97,6 +97,7 @@ class ProcessMonitor:
         browser_apps: Iterable[str] | None = None,
         mic_probe: MicProbe | None = None,
         process_iter: ProcessIter | None = None,
+        mic_activation_enabled: bool = True,
     ) -> None:
         self._whitelist = [w.lower() for w in whitelisted_apps]
         self._blacklist = [b.lower() for b in blacklisted_apps]
@@ -107,6 +108,11 @@ class ProcessMonitor:
         ]
         self._mic_probe = mic_probe or _default_mic_probe
         self._process_iter = process_iter or _default_process_iter
+        # When False, browsers are NEVER promoted to "in a meeting" — useful
+        # when a dictation tool (e.g. SuperWhisper) keeps the default mic open
+        # continuously, which would otherwise make every running browser look
+        # like a meeting in progress.
+        self._mic_activation_enabled = bool(mic_activation_enabled)
 
         self._on_detected: list[DetectedCallback] = []
         self._on_ended: list[EndedCallback] = []
@@ -201,8 +207,16 @@ class ProcessMonitor:
                         browser_pids[bro].add(int(pid))
                     break
 
-        # Browsers only count if the default mic is currently in use.
-        if browser_names_seen:
+        # Browsers only count if the default mic is currently in use — and
+        # only if mic-based activation is enabled. The user can disable it
+        # when a dictation tool (e.g. SuperWhisper) keeps the mic permanently
+        # open and would otherwise make every browser look like a meeting.
+        if browser_names_seen and not self._mic_activation_enabled:
+            logger.debug(
+                "Browser(s) running but mic_activation disabled; skipping: %s",
+                sorted(browser_names_seen),
+            )
+        elif browser_names_seen:
             try:
                 mic_in_use = bool(self._mic_probe())
             except Exception as exc:

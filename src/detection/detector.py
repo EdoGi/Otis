@@ -291,6 +291,16 @@ class MeetingDetector:
 
     def _handle_process_detected(self, app_name: str) -> None:
         with self._lock:
+            # If a recording is already in progress, the process signal is
+            # advisory only — never overwrite RECORDING/PROCESSING state, even
+            # if a freshly-arrived calendar event would otherwise correlate.
+            # (Without this guard, an upcoming calendar alert that fires mid-
+            # recording would silently demote the UI to DETECTED while the
+            # recorder thread keeps writing audio, hiding Pause/Stop.)
+            if self._context.state in (MeetingState.RECORDING, MeetingState.PROCESSING):
+                if self._context.app is None:
+                    self._context.app = app_name
+                return
             now = self._now()
             matched = self._match_calendar_event(now)
             if matched is not None:
@@ -301,11 +311,6 @@ class MeetingDetector:
                     app_name,
                     matched.title,
                 )
-            elif self._context.state in (MeetingState.RECORDING, MeetingState.PROCESSING):
-                # Already recording — just note the app, don't fire a new event.
-                if self._context.app is None:
-                    self._context.app = app_name
-                return
             else:
                 # Ad-hoc: process appeared with no calendar correlation.
                 # Use the current wall clock as the start_time so the UI / next
