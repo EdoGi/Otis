@@ -4,9 +4,9 @@
 with Whisper on-device, exposes transcripts to Claude via MCP. Nothing leaves
 your Mac.
 
-[![status](https://img.shields.io/badge/phase-3%2F6-blue)](#phases) [![tests](https://img.shields.io/badge/tests-140%20passing-brightgreen)](#tests) [![python](https://img.shields.io/badge/python-3.12-blue)](https://www.python.org) [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![status](https://img.shields.io/badge/phase-5%2F6-blue)](#phases) [![tests](https://img.shields.io/badge/tests-250%2B%20passing-brightgreen)](#tests) [![python](https://img.shields.io/badge/python-3.12-blue)](https://www.python.org) [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-> Status: **Phase 3 of 6** — menu-bar UI + notifications shipped. Transcription pipeline lands in Phase 4.
+> Status: **Phase 5 of 6** — recording, transcription, and storage shipped. Web UI + MCP server land in Phase 6.
 
 ## Why
 
@@ -19,9 +19,9 @@ without sending the contents to anyone.
 
 1. **Project scaffold + audio engine** ✅
 2. **Meeting detection (Google Calendar + process monitoring)** ✅
-3. **Menu-bar UI + notifications** ← *you are here*
-4. Transcription pipeline (mlx-whisper, post-meeting batch)
-5. Storage (markdown + YAML frontmatter, retention policies)
+3. **Menu-bar UI + notifications** ✅
+4. **Transcription pipeline (mlx-whisper, post-meeting batch)** ✅
+5. **Storage (markdown + YAML frontmatter, retention policies)** ← *you are here*
 6. Web UI + MCP server
 
 ## Requirements
@@ -172,7 +172,9 @@ see the inline comment in the YAML.
 pytest
 ```
 
-140+ tests across audio, detection, daemon, and UI helpers. The suite uses a
+250+ tests across audio, detection, transcription, storage, daemon, and UI
+helpers, plus an aggressive end-to-end harness (`python scripts/stress_test.py`).
+The suite uses a
 fake `sounddevice` module and never touches a real CoreAudio stack, so it
 runs anywhere — useful for CI.
 

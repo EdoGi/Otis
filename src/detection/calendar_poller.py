@@ -138,6 +138,7 @@ class GoogleCalendarPoller:
         # Bookkeeping so we don't double-fire.
         self._alerted_upcoming: set[str] = set()
         self._alerted_ended: set[str] = set()
+        self._last_poll_date: Any = None  # datetime.date of the last poll cycle
         self._service: Any = None  # googleapiclient resource, lazy-built
 
     # =====================================================================
@@ -156,9 +157,15 @@ class GoogleCalendarPoller:
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
-        self._stop_event.clear()
+        # Fresh event per run: a previous thread that's still finishing a
+        # blocking network call keeps its own (already-set) event and exits
+        # on its own, instead of being resurrected by this clear().
+        self._stop_event = threading.Event()
         self._thread = threading.Thread(
-            target=self._run, name="otis-calendar-poller", daemon=True
+            target=self._run,
+            args=(self._stop_event,),
+            name="otis-calendar-poller",
+            daemon=True,
         )
         self._thread.start()
         logger.info(
@@ -168,9 +175,22 @@ class GoogleCalendarPoller:
         )
 
     def stop(self) -> None:
+        """Signal the poll loop to exit. Returns quickly.
+
+        The loop wakes immediately from its wait; the only thing that can
+        delay exit is a network fetch already in flight. Don't block the
+        caller (often the main/UI thread) on that — the thread is a daemon
+        and checks the stop event right after the fetch.
+        """
         self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=self._poll_interval + 1.0)
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=2.0)
+            if thread.is_alive():
+                logger.info(
+                    "Calendar poller still finishing its last cycle; "
+                    "it will exit on its own."
+                )
             self._thread = None
 
     def is_running(self) -> bool:
@@ -281,6 +301,7 @@ class GoogleCalendarPoller:
 
         seen_ids: set[str] = set()
         events: list[CalendarEvent] = []
+        failed_calendars = 0
         for cal_id in self._calendar_ids:
             try:
                 response = (
@@ -297,9 +318,7 @@ class GoogleCalendarPoller:
                 )
             except Exception as exc:
                 logger.warning("Calendar %r fetch failed: %s", cal_id, exc)
-                # Don't kill the cached service for one bad calendar — but
-                # if EVERY calendar fails the next cycle will rebuild it
-                # because of the resulting empty result set.
+                failed_calendars += 1
                 continue
 
             items = response.get("items", []) if isinstance(response, dict) else []
@@ -309,6 +328,18 @@ class GoogleCalendarPoller:
                     continue
                 seen_ids.add(ev.id)
                 events.append(ev)
+
+        # Every calendar failing usually means the cached service is dead
+        # (revoked token, expired credentials, long network change) — drop it
+        # so the next cycle rebuilds it through authenticate(), which also
+        # re-fires the reauth callback if the user has to intervene.
+        if failed_calendars and failed_calendars == len(self._calendar_ids):
+            logger.warning(
+                "All %d calendar fetch(es) failed; discarding cached service "
+                "so the next poll rebuilds it.",
+                failed_calendars,
+            )
+            self._service = None
 
         events.sort(key=lambda e: e.start)
         return events
@@ -330,21 +361,29 @@ class GoogleCalendarPoller:
     # =====================================================================
     # Internals
     # =====================================================================
-    def _run(self) -> None:
+    def _run(self, stop_event: threading.Event) -> None:
         backoff = self._poll_interval
-        while not self._stop_event.is_set():
+        while not stop_event.is_set():
             try:
                 self._poll_cycle()
                 backoff = self._poll_interval
             except Exception:  # pragma: no cover (defensive)
                 logger.exception("Calendar poll cycle crashed; backing off.")
                 backoff = min(backoff * 2, 600.0)
-            self._stop_event.wait(backoff)
+            stop_event.wait(backoff)
         logger.info("GoogleCalendarPoller stopped.")
 
     def _poll_cycle(self) -> None:
-        events = self.fetch_today_events()
         now = self._now()
+        # Day rollover: yesterday's alert bookkeeping is useless today and
+        # would otherwise grow unboundedly in a long-running app.
+        today = now.date()
+        if self._last_poll_date is not None and today != self._last_poll_date:
+            logger.info("Date rolled over to %s; resetting alert bookkeeping.", today)
+            self.reset_alerts()
+        self._last_poll_date = today
+
+        events = self.fetch_today_events()
         horizon = now + timedelta(minutes=self._pre_alert)
 
         for ev in events:

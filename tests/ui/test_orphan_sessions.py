@@ -133,6 +133,30 @@ def test_skips_sessions_already_transcribed(tmp_path: Path) -> None:
     assert out == []
 
 
+def test_failed_placeholder_does_not_hide_session(tmp_path: Path) -> None:
+    """A session whose transcription failed must STILL be offered for retry.
+
+    save_failure writes a status:failed transcript with the session id; that
+    placeholder used to make the session look transcribed and vanish from the
+    Generate Transcript menu.
+    """
+    sid = "failed-1"
+    audio = tmp_path / "audio"
+    transcripts = tmp_path / "transcripts"
+    audio.mkdir(); transcripts.mkdir()
+    _make_wav(audio / f"{sid}_mic.wav")
+    _write_metadata(audio / f"{sid}_metadata.json", session_id=sid)
+    store = TranscriptStore(transcripts)
+    store.save_failure(session_id=sid, error=RuntimeError("oom"), title="Big Call")
+
+    out = find_orphan_sessions(audio_dir=audio, store=store)
+    assert [e["session_id"] for e in out] == [sid]
+
+    # Once a real transcript lands, the session disappears from the list.
+    store.save(_basic_transcript(sid), "## Transcript\n\nbody")
+    assert find_orphan_sessions(audio_dir=audio, store=store) == []
+
+
 # ---------------------------------------------------------------------------
 # Pass 2 — orphan WAVs without metadata.json
 # ---------------------------------------------------------------------------

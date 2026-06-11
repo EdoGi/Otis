@@ -242,8 +242,23 @@ class MeetingDetector:
             if self._context.state == MeetingState.PROCESSING:
                 self._transition(MeetingState.IDLE)
                 self._context = MeetingContext()  # reset
-                self._alerted_uids.clear()
-                self._pending_approaching.clear()
+                # Only forget calendar events that are over. A back-to-back
+                # meeting B whose 2-min alert fired while meeting A was still
+                # recording must keep its pending entry, so B's process
+                # detection a moment later correlates to B's title/attendees
+                # instead of producing an "Ad-hoc Recording".
+                self._prune_stale_pending()
+
+    def _prune_stale_pending(self) -> None:
+        """Drop pending/alerted bookkeeping for events already past their end."""
+        now = self._now()
+        stale = [
+            key for key, event in self._pending_approaching.items()
+            if event.end <= now
+        ]
+        for key in stale:
+            self._pending_approaching.pop(key, None)
+            self._alerted_uids.discard(key)
 
     # =====================================================================
     # Signal handlers

@@ -364,15 +364,49 @@ class TranscriptProcessor:
     def _relocated_audio_paths(
         self, session: RecordingSession, local_start: datetime,
     ) -> dict[str, str | None]:
-        """Compute the post-rename relative paths under ``audio_dir``."""
+        """Compute the post-rename relative paths under ``audio_dir``.
+
+        Two recordings stopped within the same minute resolve to the same
+        ``YYYY-MM-DD_HHMM`` prefix, and ``shutil.move`` would silently
+        overwrite the first session's WAVs. Bump a numeric suffix until the
+        whole destination set is free. A destination that already exists but
+        *is* the session's own file (re-transcription of already-relocated
+        audio) doesn't count as a collision — the move becomes a no-op.
+        """
         date_str = local_start.strftime("%Y-%m-%d")
         time_compact = local_start.strftime("%H%M")
         rel_dir = f"{local_start.strftime('%Y')}/{local_start.strftime('%m')}"
-        prefix = f"{rel_dir}/{date_str}_{time_compact}"
-        return {
-            "mic": f"{prefix}_mic.wav",
-            "system": f"{prefix}_system.wav" if session.system_wav else None,
-        }
+        attempt = 1
+        while True:
+            base = f"{date_str}_{time_compact}" if attempt == 1 else (
+                f"{date_str}_{time_compact}_{attempt}"
+            )
+            prefix = f"{rel_dir}/{base}"
+            paths: dict[str, str | None] = {
+                "mic": f"{prefix}_mic.wav",
+                "system": f"{prefix}_system.wav" if session.system_wav else None,
+            }
+            if not self._relocation_collides(session, paths):
+                return paths
+            attempt += 1
+
+    def _relocation_collides(
+        self, session: RecordingSession, relative_paths: dict[str, str | None],
+    ) -> bool:
+        """True if any destination is taken by a file other than the source."""
+        mic_rel = relative_paths["mic"]
+        assert mic_rel is not None
+        pairs: list[tuple[Path, str]] = [
+            (session.mic_wav, mic_rel),
+            (session.metadata_path, mic_rel.replace("_mic.wav", "_metadata.json")),
+        ]
+        if session.system_wav is not None and relative_paths.get("system"):
+            pairs.append((session.system_wav, relative_paths["system"]))
+        for src, rel in pairs:
+            dst = self._audio_dir / rel
+            if dst.exists() and dst.resolve() != src.resolve():
+                return True
+        return False
 
     def _relocate_audio(
         self,

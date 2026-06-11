@@ -269,6 +269,83 @@ def test_fetch_swallows_api_errors() -> None:
     assert poller.fetch_today_events() == []
 
 
+def test_fetch_drops_cached_service_when_all_calendars_fail() -> None:
+    """A dead service (revoked token etc.) must be rebuilt, not cached forever."""
+
+    class _Boom:
+        def events(self):
+            return self
+
+        def list(self, **kwargs: Any):
+            return self
+
+        def execute(self) -> dict[str, Any]:
+            raise RuntimeError("invalid_grant")
+
+    now = datetime(2026, 5, 9, 8, 0, tzinfo=timezone.utc)
+    poller = GoogleCalendarPoller(
+        credentials_path="/nope.json",
+        clock=_fixed_clock(now),
+    )
+    poller._service = _Boom()  # type: ignore[attr-defined]
+    assert poller.fetch_today_events() == []
+    assert poller._service is None  # type: ignore[attr-defined]
+
+
+def test_fetch_keeps_service_when_only_one_calendar_fails() -> None:
+    now = datetime(2026, 5, 9, 8, 0, tzinfo=timezone.utc)
+
+    class _PartialService(_FakeService):
+        def execute(self) -> dict[str, Any]:
+            cal = (self.last_kwargs or {}).get("calendarId")
+            if cal == "broken@x.com":
+                raise RuntimeError("HTTP 404")
+            return super().execute()
+
+    poller = GoogleCalendarPoller(
+        credentials_path="/nope.json",
+        calendar_ids=["primary", "broken@x.com"],
+        clock=_fixed_clock(now),
+    )
+    fake = _PartialService(
+        [
+            {
+                "id": "a",
+                "summary": "Sync",
+                "start": {"dateTime": (now + timedelta(minutes=5)).isoformat()},
+                "end": {"dateTime": (now + timedelta(minutes=35)).isoformat()},
+            }
+        ]
+    )
+    poller._service = fake  # type: ignore[attr-defined]
+    events = poller.fetch_today_events()
+    assert [e.id for e in events] == ["a"]
+    assert poller._service is fake  # type: ignore[attr-defined]
+
+
+def test_poll_cycle_resets_alert_bookkeeping_on_date_rollover() -> None:
+    now = datetime(2026, 5, 9, 8, 0, tzinfo=timezone.utc)
+    items = [
+        {
+            "id": "evt",
+            "summary": "Daily",
+            "start": {"dateTime": (now + timedelta(minutes=1)).isoformat()},
+            "end": {"dateTime": (now + timedelta(minutes=2)).isoformat()},
+        }
+    ]
+    poller, _ = _make_poller(items, now=now)
+    poller._poll_cycle()
+    assert poller._alerted_upcoming  # type: ignore[attr-defined]
+
+    # Next day: stale ids from yesterday are cleared.
+    tomorrow = now + timedelta(days=1)
+    poller._now = _fixed_clock(tomorrow)  # type: ignore[attr-defined]
+    poller._service = _FakeService([])  # type: ignore[attr-defined]
+    poller._poll_cycle()
+    assert not poller._alerted_upcoming  # type: ignore[attr-defined]
+    assert not poller._alerted_ended  # type: ignore[attr-defined]
+
+
 def test_fetch_iterates_multiple_calendars_and_dedupes() -> None:
     """When ``calendar_ids`` lists multiple calendars, each is fetched and
     duplicate ids (the same event present on both) appear only once.

@@ -326,6 +326,69 @@ def test_concurrent_calendar_alert_during_detected_still_fires() -> None:
     assert detector.get_state() == MeetingState.DETECTED
 
 
+def test_back_to_back_meeting_correlates_after_transcription() -> None:
+    """Meeting B's alert fires during meeting A's recording; once A's
+    transcription finishes, B's process detection must still correlate to
+    B's calendar entry (title/attendees), not become an ad-hoc recording.
+    """
+    clock = {"now": datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc)}
+    pm = _FakeProcessMonitor()
+    cp = _FakeCalendarPoller()
+    detector = MeetingDetector(
+        process_monitor=pm,  # type: ignore[arg-type]
+        calendar_poller=cp,  # type: ignore[arg-type]
+        clock=lambda: clock["now"],
+    )
+
+    detector.user_started_recording()  # meeting A, manual
+    cp.fire_upcoming(
+        _evt(clock["now"] + timedelta(minutes=2), eid="meet-b", title="Meeting B")
+    )
+
+    # A ends, transcription runs and finishes; B starts 3 minutes later.
+    detector.user_stopped_recording()
+    detector.transcription_started()
+    clock["now"] += timedelta(minutes=2)
+    detector.transcription_finished()
+    clock["now"] += timedelta(minutes=1)
+
+    detected: list[MeetingContext] = []
+    detector.on_meeting_detected(detected.append)
+    pm.fire_detected("zoom.us")
+
+    assert len(detected) == 1
+    assert detected[0].title == "Meeting B"
+
+
+def test_transcription_finished_still_drops_expired_events() -> None:
+    """Events already past their end ARE forgotten when transcription ends."""
+    clock = {"now": datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc)}
+    pm = _FakeProcessMonitor()
+    cp = _FakeCalendarPoller()
+    detector = MeetingDetector(
+        process_monitor=pm,  # type: ignore[arg-type]
+        calendar_poller=cp,  # type: ignore[arg-type]
+        clock=lambda: clock["now"],
+    )
+
+    detector.user_started_recording()
+    cp.fire_upcoming(
+        _evt(clock["now"] + timedelta(minutes=2), eid="meet-b", title="Meeting B")
+    )
+    detector.user_stopped_recording()
+    detector.transcription_started()
+    # _evt ends 30 min after start; jump past that.
+    clock["now"] += timedelta(minutes=45)
+    detector.transcription_finished()
+
+    detected: list[MeetingContext] = []
+    detector.on_meeting_detected(detected.append)
+    pm.fire_detected("zoom.us")
+
+    assert len(detected) == 1
+    assert detected[0].title is None  # ad-hoc: stale event was pruned
+
+
 def test_concurrent_calendar_alert_for_same_meeting_is_suppressed() -> None:
     """If the new APPROACHING event's id matches the current context, it's the
     calendar's own 2-min alert for the meeting we're already tracking — not a

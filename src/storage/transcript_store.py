@@ -158,6 +158,11 @@ class TranscriptStore:
             )
         else:
             logger.info("Saved transcript: %s", target)
+        # A retry that lands on a new path (the failure placeholder's title
+        # differs, so its slug differs) would otherwise leave two files
+        # carrying the same id. Trash superseded failure placeholders.
+        if new_id and frontmatter.get("status") != "failed":
+            self._trash_stale_failures(new_id, keep=target)
         return target
 
     @staticmethod
@@ -203,7 +208,7 @@ class TranscriptStore:
             return None
         fm, body = split_frontmatter(path.read_text(encoding="utf-8"))
         fm.update(updates)
-        path.write_text(render_with_frontmatter(fm, body), encoding="utf-8")
+        self._atomic_write(path, render_with_frontmatter(fm, body))
         return path
 
     # =====================================================================
@@ -227,6 +232,23 @@ class TranscriptStore:
             if fm.get("id") == transcript_id:
                 return path
         return None
+
+    def has_completed_transcript(self, transcript_id: str) -> bool:
+        """True if a transcript exists that is NOT a failure placeholder.
+
+        Failure placeholders (``status: failed``) record that a transcription
+        was attempted and lost — the session should still count as
+        untranscribed so retry surfaces (the Generate Transcript menu) keep
+        offering it.
+        """
+        for path in self._iter_transcripts():
+            try:
+                fm = self._read_frontmatter_fast(path)
+            except Exception:
+                continue
+            if fm.get("id") == transcript_id and fm.get("status") != "failed":
+                return True
+        return False
 
     def list_transcripts(
         self,
@@ -310,7 +332,7 @@ class TranscriptStore:
             return True
         tags.append(tag)
         fm["tags"] = tags
-        path.write_text(render_with_frontmatter(fm, body), encoding="utf-8")
+        self._atomic_write(path, render_with_frontmatter(fm, body))
         return True
 
     def remove_tag(self, transcript_id: str, tag: str) -> bool:
@@ -323,7 +345,7 @@ class TranscriptStore:
             return True
         tags.remove(tag)
         fm["tags"] = tags
-        path.write_text(render_with_frontmatter(fm, body), encoding="utf-8")
+        self._atomic_write(path, render_with_frontmatter(fm, body))
         return True
 
     # =====================================================================
@@ -334,6 +356,10 @@ class TranscriptStore:
         path = self.path_for(transcript_id)
         if path is None:
             return None
+        return self._trash(path)
+
+    def _trash(self, path: Path) -> Path:
+        """Move ``path`` into ``.trash/`` (disambiguating) and return the new path."""
         self.trash_dir.mkdir(parents=True, exist_ok=True)
         target = self.trash_dir / path.name
         # Disambiguate if a file with the same name is already there.
@@ -344,6 +370,25 @@ class TranscriptStore:
         shutil.move(str(path), str(target))
         logger.info("Moved transcript to trash: %s → %s", path, target)
         return target
+
+    def _trash_stale_failures(self, transcript_id: str, *, keep: Path) -> None:
+        """Trash failure placeholders for ``transcript_id`` other than ``keep``."""
+        for path in list(self._iter_transcripts()):
+            if path == keep:
+                continue
+            try:
+                fm = self._read_frontmatter_fast(path)
+            except Exception:
+                continue
+            if fm.get("id") == transcript_id and fm.get("status") == "failed":
+                try:
+                    self._trash(path)
+                    logger.info(
+                        "Superseded failure placeholder for %s trashed: %s",
+                        transcript_id, path.name,
+                    )
+                except Exception:
+                    logger.exception("Could not trash stale failure %s", path)
 
     def mark_audio_unavailable(self, session_id: str) -> Path | None:
         """Update a transcript's ``audio_available`` flag to ``False``.

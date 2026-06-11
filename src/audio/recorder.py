@@ -149,6 +149,10 @@ class DualStreamRecorder:
         self._start_wall_clock: datetime | None = None
         self._pauses: list[dict[str, float]] = []
         self._current_pause_started: float | None = None
+        # Who initiated the current pause: "user" or "sleep". A wake event
+        # only auto-resumes a sleep-initiated pause — never one the user
+        # made deliberately before closing the lid.
+        self._pause_source: str | None = None
 
         # Sleep/wake observer (pyobjc-based). Lazily started.
         self._sleep_wake_observer: _SleepWakeObserver | None = None
@@ -231,20 +235,30 @@ class DualStreamRecorder:
             )
             return self._session_id
 
-    def pause(self) -> None:
+    def pause(self, *, source: str = "user") -> None:
         with self._state_lock:
             if self._state != RecorderState.RECORDING:
                 logger.debug("pause() ignored; state=%s", self._state)
                 return
             self._active.clear()
             self._current_pause_started = self._elapsed_seconds()
+            self._pause_source = source
             self._state = RecorderState.PAUSED
-            logger.info("Recording paused at %.3fs", self._current_pause_started)
+            logger.info(
+                "Recording paused at %.3fs (source=%s)",
+                self._current_pause_started, source,
+            )
 
-    def resume(self) -> None:
+    def resume(self, *, source: str = "user") -> None:
         with self._state_lock:
             if self._state != RecorderState.PAUSED:
                 logger.debug("resume() ignored; state=%s", self._state)
+                return
+            if source == "wake" and self._pause_source != "sleep":
+                logger.info(
+                    "Wake resume skipped — pause was user-initiated; "
+                    "recording stays paused."
+                )
                 return
             now = self._elapsed_seconds()
             if self._current_pause_started is not None:
@@ -252,9 +266,10 @@ class DualStreamRecorder:
                     {"paused_at": self._current_pause_started, "resumed_at": now}
                 )
                 self._current_pause_started = None
+            self._pause_source = None
             self._active.set()
             self._state = RecorderState.RECORDING
-            logger.info("Recording resumed at %.3fs", now)
+            logger.info("Recording resumed at %.3fs (source=%s)", now, source)
 
     def stop(self) -> dict[str, Any]:
         """Stop recording, flush WAV files, write metadata. Returns metadata dict.
@@ -497,14 +512,14 @@ class DualStreamRecorder:
     def _handle_system_sleep(self) -> None:
         logger.info("System sleep detected — pausing recording.")
         try:
-            self.pause()
+            self.pause(source="sleep")
         except Exception:  # pragma: no cover
             logger.exception("Failed to pause on system sleep")
 
     def _handle_system_wake(self) -> None:
         logger.info("System wake detected — resuming recording.")
         try:
-            self.resume()
+            self.resume(source="wake")
         except Exception:  # pragma: no cover
             logger.exception("Failed to resume on system wake")
 

@@ -125,6 +125,49 @@ def test_pause_and_resume_logged_in_metadata(
     assert p["resumed_at"] > p["paused_at"]
 
 
+def test_wake_does_not_resume_user_initiated_pause(
+    fake_sounddevice, tmp_path: Path  # noqa: ARG001
+) -> None:
+    """User pauses, lid closes, Mac wakes — recording must stay paused."""
+    rec = _make_recorder(tmp_path)
+    rec.start()
+    rec.pause()  # user
+    rec.pause(source="sleep")  # no-op (already paused), source stays "user"
+    rec.resume(source="wake")
+    assert rec.state == RecorderState.PAUSED
+    # The user can still resume explicitly.
+    rec.resume()
+    assert rec.state == RecorderState.RECORDING
+    rec.stop()
+
+
+def test_wake_resumes_sleep_initiated_pause(
+    fake_sounddevice, tmp_path: Path  # noqa: ARG001
+) -> None:
+    rec = _make_recorder(tmp_path)
+    rec.start()
+    rec.pause(source="sleep")
+    assert rec.state == RecorderState.PAUSED
+    rec.resume(source="wake")
+    assert rec.state == RecorderState.RECORDING
+    meta = rec.stop()
+    assert len(meta["pauses"]) == 1
+
+
+def test_user_resume_clears_pause_source(
+    fake_sounddevice, tmp_path: Path  # noqa: ARG001
+) -> None:
+    """After a full user pause/resume cycle, sleep/wake behaves normally again."""
+    rec = _make_recorder(tmp_path)
+    rec.start()
+    rec.pause()
+    rec.resume()
+    rec.pause(source="sleep")
+    rec.resume(source="wake")
+    assert rec.state == RecorderState.RECORDING
+    rec.stop()
+
+
 def test_pause_while_idle_is_a_noop(tmp_path: Path) -> None:
     rec = DualStreamRecorder(
         audio_dir=tmp_path,

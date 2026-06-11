@@ -192,6 +192,10 @@ class UiSnapshot:
 
     state: str = UiState.IDLE
     recording_started_monotonic: float | None = None
+    # When the current pause began. While paused, elapsed time freezes; on
+    # resume, recording_started_monotonic is shifted forward by the pause
+    # length so the MM:SS counter only counts recorded time.
+    paused_at_monotonic: float | None = None
     current_meeting: MeetingContext | None = None
     selected_language_code: str | None = None
     show_off_hours: bool = False
@@ -548,6 +552,7 @@ class MenuBarApp:
     # Main-thread queue drain (rumps.Timer)
     # =====================================================================
     def _drain_main_queue(self, _timer: Any) -> None:
+        self._sync_recorder_state()
         while True:
             try:
                 event_type, payload = self._events.get_nowait()
@@ -557,6 +562,28 @@ class MenuBarApp:
                 self._handle_event(event_type, payload)
             except Exception:  # pragma: no cover (defensive)
                 logger.exception("Error handling main-thread event %s", event_type)
+
+    def _sync_recorder_state(self) -> None:
+        """Mirror recorder-initiated pause/resume into the UI.
+
+        The recorder pauses/resumes itself on system sleep/wake (on the
+        sleep-wake observer thread). Without this sync the icon would keep
+        showing RECORDING while the recorder is paused. User-initiated
+        clicks already update both sides on the main thread, so this only
+        fires for the sleep/wake transitions.
+        """
+        with self._lock:
+            recorder = self._recorder
+            ui_state = self._snapshot.state
+        if recorder is None:
+            return
+        if recorder.state == RecorderState.PAUSED and ui_state == UiState.RECORDING:
+            logger.info("Recorder paused itself (system sleep); updating UI.")
+            self._set_state(UiState.PAUSED)
+        elif recorder.state == RecorderState.RECORDING and ui_state == UiState.PAUSED:
+            logger.info("Recorder resumed itself (system wake); updating UI.")
+            self._set_state(UiState.RECORDING)
+            self._timer_duration.start()
 
     def _handle_event(self, event_type: str, payload: Any) -> None:
         # Background detector signals must never demote the UI out of an
@@ -854,8 +881,19 @@ class MenuBarApp:
             if state == UiState.RECORDING:
                 if self._snapshot.recording_started_monotonic is None:
                     self._snapshot.recording_started_monotonic = time.monotonic()
+                elif self._snapshot.paused_at_monotonic is not None:
+                    # Resuming: shift the anchor forward by the pause length
+                    # so the MM:SS counter excludes time spent paused.
+                    self._snapshot.recording_started_monotonic += (
+                        time.monotonic() - self._snapshot.paused_at_monotonic
+                    )
+                self._snapshot.paused_at_monotonic = None
+            elif state == UiState.PAUSED:
+                if self._snapshot.paused_at_monotonic is None:
+                    self._snapshot.paused_at_monotonic = time.monotonic()
             elif state in (UiState.IDLE, UiState.OFF_HOURS):
                 self._snapshot.recording_started_monotonic = None
+                self._snapshot.paused_at_monotonic = None
                 self._snapshot.current_meeting = None
 
         self._set_icon(state)
@@ -1524,10 +1562,13 @@ def _resolve_session_audio(
 
 
 def _session_has_transcript(store: TranscriptStore | None, session_id: str) -> bool:
+    """True only for a *successful* transcript — a ``status: failed``
+    placeholder must not hide the session from the Generate Transcript menu,
+    which exists precisely to retry it."""
     if store is None:
         return False
     try:
-        return store.path_for(session_id) is not None
+        return store.has_completed_transcript(session_id)
     except Exception:
         return False
 

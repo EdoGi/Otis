@@ -162,7 +162,7 @@ def _make_recording_session(
     with_system: bool = True,
 ) -> RecordingSession:
     audio_dir = tmp_path / "audio"
-    audio_dir.mkdir()
+    audio_dir.mkdir(exist_ok=True)
     mic_wav = audio_dir / f"{session_id}_mic.wav"
     sys_wav = audio_dir / f"{session_id}_system.wav"
     metadata_path = audio_dir / f"{session_id}_metadata.json"
@@ -363,6 +363,85 @@ def test_process_relocates_audio_into_year_month_tree(tmp_path: Path) -> None:
         f"{local_start.strftime('%Y-%m-%d_%H%M_mic.wav')}"
     )
     assert result.metadata["audio_files"]["mic"] == expected_relative
+
+
+def test_process_same_minute_sessions_do_not_clobber_audio(tmp_path: Path) -> None:
+    """Two recordings stopped in the same minute must keep separate WAVs.
+
+    Both sessions share the same wall-clock start (same YYYY-MM-DD_HHMM
+    prefix); the second relocation used to shutil.move straight over the
+    first session's audio + metadata.
+    """
+    store = TranscriptStore(tmp_path / "transcripts")
+    results = []
+    for sid in (
+        "aaaa1111-0000-0000-0000-000000000001",
+        "bbbb2222-0000-0000-0000-000000000002",
+    ):
+        session = _make_recording_session(tmp_path, session_id=sid)
+        engine = _engine_returning(
+            mic_segments=[(0.0, 1.0, "x")], system_segments=[(0.0, 1.0, "y")]
+        )
+        processor = TranscriptProcessor(
+            engine=engine, store=store, audio_dir=session.audio_dir
+        )
+        results.append(processor.process(session, meeting=MeetingSnapshot()))
+
+    audio_dir = tmp_path / "audio"
+    mic_wavs = sorted(audio_dir.rglob("*_mic.wav"))
+    sys_wavs = sorted(audio_dir.rglob("*_system.wav"))
+    metas = sorted(audio_dir.rglob("*_metadata.json"))
+    assert len(mic_wavs) == 2, [p.name for p in mic_wavs]
+    assert len(sys_wavs) == 2
+    assert len(metas) == 2
+    # Each transcript points at its own audio file.
+    mic_refs = {r.metadata["audio_files"]["mic"] for r in results}
+    assert len(mic_refs) == 2
+    # The surviving metadata files still belong to distinct sessions.
+    session_ids = {json.loads(p.read_text())["session_id"] for p in metas}
+    assert len(session_ids) == 2
+
+
+def test_process_retranscribe_relocated_audio_reuses_paths(tmp_path: Path) -> None:
+    """Re-running on already-relocated audio must not bump to a _2 suffix."""
+    store = TranscriptStore(tmp_path / "transcripts")
+    session = _make_recording_session(tmp_path)
+    engine = _engine_returning(
+        mic_segments=[(0.0, 1.0, "x")], system_segments=[(0.0, 1.0, "y")]
+    )
+    processor = TranscriptProcessor(
+        engine=engine, store=store, audio_dir=session.audio_dir
+    )
+    first = processor.process(session, meeting=MeetingSnapshot())
+
+    relocated_mic = session.audio_dir / first.metadata["audio_files"]["mic"]
+    relocated_sys = session.audio_dir / first.metadata["audio_files"]["system"]
+    relocated_meta = relocated_mic.with_name(
+        relocated_mic.name.replace("_mic.wav", "_metadata.json")
+    )
+    assert relocated_mic.exists() and relocated_meta.exists()
+
+    second_session = RecordingSession(
+        session_id=session.session_id,
+        audio_dir=session.audio_dir,
+        mic_wav=relocated_mic,
+        system_wav=relocated_sys,
+        metadata_path=relocated_meta,
+        mic_start_monotonic=session.mic_start_monotonic,
+        system_start_monotonic=session.system_start_monotonic,
+        start_wall_clock=session.start_wall_clock,
+        sample_rate=16000,
+    )
+    engine2 = _engine_returning(
+        mic_segments=[(0.0, 1.0, "x")], system_segments=[(0.0, 1.0, "y")]
+    )
+    processor2 = TranscriptProcessor(
+        engine=engine2, store=store, audio_dir=session.audio_dir
+    )
+    second = processor2.process(second_session, meeting=MeetingSnapshot())
+
+    assert second.metadata["audio_files"]["mic"] == first.metadata["audio_files"]["mic"]
+    assert len(list((tmp_path / "audio").rglob("*_mic.wav"))) == 1
 
 
 def test_process_progress_reaches_100(tmp_path: Path) -> None:

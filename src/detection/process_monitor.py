@@ -138,9 +138,14 @@ class ProcessMonitor:
         if self._thread is not None and self._thread.is_alive():
             logger.debug("ProcessMonitor already running.")
             return
-        self._stop_event.clear()
+        # Fresh event per run so a previous thread that's still mid-scan
+        # can't be resurrected by clearing a shared event.
+        self._stop_event = threading.Event()
         self._thread = threading.Thread(
-            target=self._run, name="otis-process-monitor", daemon=True
+            target=self._run,
+            args=(self._stop_event,),
+            name="otis-process-monitor",
+            daemon=True,
         )
         self._thread.start()
         logger.info(
@@ -153,8 +158,14 @@ class ProcessMonitor:
     def stop(self) -> None:
         """Signal the polling thread to stop and wait briefly for it to exit."""
         self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=self._poll_interval + 1.0)
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=2.0)
+            if thread.is_alive():  # pragma: no cover (slow process scan)
+                logger.info(
+                    "ProcessMonitor still finishing its last scan; "
+                    "it will exit on its own."
+                )
             self._thread = None
 
     def is_running(self) -> bool:
@@ -238,13 +249,13 @@ class ProcessMonitor:
     # =====================================================================
     # Internals
     # =====================================================================
-    def _run(self) -> None:
-        while not self._stop_event.is_set():
+    def _run(self, stop_event: threading.Event) -> None:
+        while not stop_event.is_set():
             try:
                 self.poll_once()
             except Exception:  # pragma: no cover (defensive)
                 logger.exception("ProcessMonitor poll cycle crashed; continuing.")
-            self._stop_event.wait(self._poll_interval)
+            stop_event.wait(self._poll_interval)
         logger.info("ProcessMonitor stopped.")
 
     def _reconcile(self, seen: set[str], pids_by_name: dict[str, set[int]]) -> None:

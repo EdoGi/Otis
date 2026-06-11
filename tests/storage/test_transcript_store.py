@@ -338,6 +338,43 @@ def test_save_failure_appears_in_listing_with_failed_tag(tmp_path: Path) -> None
     assert {fm["id"] for fm in listed_all} == {"ok-1", "bad-1"}
 
 
+def test_has_completed_transcript_ignores_failure_placeholders(tmp_path: Path) -> None:
+    store = TranscriptStore(tmp_path)
+    store.save_failure(session_id="sess-1", error=RuntimeError("boom"), title="Sync")
+    assert store.path_for("sess-1") is not None  # placeholder is on disk
+    assert store.has_completed_transcript("sess-1") is False
+
+    store.save(_fm(session_id="sess-1", title="Sync"), "## Transcript")
+    assert store.has_completed_transcript("sess-1") is True
+
+
+def test_successful_save_trashes_superseded_failure_placeholder(tmp_path: Path) -> None:
+    """A retry that succeeds must not leave two files with the same id."""
+    store = TranscriptStore(tmp_path)
+    placeholder = store.save_failure(
+        session_id="sess-2", error=RuntimeError("boom"), title="Standup"
+    )
+    real = store.save(_fm(session_id="sess-2", title="Standup"), "## Transcript")
+
+    assert real.exists()
+    assert not placeholder.exists()
+    # The placeholder went to .trash, not into the void.
+    assert list(store.trash_dir.glob("*.md"))
+    # Listings now resolve sess-2 to exactly the successful transcript.
+    listed = [fm for fm in store.list_transcripts() if fm["id"] == "sess-2"]
+    assert len(listed) == 1
+    assert listed[0].get("status") != "failed"
+
+
+def test_repeated_failures_keep_only_latest_placeholder(tmp_path: Path) -> None:
+    store = TranscriptStore(tmp_path)
+    store.save_failure(session_id="sess-3", error=RuntimeError("first"), title="Call")
+    store.save_failure(session_id="sess-3", error=RuntimeError("second"), title="Call")
+    listed = [fm for fm in store.list_transcripts() if fm["id"] == "sess-3"]
+    assert len(listed) == 1
+    assert store.has_completed_transcript("sess-3") is False
+
+
 def test_save_failure_with_unknown_audio_paths_uses_placeholder_text(tmp_path: Path) -> None:
     store = TranscriptStore(tmp_path)
     path = store.save_failure(
