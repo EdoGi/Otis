@@ -168,6 +168,20 @@ class DualStreamRecorder:
     def session_id(self) -> str | None:
         return self._session_id
 
+    @property
+    def on_device_error(self) -> Callable[[str, Exception], None] | None:
+        return self._on_device_error
+
+    @on_device_error.setter
+    def on_device_error(self, callback: Callable[[str, Exception], None] | None) -> None:
+        """Late-bind the device-error callback.
+
+        The UI builds recorders through a config-only factory, so it can't
+        pass the callback at construction time — it sets it here right
+        before ``start()``.
+        """
+        self._on_device_error = callback
+
     def start(self, session_id: str | None = None) -> str:
         """Begin recording. Returns the session id.
 
@@ -380,6 +394,8 @@ class DualStreamRecorder:
             if status:
                 # Non-fatal warnings (input_overflow etc.) — log but keep going.
                 logger.warning("[%s] sounddevice status: %s", st.label, status)
+            if st.error is not None:
+                return  # writer thread is dead; queueing would grow unbounded
             if not self._active.is_set():
                 return  # paused — drop frames
             try:

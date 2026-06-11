@@ -1,6 +1,5 @@
 app:
   name: "Otis"
-  launch_at_login: true
   working_days: [0, 1, 2, 3, 4]  # 0=Monday, 1=Tuesday, ..., 6=Sunday (matches Python datetime.weekday())
   working_hours:
     start: "08:00"
@@ -11,7 +10,6 @@ audio:
   system_audio_device: "BlackHole 2ch"
   sample_rate: 16000
   channels: 1  # mono per stream
-  format: "wav"
 
 detection:
   process_monitor:
@@ -52,10 +50,8 @@ detection:
           - "primary"
   mic_activation:
     enabled: true
-    trigger_apps_only: true  # only trigger if mic is grabbed by a whitelisted app
 
 transcription:
-  engine: "mlx-whisper"  # mlx-whisper (recommended, native Apple Silicon)
   model: "small"  # tiny, base, small, medium, large-v3
   language: null  # null = auto-detect
 
@@ -64,10 +60,11 @@ storage:
   audio_dir: "~/Otis/audio"
   audio_retention_days: 30
 
+# Local transcript browser, started automatically by `otis ui`.
 web:
   port: 8765
   host: "127.0.0.1"
 
-mcp:
-  enabled: true
-  port: 8766
+# The MCP server runs over stdio and is launched by the MCP client itself
+# (e.g. `claude mcp add otis -- <repo>/.venv/bin/python -m src.mcp.server`),
+# so it needs no configuration here.

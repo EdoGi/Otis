@@ -4,9 +4,9 @@
 with Whisper on-device, exposes transcripts to Claude via MCP. Nothing leaves
 your Mac.
 
-[![status](https://img.shields.io/badge/phase-5%2F6-blue)](#phases) [![tests](https://img.shields.io/badge/tests-250%2B%20passing-brightgreen)](#tests) [![python](https://img.shields.io/badge/python-3.12-blue)](https://www.python.org) [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![status](https://img.shields.io/badge/phase-6%2F6-blue)](#phases) [![tests](https://img.shields.io/badge/tests-315%2B%20passing-brightgreen)](#tests) [![python](https://img.shields.io/badge/python-3.12-blue)](https://www.python.org) [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-> Status: **Phase 5 of 6** — recording, transcription, and storage shipped. Web UI + MCP server land in Phase 6.
+> Status: **Phase 6 of 6** — all phases shipped: recording, detection, transcription, storage, web UI, and the MCP server for Claude.
 
 ## Why
 
@@ -21,8 +21,8 @@ without sending the contents to anyone.
 2. **Meeting detection (Google Calendar + process monitoring)** ✅
 3. **Menu-bar UI + notifications** ✅
 4. **Transcription pipeline (mlx-whisper, post-meeting batch)** ✅
-5. **Storage (markdown + YAML frontmatter, retention policies)** ← *you are here*
-6. Web UI + MCP server
+5. **Storage (markdown + YAML frontmatter, retention policies)** ✅
+6. **Web UI + MCP server** ✅
 
 ## Requirements
 
@@ -78,8 +78,12 @@ itself is per-machine — not committed to the repo.
 ```bash
 ./scripts/run.sh                # menu-bar app (default)
 ./scripts/run.sh check-audio    # one-shot: BlackHole + audio device list
-./scripts/run.sh run            # headless daemon (auto-records on detection)
+./scripts/run.sh run            # headless daemon: auto-records AND transcribes
 ```
+
+The headless daemon (`otis run`) uses the same pipeline as the menu bar: it
+reads your `~/.otis/config.yaml` overrides, honours working days/hours, and
+transcribes each recording when the meeting ends.
 
 In the menu bar you'll get an Otis mic icon. Click it for the menu:
 
@@ -93,15 +97,19 @@ Stop & Transcribe        (visible while RECORDING / PAUSED)
 ─────
 Language: Auto-detect    (Auto / English / French / Italian / Portuguese / Spanish / German)
 ─────
-Open Transcripts         → http://127.0.0.1:8765 (Phase 6)
+Open Transcripts         → http://127.0.0.1:8765 (local web UI)
 Open Transcripts Folder  → ~/Otis/transcripts in Finder
 ─────
 Settings                 (Whisper model · Working days · Working hours · App whitelist)
 ─────
+Generate Transcript      (retry orphaned / failed recordings)
 Recent Transcripts       (last 5 — clickable)
 ─────
 About Otis · Quit
 ```
+
+While a transcription runs, the menu-bar title shows live progress (`47%`)
+next to the blue PROCESSING icon.
 
 ### Icon states
 
@@ -121,6 +129,53 @@ macOS Notification Center for: `meeting_approaching`, `meeting_detected`,
 `recording_started`, `recording_paused`, `process_disappeared`,
 `transcription_complete`, `error`. Rate-limited to one notification per type
 per 30 s.
+
+## Web UI
+
+`otis ui` automatically serves a local transcript browser at
+**http://127.0.0.1:8765** (configurable via `web.host` / `web.port`):
+list + filter, full-text search with snippets, and a per-meeting reader.
+"Open Transcripts" in the menu bar takes you straight there. No JavaScript,
+nothing leaves the machine; if the port is busy Otis keeps running and tells
+you via a notification.
+
+Run it standalone (without the menu bar):
+
+```bash
+.venv/bin/python -m src.web.server
+```
+
+## MCP server (Claude integration)
+
+The MCP server gives Claude read-only access to your transcripts — search,
+list, and fetch — over **stdio**, launched by the client itself (nothing to
+start or keep running):
+
+```bash
+# Claude Code:
+claude mcp add otis -- /path/to/Otis/.venv/bin/python -m src.mcp.server
+```
+
+Or in Claude Desktop's `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "otis": {
+      "command": "/path/to/Otis/.venv/bin/python",
+      "args": ["-m", "src.mcp.server"]
+    }
+  }
+}
+```
+
+Three read-only tools are exposed:
+
+| Tool | What it does |
+|---|---|
+| `list_transcripts` | Browse metadata, filtered by date range / participant / tag / language / title. |
+| `search_transcripts` | Full-text search across bodies; returns snippets per hit. |
+| `get_transcript` | Fetch one meeting in full (frontmatter + Markdown body) by id. |
 
 ## Auto-launch at login
 
@@ -172,11 +227,12 @@ see the inline comment in the YAML.
 pytest
 ```
 
-250+ tests across audio, detection, transcription, storage, daemon, and UI
-helpers, plus an aggressive end-to-end harness (`python scripts/stress_test.py`).
-The suite uses a
-fake `sounddevice` module and never touches a real CoreAudio stack, so it
-runs anywhere — useful for CI.
+315+ tests across audio, detection, transcription, storage, daemon, web, MCP,
+and UI, plus an aggressive end-to-end harness (`python scripts/stress_test.py`,
+22 checks). The suite uses a fake `sounddevice` module and never touches a
+real CoreAudio stack, so it runs anywhere — the only exception is the
+menu-bar behavioural tests, which need macOS + rumps and skip themselves
+elsewhere.
 
 ## Layout
 
@@ -197,8 +253,12 @@ otis/
 ├── scripts/
 │   ├── setup.sh                  # full bootstrap
 │   ├── run.sh                    # daily launcher
+│   ├── build_app.sh              # build the double-clickable Otis.app
 │   ├── setup_blackhole.sh
 │   ├── setup_google_cal.sh
+│   ├── retranscribe.py           # redo old sessions (bigger model, crash recovery)
+│   ├── stress_test.py            # aggressive end-to-end harness (22 checks)
+│   ├── regenerate_icons.py
 │   ├── list_calendars.py
 │   ├── list_devices.py
 │   ├── probe_mic.py
@@ -215,7 +275,8 @@ Everything is on-device:
 - Audio capture runs locally via `sounddevice` + BlackHole.
 - Transcription runs locally via `mlx-whisper` (Apple Silicon GPU).
 - Transcripts are written as Markdown files in `~/Otis/transcripts/`.
-- The MCP server binds to `127.0.0.1` only.
+- The web UI binds to `127.0.0.1` only; the MCP server runs over stdio
+  (no network socket at all) and is read-only.
 - The Google Calendar token is OAuth-2 with the **read-only** scope —
   Otis can't write to or delete your calendars.
 - No telemetry. No analytics. No phone-home.

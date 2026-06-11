@@ -42,19 +42,21 @@ import os
 import queue
 import threading
 import time
-from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
-from datetime import datetime, time as dtime, timezone
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from src.audio.recorder import DualStreamRecorder, RecorderState
+from src.audio.wav_repair import repair_if_needed
 from src.config import Config
 from src.detection.detector import (
     MeetingContext,
     MeetingDetector,
     MeetingState,
 )
+from src.schedule import is_within_working_hours, working_hours_from_config
 from src.storage.transcript_store import TranscriptStore
 from src.ui.icons import ensure_icons
 from src.ui.notifications import (
@@ -81,6 +83,10 @@ WHISPER_MODELS: list[str] = ["tiny", "base", "small", "medium", "large-v3"]
 
 WEEKDAY_NAMES: list[str] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
+# Hour presets offered in Settings → Working Hours.
+HOUR_START_PRESETS: list[str] = [f"{h:02d}:00" for h in range(6, 13)]   # 06:00–12:00
+HOUR_END_PRESETS: list[str] = [f"{h:02d}:00" for h in range(14, 23)]    # 14:00–22:00
+
 # Polling cadences for main-thread timers (rumps.Timer).
 QUEUE_DRAIN_INTERVAL = 0.1   # 100 ms — main-thread event drain
 BLINK_INTERVAL = 0.5         # 500 ms — DETECTED state blink
@@ -91,31 +97,6 @@ SCHEDULE_CHECK_INTERVAL = 60  # 60 s — off-hours window check
 # ============================================================================
 # Helpers used both by the live app and by tests.
 # ============================================================================
-def is_within_working_hours(
-    now: datetime,
-    *,
-    working_days: Iterable[int],
-    start_hhmm: str,
-    end_hhmm: str,
-) -> bool:
-    """Return True iff ``now`` falls inside the configured work window.
-
-    ``working_days`` are Python weekday() values (0 = Monday … 6 = Sunday).
-    ``start_hhmm`` / ``end_hhmm`` are ``"HH:MM"`` strings in local time.
-    """
-    if now.weekday() not in set(working_days):
-        return False
-    try:
-        sh, sm = map(int, start_hhmm.split(":"))
-        eh, em = map(int, end_hhmm.split(":"))
-    except (ValueError, AttributeError):
-        return True  # malformed config → don't block
-    start = dtime(sh, sm)
-    end = dtime(eh, em)
-    cur = now.time()
-    return start <= cur <= end
-
-
 def format_duration_mmss(seconds: float) -> str:
     """``93.4 -> "01:33"`` — used in the menu-bar title during recording."""
     seconds = max(0, int(seconds))
@@ -305,10 +286,7 @@ class MenuBarApp:
         # we'd run detection for up to ``SCHEDULE_CHECK_INTERVAL`` seconds even
         # though we're outside the window.
         in_window = is_within_working_hours(
-            datetime.now(),
-            working_days=self._config.get("app", "working_days", default=[0, 1, 2, 3, 4]),
-            start_hhmm=self._config.get("app", "working_hours", "start", default="08:00"),
-            end_hhmm=self._config.get("app", "working_hours", "end", default="20:00"),
+            datetime.now(), **working_hours_from_config(self._config)
         )
         if in_window:
             self._detector.start()
@@ -346,6 +324,14 @@ class MenuBarApp:
             "System audio won't be captured. Run scripts/setup_blackhole.sh.",
             force=True,
         )
+
+    def notify_transcription_progress(self, pct: int) -> None:
+        """Surface transcription progress in the menu-bar title (thread-safe).
+
+        Called by the transcription handler from its worker thread; the
+        actual title mutation happens on the main thread via the event queue.
+        """
+        self._events.put(("progress", int(pct)))
 
     # ---- read-only views, mostly for tests ----
     @property
@@ -483,13 +469,20 @@ class MenuBarApp:
             days_root.add(it)
         self._mi["settings_days_root"] = days_root
 
-        # Working hours (display only — editing is a Phase 4+ polish)
-        hours_root = rumps.MenuItem(
-            "Working Hours: "
-            f"{self._config.get('app', 'working_hours', 'start', default='08:00')} → "
-            f"{self._config.get('app', 'working_hours', 'end', default='20:00')}"
-        )
+        # Working hours — Start / End submenus with hourly presets.
+        hours_root = rumps.MenuItem(self._working_hours_title())
+        self._hour_items: dict[tuple[str, str], rumps.MenuItem] = {}
+        for which, presets in (("start", HOUR_START_PRESETS), ("end", HOUR_END_PRESETS)):
+            sub = rumps.MenuItem(which.capitalize())
+            for hhmm in presets:
+                it = rumps.MenuItem(hhmm, callback=self._on_working_hour_picked)
+                it._otis_which = which  # type: ignore[attr-defined]
+                it._otis_hhmm = hhmm  # type: ignore[attr-defined]
+                self._hour_items[(which, hhmm)] = it
+                sub.add(it)
+            hours_root.add(sub)
         self._mi["settings_hours_root"] = hours_root
+        self._update_working_hours_menu()
 
         # App whitelist
         wl_root = rumps.MenuItem("App Whitelist")
@@ -547,6 +540,11 @@ class MenuBarApp:
     def _cb_process_gone(self, app_name: str) -> None:
         logger.debug("detector → process gone: %s", app_name)
         self._events.put(("process_gone", app_name))
+
+    def _cb_device_error(self, stream_label: str, exc: Exception) -> None:
+        """Recorder writer thread reports a dead capture stream (bg thread)."""
+        logger.error("recorder → device error on %s stream: %s", stream_label, exc)
+        self._events.put(("device_error", (stream_label, exc)))
 
     # =====================================================================
     # Main-thread queue drain (rumps.Timer)
@@ -661,10 +659,31 @@ class MenuBarApp:
             self._notifications.notify(
                 NotificationType.PROCESS_DISAPPEARED, title, body
             )
+        elif event_type == "device_error":
+            # A capture stream died mid-recording (device unplugged, disk
+            # error). Don't auto-stop — the other stream may still be
+            # capturing fine; the user decides whether to Stop & Transcribe.
+            stream_label, exc = payload
+            self._notifications.notify(
+                NotificationType.ERROR,
+                f"{stream_label.capitalize()} stream failed",
+                f"{exc} — the other stream keeps recording. "
+                "Stop & Transcribe to save what was captured.",
+                force=True,
+            )
         elif event_type == "force_state":
             # Used by background threads (e.g. the transcription worker) to
             # request a state change on the main thread.
             self._set_state(payload)
+        elif event_type == "progress":
+            # Live transcription progress next to the blue PROCESSING icon.
+            # Ignore stale events that arrive after the state moved on —
+            # _set_state already cleared the title at that transition.
+            if self._snapshot.state == UiState.PROCESSING:
+                try:
+                    self._app.title = f"{payload}%"
+                except Exception:  # pragma: no cover
+                    logger.exception("Could not set progress title")
         elif event_type == "refresh_recent":
             # The transcription worker just landed (or failed); reload the
             # Recent Transcripts submenu so the new item shows up.
@@ -700,26 +719,30 @@ class MenuBarApp:
     def _on_stop_clicked(self, _sender: Any) -> None:
         self._do_stop_and_transcribe()
 
+    def _persist_setting(self, overrides: dict[str, Any]) -> None:
+        """Persist a settings change to disk AND the live config.
+
+        Without the in-memory half, anything that re-reads ``self._config``
+        (the schedule tick, the next transcription) would keep seeing the
+        stale pre-toggle value until restart.
+        """
+        write_user_config_override(self._user_config_path, overrides)
+        self._config.apply_overrides(overrides)
+
     def _on_language_picked(self, sender: Any) -> None:
         code = getattr(sender, "_otis_lang_code", None)
         with self._lock:
             self._snapshot.selected_language_code = code
         self._update_language_menu(code)
-        # Persist so the choice survives restart and Phase 4's transcription
+        # Persist so the choice survives restart and the transcription
         # pipeline picks it up via load_user_config().
-        write_user_config_override(
-            self._user_config_path,
-            {"transcription": {"language": code}},
-        )
+        self._persist_setting({"transcription": {"language": code}})
 
     def _on_model_picked(self, sender: Any) -> None:
         model = sender.title
         if model not in WHISPER_MODELS:
             return
-        write_user_config_override(
-            self._user_config_path,
-            {"transcription": {"model": model}},
-        )
+        self._persist_setting({"transcription": {"model": model}})
         self._mi["settings_model_root"].title = f"Whisper Model: {model}"
         self._update_model_menu(active=model)
 
@@ -729,17 +752,16 @@ class MenuBarApp:
             return
         sender.state = not sender.state
         active = sorted(i for i, item in self._day_items.items() if item.state)
-        write_user_config_override(
-            self._user_config_path,
-            {"app": {"working_days": active}},
-        )
+        self._persist_setting({"app": {"working_days": active}})
+        # Re-evaluate the window right away — a day toggle can flip us
+        # into/out of OFF_HOURS without waiting up to 60 s for the tick.
+        self._on_schedule_tick(None)
 
     def _on_whitelist_toggled(self, sender: Any) -> None:
         sender.state = not sender.state
         active = [name for name, item in self._whitelist_items.items() if item.state]
-        write_user_config_override(
-            self._user_config_path,
-            {"detection": {"process_monitor": {"whitelisted_apps": active}}},
+        self._persist_setting(
+            {"detection": {"process_monitor": {"whitelisted_apps": active}}}
         )
         self._notifications.notify(
             NotificationType.ERROR,
@@ -750,9 +772,8 @@ class MenuBarApp:
 
     def _on_mic_activation_toggled(self, sender: Any) -> None:
         sender.state = not sender.state
-        write_user_config_override(
-            self._user_config_path,
-            {"detection": {"mic_activation": {"enabled": bool(sender.state)}}},
+        self._persist_setting(
+            {"detection": {"mic_activation": {"enabled": bool(sender.state)}}}
         )
         self._notifications.notify(
             NotificationType.ERROR,
@@ -762,8 +783,9 @@ class MenuBarApp:
         )
 
     def _on_open_transcripts_web(self, _sender: Any) -> None:
+        host = self._config.get("web", "host", default="127.0.0.1")
         port = self._config.get("web", "port", default=8765)
-        self._open_url(f"http://127.0.0.1:{port}")
+        self._open_url(f"http://{host}:{port}")
 
     def _on_open_transcripts_folder(self, _sender: Any) -> None:
         path = Path(self._config.get(
@@ -835,10 +857,7 @@ class MenuBarApp:
         DETECTED).
         """
         in_window = is_within_working_hours(
-            datetime.now(),
-            working_days=self._config.get("app", "working_days", default=[0, 1, 2, 3, 4]),
-            start_hhmm=self._config.get("app", "working_hours", "start", default="08:00"),
-            end_hhmm=self._config.get("app", "working_hours", "end", default="20:00"),
+            datetime.now(), **working_hours_from_config(self._config)
         )
         with self._lock:
             current_state = self._snapshot.state
@@ -1203,6 +1222,30 @@ class MenuBarApp:
         for name, item in self._model_items.items():
             item.state = (name == active)
 
+    def _working_hours_title(self) -> str:
+        start = self._config.get("app", "working_hours", "start", default="08:00")
+        end = self._config.get("app", "working_hours", "end", default="20:00")
+        return f"Working Hours: {start} → {end}"
+
+    def _update_working_hours_menu(self) -> None:
+        current = {
+            "start": self._config.get("app", "working_hours", "start", default="08:00"),
+            "end": self._config.get("app", "working_hours", "end", default="20:00"),
+        }
+        for (which, hhmm), item in self._hour_items.items():
+            item.state = (hhmm == current[which])
+
+    def _on_working_hour_picked(self, sender: Any) -> None:
+        which = getattr(sender, "_otis_which", None)
+        hhmm = getattr(sender, "_otis_hhmm", None)
+        if which not in ("start", "end") or not hhmm:
+            return
+        self._persist_setting({"app": {"working_hours": {which: hhmm}}})
+        self._mi["settings_hours_root"].title = self._working_hours_title()
+        self._update_working_hours_menu()
+        # Apply immediately instead of waiting up to 60 s for the next tick.
+        self._on_schedule_tick(None)
+
     # =====================================================================
     # Recording lifecycle (called from main thread)
     # =====================================================================
@@ -1212,6 +1255,7 @@ class MenuBarApp:
                 return
         try:
             recorder = self._recorder_factory(self._config)
+            recorder.on_device_error = self._cb_device_error
             session_id = recorder.start()
         except Exception as exc:
             logger.exception("Failed to start recorder")
@@ -1453,6 +1497,15 @@ def find_orphan_sessions(
     if not audio_dir.exists():
         return []
 
+    # One store scan up front instead of a full rglob+parse per candidate.
+    # Failure placeholders don't count — those sessions must stay retryable.
+    completed_ids: set[str] = set()
+    if store is not None:
+        try:
+            completed_ids = store.completed_session_ids()
+        except Exception:
+            logger.exception("Could not index completed transcripts")
+
     results: list[dict[str, Any]] = []
     seen_session_ids: set[str] = set()
     # We also track resolved WAV paths from Pass 1 so Pass 2 doesn't list
@@ -1484,10 +1537,16 @@ def find_orphan_sessions(
         )
         if mic_path is None:
             continue
+        # A crash mid-recording leaves a 0-frame header with PCM data behind
+        # it; repair so the session is actually transcribable when picked.
+        # (The actively-recording session was excluded above via
+        # seen_session_ids, so we never touch a file still being written.)
+        repair_if_needed(mic_path)
+        repair_if_needed(sys_path)
         seen_audio_paths.add(mic_path)
         if sys_path is not None:
             seen_audio_paths.add(sys_path)
-        if _session_has_transcript(store, sid):
+        if sid in completed_ids:
             seen_session_ids.add(sid)
             continue
         seen_session_ids.add(sid)
@@ -1511,11 +1570,13 @@ def find_orphan_sessions(
         sid = mic_path.stem.removesuffix("_mic")
         if sid in seen_session_ids:
             continue
-        if _session_has_transcript(store, sid):
+        if sid in completed_ids:
             seen_session_ids.add(sid)
             continue
         seen_session_ids.add(sid)
         sys_path = mic_path.with_name(f"{sid}_system.wav")
+        repair_if_needed(mic_path)
+        repair_if_needed(sys_path if sys_path.exists() else None)
         results.append({
             "session_id": sid,
             "label": _format_session_label(mic_path, mic_path) + "  (orphan)",
@@ -1559,18 +1620,6 @@ def _resolve_session_audio(
         if sibling.exists():
             sys_path = sibling
     return mic, sys_path
-
-
-def _session_has_transcript(store: TranscriptStore | None, session_id: str) -> bool:
-    """True only for a *successful* transcript — a ``status: failed``
-    placeholder must not hide the session from the Generate Transcript menu,
-    which exists precisely to retry it."""
-    if store is None:
-        return False
-    try:
-        return store.has_completed_transcript(session_id)
-    except Exception:
-        return False
 
 
 def _format_session_label(meta_path: Path | None, mic_path: Path) -> str:

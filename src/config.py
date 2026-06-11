@@ -28,7 +28,6 @@ USER_CONFIG_PATH = Path("~/.otis/config.yaml")
 DEFAULTS: dict[str, Any] = {
     "app": {
         "name": "Otis",
-        "launch_at_login": True,
         "working_days": [0, 1, 2, 3, 4],
         "working_hours": {"start": "08:00", "end": "20:00"},
     },
@@ -37,7 +36,6 @@ DEFAULTS: dict[str, Any] = {
         "system_audio_device": "BlackHole 2ch",
         "sample_rate": 16000,
         "channels": 1,
-        "format": "wav",
     },
     "detection": {
         "process_monitor": {
@@ -68,11 +66,9 @@ DEFAULTS: dict[str, Any] = {
         },
         "mic_activation": {
             "enabled": True,
-            "trigger_apps_only": True,
         },
     },
     "transcription": {
-        "engine": "mlx-whisper",
         "model": "small",
         "language": None,
     },
@@ -85,10 +81,8 @@ DEFAULTS: dict[str, Any] = {
         "port": 8765,
         "host": "127.0.0.1",
     },
-    "mcp": {
-        "enabled": True,
-        "port": 8766,
-    },
+    # No "mcp" block: the MCP server runs over stdio, launched by the MCP
+    # client (Claude) itself — there is nothing for Otis to configure.
 }
 
 # Keys whose values are filesystem paths and should be expanded.
@@ -175,6 +169,16 @@ class Config:
     @property
     def raw(self) -> _AttrDict:
         return self._data
+
+    def apply_overrides(self, overrides: dict[str, Any]) -> None:
+        """Deep-merge ``overrides`` into the live config tree.
+
+        Used by the menu-bar settings handlers so a toggle takes effect
+        immediately — previously they only persisted to the YAML file,
+        leaving the in-memory snapshot stale until restart.
+        """
+        merged = _deep_merge(self._data, overrides)
+        self._data = _AttrDict(_expand_paths(merged))
 
     def get(self, *path: str, default: Any = None) -> Any:
         """Dotted-path lookup, e.g. ``cfg.get("audio", "sample_rate")``."""

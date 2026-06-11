@@ -12,8 +12,10 @@ from src.config import DEFAULTS, Config, load_config, load_user_config
 
 def test_load_default_config_returns_known_keys() -> None:
     cfg = load_config()
-    for key in ("app", "audio", "detection", "transcription", "storage", "web", "mcp"):
+    for key in ("app", "audio", "detection", "transcription", "storage", "web"):
         assert key in cfg
+    # Dead keys were removed in the Phase-6 cleanup.
+    assert "mcp" not in cfg
     assert cfg.get("audio", "sample_rate") == 16000
     assert cfg.get("audio", "system_audio_device") == "BlackHole 2ch"
 
@@ -30,7 +32,7 @@ def test_config_supports_attribute_access() -> None:
     cfg = load_config()
     assert cfg.audio.sample_rate == 16000
     assert cfg.audio.system_audio_device == "BlackHole 2ch"
-    assert cfg.transcription.engine == "mlx-whisper"
+    assert cfg.transcription.model == "small"
     assert cfg.detection.process_monitor.poll_interval_seconds == 5
     # Lists of primitives stay lists, but list-of-dicts entries would be wrapped.
     assert cfg.app.working_days == [0, 1, 2, 3, 4]
@@ -56,7 +58,7 @@ def test_load_config_default_path_falls_back_to_in_code_defaults(monkeypatch, tm
     monkeypatch.setattr(config_mod, "DEFAULT_CONFIG_PATH", tmp_path / "missing.yaml")
     cfg = load_config()
     assert cfg.get("app", "name") == DEFAULTS["app"]["name"]
-    assert cfg.get("transcription", "engine") == "mlx-whisper"
+    assert cfg.get("transcription", "model") == "small"
 
 
 def test_load_config_deep_merges_user_overrides(tmp_path: Path) -> None:
@@ -75,7 +77,7 @@ transcription:
     assert cfg.get("transcription", "model") == "large-v3"
     # Sibling defaults preserved
     assert cfg.get("audio", "system_audio_device") == "BlackHole 2ch"
-    assert cfg.get("transcription", "engine") == "mlx-whisper"
+    assert cfg.get("transcription", "language") is None
 
 
 def test_load_config_expands_tilde_in_path_keys(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -126,7 +128,7 @@ def test_load_user_config_overrides_only_specified_keys(tmp_path: Path) -> None:
     )
     cfg = load_user_config(user_config_path=user_path)
     assert cfg.transcription.model == "large-v3"
-    assert cfg.transcription.engine == "mlx-whisper"  # default preserved
+    assert cfg.transcription.language is None  # default preserved
     assert cfg.app.working_days == [0, 1]
     assert cfg.audio.sample_rate == 16000
 
@@ -146,3 +148,35 @@ def test_config_working_days_uses_python_weekday_convention() -> None:
     assert days == [0, 1, 2, 3, 4]  # Mon–Fri, weekday() convention
     assert min(days) == 0  # never 1, which would be isoweekday()
     assert 6 not in days  # Sunday excluded under weekday() convention
+
+
+# ---------------------------------------------------------------------------
+# apply_overrides — the in-memory half of settings persistence
+# ---------------------------------------------------------------------------
+def test_apply_overrides_deep_merges_into_live_tree() -> None:
+    cfg = Config({"app": {"working_hours": {"start": "08:00", "end": "20:00"},
+                          "working_days": [0, 1, 2, 3, 4]}})
+    cfg.apply_overrides({"app": {"working_hours": {"start": "09:00"}}})
+    assert cfg.get("app", "working_hours", "start") == "09:00"
+    # Sibling keys survive the merge.
+    assert cfg.get("app", "working_hours", "end") == "20:00"
+    assert cfg.get("app", "working_days") == [0, 1, 2, 3, 4]
+
+
+def test_apply_overrides_replaces_lists() -> None:
+    cfg = Config({"app": {"working_days": [0, 1, 2, 3, 4]}})
+    cfg.apply_overrides({"app": {"working_days": [5, 6]}})
+    assert cfg.get("app", "working_days") == [5, 6]
+
+
+def test_apply_overrides_expands_path_keys() -> None:
+    cfg = Config({"storage": {"audio_dir": "/tmp/a"}})
+    cfg.apply_overrides({"storage": {"audio_dir": "~/elsewhere"}})
+    assert cfg.get("storage", "audio_dir").startswith("/")
+    assert "~" not in cfg.get("storage", "audio_dir")
+
+
+def test_apply_overrides_keeps_attribute_access() -> None:
+    cfg = Config({"transcription": {"model": "small"}})
+    cfg.apply_overrides({"transcription": {"model": "medium"}})
+    assert cfg.transcription.model == "medium"

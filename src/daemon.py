@@ -1,24 +1,21 @@
-"""End-to-end Otis runner: detection → recording → graceful shutdown.
+"""End-to-end headless Otis runner: detection → recording → transcription.
 
-This is the smallest thing that turns the Phase-1+2 building blocks into an app
-you can leave running in a terminal. Phase 4 will replace it with a proper
-menu-bar UI; until then this is the daily-driver-acceptable testing harness.
+``otis run`` for terminals / SSH sessions — same pipeline as the menu-bar
+app, no UI:
 
-What it does
-------------
 1. Builds a :class:`ProcessMonitor` and one :class:`GoogleCalendarPoller` per
    configured account, then a :class:`MeetingDetector` that orchestrates them.
-2. Subscribes to the four detector events and prints them as readable
-   notifications on stdout.
-3. When a meeting is **detected** (process spotted, or calendar+process
-   correlated), it auto-starts a :class:`DualStreamRecorder` writing to the
-   configured ``storage.audio_dir``.
-4. If the meeting app disappears mid-recording it logs a warning **but keeps
-   recording** (per the Phase-2 review decision: process exits are advisory).
-5. On Ctrl-C or SIGTERM it stops the recorder, flushes the metadata, stops
-   the pollers, and exits cleanly.
-
-Anything richer (menu bar, autostart at login, UI) lands in Phase 4+.
+2. Honours the configured working days / hours: outside the window the
+   detector is stopped (an in-progress recording is never interrupted).
+3. When a meeting is **detected**, auto-starts a :class:`DualStreamRecorder`
+   writing to the configured ``storage.audio_dir``.
+4. When the meeting ends, transcribes the recording on a worker thread via
+   the shared :mod:`src.pipeline` (same handler as the menu bar) and saves
+   the Markdown transcript; failures leave a retryable placeholder.
+5. If the meeting app disappears mid-recording it logs a warning **but keeps
+   recording** (process exits are advisory).
+6. On Ctrl-C or SIGTERM it stops the recorder, transcribes what was
+   captured (bounded wait), stops the pollers, and exits cleanly.
 """
 
 from __future__ import annotations
@@ -27,19 +24,28 @@ import logging
 import signal
 import threading
 from collections.abc import Callable
-from pathlib import Path
+from datetime import datetime
 from typing import Any
 
 from src.audio.recorder import DualStreamRecorder
-from src.config import Config, load_config
+from src.config import Config, load_user_config
 from src.detection.calendar_poller import (
     GoogleCalendarPoller,
     build_pollers_from_config,
 )
 from src.detection.detector import MeetingContext, MeetingDetector
 from src.detection.process_monitor import ProcessMonitor
+from src.pipeline import (
+    TranscriptionPipeline,
+    make_recorder_factory,
+    make_transcription_handler,
+)
+from src.schedule import is_within_working_hours, working_hours_from_config
 
 logger = logging.getLogger(__name__)
+
+SCHEDULE_CHECK_SECONDS = 60.0
+TRANSCRIBE_SHUTDOWN_JOIN_SECONDS = 600.0
 
 
 class OtisDaemon:
@@ -66,13 +72,33 @@ class OtisDaemon:
         notify: Callable[[str], None] | None = None,
         recorder_factory: Callable[[Config], DualStreamRecorder] | None = None,
         detector: MeetingDetector | None = None,
+        transcription_pipeline: TranscriptionPipeline | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._config = config
         self._notify = notify or print
-        self._recorder_factory = recorder_factory or _default_recorder_factory
+        self._recorder_factory = recorder_factory or make_recorder_factory(config)
+        self._clock = clock or datetime.now
         self._lock = threading.RLock()
         self._recorder: DualStreamRecorder | None = None
         self._stop_event = threading.Event()
+
+        # Transcription: same shared pipeline as the menu-bar app. ``None``
+        # (tests, or callers that only want recording) degrades to
+        # record-only with a logged notice at stop time.
+        self._pipeline = transcription_pipeline
+        self._transcription_handler = (
+            make_transcription_handler(transcription_pipeline)
+            if transcription_pipeline is not None
+            else None
+        )
+        self._transcribe_lock = threading.Lock()
+        self._transcribe_thread: threading.Thread | None = None
+        self._current_meeting: MeetingContext | None = None
+
+        # Working-hours gating.
+        self._detector_started = False
+        self._schedule_thread: threading.Thread | None = None
 
         self._detector = detector or self._build_detector()
         self._wire_callbacks()
@@ -85,7 +111,13 @@ class OtisDaemon:
         self._install_signal_handlers()
         self._notify("Otis is watching for meetings. Press Ctrl-C to stop.")
         self._notify(self._summary_line())
-        self._detector.start()
+        # Honour the working-hours window from tick zero; the schedule
+        # thread keeps re-checking every minute.
+        self._apply_schedule()
+        self._schedule_thread = threading.Thread(
+            target=self._schedule_loop, name="otis-daemon-schedule", daemon=True
+        )
+        self._schedule_thread.start()
         try:
             self._stop_event.wait()
         finally:
@@ -153,10 +185,15 @@ class OtisDaemon:
     def _on_detected(self, ctx: MeetingContext) -> None:
         title = ctx.title or "(ad-hoc meeting)"
         self._notify(f"📞  Detected: {title}  via {ctx.app or 'calendar'}")
+        with self._lock:
+            self._current_meeting = ctx
         self._start_recording()
 
     def _on_ended(self, ctx: MeetingContext) -> None:
         self._notify(f"✅  Meeting ended: {ctx.title or ctx.app or 'unknown'}")
+        with self._lock:
+            if ctx.title or ctx.app:
+                self._current_meeting = ctx
         self._stop_recording()
 
     def _on_process_gone(self, app_name: str) -> None:
@@ -174,6 +211,7 @@ class OtisDaemon:
                 return  # idempotent: already recording
             try:
                 self._recorder = self._recorder_factory(self._config)
+                self._recorder.on_device_error = self._on_recorder_device_error
                 session_id = self._recorder.start()
             except Exception as exc:
                 logger.exception("Could not start recorder: %s", exc)
@@ -182,6 +220,12 @@ class OtisDaemon:
                 return
             self._detector.user_started_recording()
             self._notify(f"🔴  Recording session {session_id}")
+
+    def _on_recorder_device_error(self, stream_label: str, exc: Exception) -> None:
+        self._notify(
+            f"⚠️   {stream_label} stream failed mid-recording: {exc} — "
+            f"the other stream keeps recording."
+        )
 
     def _stop_recording(self) -> None:
         with self._lock:
@@ -193,7 +237,126 @@ class OtisDaemon:
                 logger.exception("Recorder stop raised: %s", exc)
                 metadata = {}
             self._recorder = None
-            self._notify(_format_save_line(metadata))
+            meeting = self._current_meeting
+            self._current_meeting = None
+        self._notify(_format_save_line(metadata))
+        self._maybe_transcribe(metadata, meeting)
+
+    # =====================================================================
+    # Transcription (worker thread; same handler as the menu bar)
+    # =====================================================================
+    def _maybe_transcribe(
+        self, metadata: dict[str, Any], meeting: MeetingContext | None,
+    ) -> None:
+        if not metadata:
+            return
+        if self._transcription_handler is None:
+            logger.info(
+                "No transcription pipeline configured — recording kept at %r.",
+                metadata.get("mic_wav"),
+            )
+            return
+        metadata["_language"] = self._config.get("transcription", "language")
+        if meeting is not None:
+            metadata["_meeting"] = {
+                "title": meeting.title,
+                "app": meeting.app,
+                "participants": list(meeting.participants),
+                "meeting_link": meeting.meeting_link,
+                "calendar_event_id": meeting.calendar_event_id,
+            }
+        else:
+            metadata["_meeting"] = {"title": None, "app": None, "participants": []}
+
+        thread = threading.Thread(
+            target=self._run_transcription,
+            args=(metadata,),
+            name="otis-daemon-transcribe",
+            daemon=True,
+        )
+        with self._lock:
+            self._transcribe_thread = thread
+        thread.start()
+
+    def _run_transcription(self, metadata: dict[str, Any]) -> None:
+        session_id = str(metadata.get("session_id") or "unknown")
+        with self._transcribe_lock:  # back-to-back stops serialize here
+            try:
+                self._detector.transcription_started()
+            except Exception:  # pragma: no cover
+                logger.exception("Detector transcription_started raised")
+            self._notify(f"📝  Transcribing session {session_id[:8]}…")
+            try:
+                assert self._transcription_handler is not None
+                self._transcription_handler(metadata)
+                self._notify(f"📄  Transcript saved for session {session_id[:8]}.")
+            except Exception as exc:
+                logger.exception("Transcription failed for session %s", session_id)
+                self._notify(f"❌  Transcription failed: {exc}")
+                self._save_failure_placeholder(metadata, exc)
+            finally:
+                try:
+                    self._detector.transcription_finished()
+                except Exception:  # pragma: no cover
+                    logger.exception("Detector transcription_finished raised")
+
+    def _save_failure_placeholder(
+        self, metadata: dict[str, Any], error: BaseException,
+    ) -> None:
+        if self._pipeline is None:
+            return
+        meeting = metadata.get("_meeting") or {}
+        try:
+            self._pipeline.store.save_failure(
+                session_id=str(metadata.get("session_id") or "unknown"),
+                error=error,
+                title=meeting.get("title"),
+                app=meeting.get("app"),
+                participants=[str(p) for p in (meeting.get("participants") or [])],
+                model=str(self._config.get("transcription", "model", default="small")),
+                audio_files={
+                    "mic": metadata.get("mic_wav"),
+                    "system": metadata.get("system_wav"),
+                },
+                language=metadata.get("_language"),
+            )
+        except Exception:
+            logger.exception("Could not save failure placeholder transcript")
+
+    # =====================================================================
+    # Working-hours schedule
+    # =====================================================================
+    def _schedule_loop(self) -> None:
+        while not self._stop_event.wait(SCHEDULE_CHECK_SECONDS):
+            try:
+                self._apply_schedule()
+            except Exception:  # pragma: no cover (defensive)
+                logger.exception("Schedule check failed; will retry next tick.")
+
+    def _apply_schedule(self) -> None:
+        """Start/stop the detector based on the working-hours window.
+
+        An active recording is never interrupted: if the window closes
+        mid-meeting we leave everything running and re-check next tick.
+        """
+        in_window = is_within_working_hours(
+            self._clock(), **working_hours_from_config(self._config)
+        )
+        stop_needed = False
+        with self._lock:
+            if self._recorder is not None:
+                return
+            if in_window and not self._detector_started:
+                self._detector.start()
+                self._detector_started = True
+                self._notify("🌅  Inside working hours — detection active.")
+            elif not in_window and self._detector_started:
+                self._detector_started = False
+                stop_needed = True
+        if stop_needed:
+            # Stop outside the lock — poller joins can take a moment.
+            self._detector.stop()
+            self._notify("🌙  Outside working hours — detection paused.")
 
     # =====================================================================
     # Shutdown
@@ -211,7 +374,22 @@ class OtisDaemon:
 
     def _shutdown(self) -> None:
         self._stop_recording()
+        with self._lock:
+            transcribe_thread = self._transcribe_thread
+        if transcribe_thread is not None and transcribe_thread.is_alive():
+            self._notify(
+                "⏳  Waiting for the transcription to finish "
+                f"(up to {int(TRANSCRIBE_SHUTDOWN_JOIN_SECONDS / 60)} min)…"
+            )
+            transcribe_thread.join(timeout=TRANSCRIBE_SHUTDOWN_JOIN_SECONDS)
+            if transcribe_thread.is_alive():  # pragma: no cover (very long audio)
+                self._notify(
+                    "⚠️   Transcription still running at shutdown — a failure "
+                    "placeholder may be missing; retry via scripts/retranscribe.py."
+                )
         self._detector.stop()
+        if self._pipeline is not None:
+            self._pipeline.shutdown()
         self._notify("Bye.")
 
     # =====================================================================
@@ -235,17 +413,6 @@ class OtisDaemon:
 # ----------------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------------
-def _default_recorder_factory(config: Config) -> DualStreamRecorder:
-    audio_dir = Path(config.get("storage", "audio_dir", default="~/Otis/audio"))
-    return DualStreamRecorder(
-        audio_dir=audio_dir,
-        sample_rate=int(config.get("audio", "sample_rate", default=16000)),
-        channels=int(config.get("audio", "channels", default=1)),
-        mic_device=config.get("audio", "mic_device"),
-        system_device=config.get("audio", "system_audio_device", default="BlackHole 2ch"),
-    )
-
-
 def _format_save_line(metadata: dict[str, Any]) -> str:
     if not metadata:
         return "💾  Recording stopped (nothing was captured)."
@@ -258,7 +425,9 @@ def _format_save_line(metadata: dict[str, Any]) -> str:
 # Entry point used by ``otis run``
 # ----------------------------------------------------------------------------
 def run_from_config(config_path: str | None = None) -> int:
-    """Build a daemon from a YAML config and run it. Returns the exit code."""
-    cfg = load_config(config_path)
-    daemon = OtisDaemon(cfg)
+    """Build a full daemon (detection + transcription) and run it."""
+    from src.pipeline import build_pipeline
+
+    cfg = load_user_config(config_path)
+    daemon = OtisDaemon(cfg, transcription_pipeline=build_pipeline(cfg))
     return daemon.run()

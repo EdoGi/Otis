@@ -249,3 +249,178 @@ def test_recorder_factory_failure_is_reported_not_crashed() -> None:
     # No recorder, but the daemon didn't crash — we got an error message.
     assert daemon.recorder is None
     assert any("Could not start" in n for n in notes)
+
+
+# ============================================================================
+# Transcription-on-stop (shared pipeline)
+# ============================================================================
+def _make_pipeline(tmp_path, processor):
+    from src.pipeline import TranscriptionPipeline
+    from src.storage.transcript_store import TranscriptStore
+    from src.transcription.whisper_engine import WhisperEngine
+
+    return TranscriptionPipeline(
+        audio_dir=tmp_path / "audio",
+        transcript_dir=tmp_path / "transcripts",
+        store=TranscriptStore(tmp_path / "transcripts"),
+        engine=WhisperEngine(model_name="tiny", transcribe_fn=lambda *_a, **_k: {}),
+        processor=processor,
+    )
+
+
+class _RecordingProcessor:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def process(self, session, *, meeting=None, language=None, on_progress=None):
+        self.calls.append({"session": session, "meeting": meeting, "language": language})
+
+
+def _make_daemon_with_pipeline(detector, tmp_path, processor):
+    notifications: list[str] = []
+    fake_recorder = _FakeRecorder()
+    from src.pipeline import TranscriptionPipeline  # noqa: F401
+
+    pipeline = _make_pipeline(tmp_path, processor)
+    daemon = OtisDaemon(
+        config=_make_config(),
+        notify=notifications.append,
+        recorder_factory=lambda _cfg: fake_recorder,
+        detector=detector,
+        transcription_pipeline=pipeline,
+    )
+    return daemon, notifications, fake_recorder, pipeline
+
+
+def _join_transcription(daemon: OtisDaemon) -> None:
+    thread = daemon._transcribe_thread
+    if thread is not None:
+        thread.join(timeout=5.0)
+
+
+def test_meeting_end_triggers_transcription_with_meeting_context(tmp_path) -> None:
+    pm = _FakeProcessMonitor()
+    detector = MeetingDetector(
+        process_monitor=pm,  # type: ignore[arg-type]
+        calendar_pollers=[],
+        clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc),
+    )
+    processor = _RecordingProcessor()
+    daemon, notes, rec, _pipeline = _make_daemon_with_pipeline(detector, tmp_path, processor)
+
+    pm.fire_detected("zoom.us")
+    detector.user_stopped_recording()
+    _join_transcription(daemon)
+
+    assert rec.stopped
+    assert len(processor.calls) == 1
+    call = processor.calls[0]
+    assert call["session"].session_id == "fake-session"
+    assert call["meeting"].app == "zoom.us"
+    assert any("Transcript saved" in n for n in notes)
+    # Detector cycled through PROCESSING back to IDLE.
+    assert detector.get_state() == MeetingState.IDLE
+
+
+def test_transcription_failure_saves_placeholder_and_daemon_survives(tmp_path) -> None:
+    pm = _FakeProcessMonitor()
+    detector = MeetingDetector(
+        process_monitor=pm,  # type: ignore[arg-type]
+        calendar_pollers=[],
+        clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc),
+    )
+
+    class _Boom:
+        def process(self, *_a, **_k):
+            raise RuntimeError("model exploded")
+
+    daemon, notes, _rec, pipeline = _make_daemon_with_pipeline(detector, tmp_path, _Boom())
+
+    pm.fire_detected("zoom.us")
+    detector.user_stopped_recording()
+    _join_transcription(daemon)
+
+    assert any("Transcription failed" in n for n in notes)
+    placeholders = [
+        fm for fm in pipeline.store.list_transcripts(tag="failed")
+        if fm["id"] == "fake-session"
+    ]
+    assert len(placeholders) == 1
+    assert detector.get_state() == MeetingState.IDLE  # state machine recovered
+
+
+def test_no_pipeline_means_record_only(tmp_path) -> None:
+    pm = _FakeProcessMonitor()
+    detector = MeetingDetector(
+        process_monitor=pm,  # type: ignore[arg-type]
+        calendar_pollers=[],
+        clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc),
+    )
+    daemon, notes, rec = _make_daemon(detector)
+    pm.fire_detected("zoom.us")
+    detector.user_stopped_recording()
+    assert rec.stopped
+    assert daemon._transcribe_thread is None  # no worker spawned
+
+
+# ============================================================================
+# Working-hours schedule
+# ============================================================================
+def _daemon_with_clock(now: datetime):
+    pm = _FakeProcessMonitor()
+    detector = MeetingDetector(
+        process_monitor=pm,  # type: ignore[arg-type]
+        calendar_pollers=[],
+        clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc),
+    )
+    notes: list[str] = []
+    clock = {"now": now}
+    fake_recorder = _FakeRecorder()
+    daemon = OtisDaemon(
+        config=_make_config(),
+        notify=notes.append,
+        recorder_factory=lambda _cfg: fake_recorder,
+        detector=detector,
+        clock=lambda: clock["now"],
+    )
+    return daemon, detector, pm, notes, clock, fake_recorder
+
+
+def test_apply_schedule_starts_detector_inside_window() -> None:
+    monday_noon = datetime(2026, 6, 8, 12, 0)  # Monday, inside 08-20
+    daemon, detector, pm, notes, _clock, _rec = _daemon_with_clock(monday_noon)
+    daemon._apply_schedule()
+    assert pm.started
+    assert any("detection active" in n.lower() for n in notes)
+
+
+def test_apply_schedule_keeps_detector_off_outside_window() -> None:
+    sunday = datetime(2026, 6, 7, 12, 0)  # Sunday — not a working day
+    daemon, _detector, pm, _notes, clock, _rec = _daemon_with_clock(sunday)
+    daemon._apply_schedule()
+    assert not pm.started
+
+    # Window opens Monday morning → detector comes up on the next tick.
+    clock["now"] = datetime(2026, 6, 8, 9, 0)
+    daemon._apply_schedule()
+    assert pm.started
+
+
+def test_window_closing_stops_detector_but_never_mid_recording() -> None:
+    monday_noon = datetime(2026, 6, 8, 12, 0)
+    daemon, detector, pm, notes, clock, rec = _daemon_with_clock(monday_noon)
+    daemon._apply_schedule()
+    assert pm.started
+
+    # A meeting starts; then the window closes while recording.
+    pm.fire_detected("zoom.us")
+    assert rec.started
+    clock["now"] = datetime(2026, 6, 8, 22, 0)  # after hours
+    daemon._apply_schedule()
+    assert not pm.stopped, "active recording must never be interrupted"
+
+    # Recording ends → next tick pauses detection.
+    detector.user_stopped_recording()
+    daemon._apply_schedule()
+    assert pm.stopped
+    assert any("detection paused" in n.lower() for n in notes)

@@ -326,3 +326,59 @@ def test_filter_drops_subsecond_noise_segments() -> None:
     ]
     out = filter_hallucinations(segs)
     assert [s.text for s in out] == ["good morning everyone"]
+
+
+# ---------------------------------------------------------------------------
+# Adaptive real-time-factor estimation
+# ---------------------------------------------------------------------------
+def test_rtf_starts_at_class_default(sample_wav: Path) -> None:
+    engine = WhisperEngine(transcribe_fn=lambda *_a, **_k: {"segments": []})
+    from src.transcription.whisper_engine import _ProgressEstimator
+
+    assert engine._current_rtf() == _ProgressEstimator.REAL_TIME_FACTOR
+
+
+def test_rtf_measured_after_slow_long_transcription(
+    sample_wav: Path, monkeypatch
+) -> None:
+    """A >5s clip taking >0.5s wall-clock updates the measured RTF."""
+    import time as time_module
+
+    def slow_fake(*_a, **_k):
+        time_module.sleep(0.55)
+        return {"segments": [{"start": 0, "end": 10, "text": "hello world ok"}]}
+
+    engine = WhisperEngine(transcribe_fn=slow_fake)
+    monkeypatch.setattr(
+        "src.transcription.whisper_engine._safe_wav_duration_seconds",
+        lambda _p: 10.0,
+    )
+    engine.transcribe(sample_wav)
+    measured = engine._current_rtf()
+    # ~10s of audio in ~0.55s → RTF around 18; allow generous slack.
+    assert 5.0 < measured < 25.0
+
+    # Second run EMA-smooths rather than replacing outright.
+    engine.transcribe(sample_wav)
+    assert 5.0 < engine._current_rtf() < 25.0
+
+
+def test_rtf_not_updated_for_short_clips(sample_wav: Path, monkeypatch) -> None:
+    engine = WhisperEngine(
+        transcribe_fn=lambda *_a, **_k: {"segments": [{"start": 0, "end": 1, "text": "hey you there"}]}
+    )
+    monkeypatch.setattr(
+        "src.transcription.whisper_engine._safe_wav_duration_seconds",
+        lambda _p: 2.0,  # below the 5s floor
+    )
+    engine.transcribe(sample_wav)
+    assert engine._measured_rtf is None
+
+
+def test_progress_estimator_uses_injected_rtf() -> None:
+    from src.transcription.whisper_engine import _ProgressEstimator
+
+    est = _ProgressEstimator(60.0, lambda _p: None, rtf=30.0)
+    assert est._rtf == 30.0
+    est_default = _ProgressEstimator(60.0, lambda _p: None)
+    assert est_default._rtf == _ProgressEstimator.REAL_TIME_FACTOR

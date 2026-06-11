@@ -22,7 +22,7 @@ from typing import Any
 
 from src.audio.blackhole_check import format_setup_instructions, verify_blackhole_setup
 from src.audio.devices import DeviceManager
-from src.config import Config, load_config, load_user_config
+from src.config import Config, load_user_config
 from src.daemon import OtisDaemon
 
 logger = logging.getLogger("otis")
@@ -125,28 +125,26 @@ def _print_audio_status(_cfg: Config) -> int:
 
 
 def _run_daemon(cfg: Config) -> int:
-    daemon = OtisDaemon(cfg)
+    from src.pipeline import build_pipeline
+
+    pipeline = build_pipeline(cfg)
+    daemon = OtisDaemon(cfg, transcription_pipeline=pipeline)
     return daemon.run()
 
 
 def _run_menubar(cfg: Config) -> int:
     """Build the menu-bar app from config and start its event loop."""
-    from pathlib import Path
-
-    from src.audio.recorder import DualStreamRecorder
     from src.detection.calendar_poller import build_pollers_from_config
     from src.detection.detector import MeetingDetector
     from src.detection.process_monitor import ProcessMonitor
-    from src.storage.audio_retention import AudioRetentionManager
-    from src.storage.transcript_store import TranscriptStore
-    from src.transcription.processor import (
-        MeetingSnapshot,
-        RecordingSession,
-        TranscriptProcessor,
+    from src.pipeline import (
+        build_pipeline,
+        make_recorder_factory,
+        make_transcription_handler,
     )
-    from src.transcription.whisper_engine import WhisperEngine
+    from src.storage.audio_retention import AudioRetentionManager
     from src.ui.menubar import MenuBarApp
-    from src.ui.notifications import NotificationManager
+    from src.ui.notifications import NotificationManager, NotificationType
 
     # ---- detection ---------------------------------------------------------
     pm_cfg = cfg.get("detection", "process_monitor", default={}) or {}
@@ -173,75 +171,52 @@ def _run_menubar(cfg: Config) -> int:
         calendar_pollers=calendar_pollers,
     )
 
-    # ---- audio recording ---------------------------------------------------
-    audio_dir = Path(cfg.get("storage", "audio_dir", default="~/Otis/audio")).expanduser()
-
-    def recorder_factory(_cfg: Config) -> DualStreamRecorder:
-        return DualStreamRecorder(
-            audio_dir=audio_dir,
-            sample_rate=int(_cfg.get("audio", "sample_rate", default=16000)),
-            channels=int(_cfg.get("audio", "channels", default=1)),
-            mic_device=_cfg.get("audio", "mic_device"),
-            system_device=_cfg.get("audio", "system_audio_device", default="BlackHole 2ch"),
-        )
-
-    # ---- transcription pipeline -------------------------------------------
-    transcript_dir = Path(
-        cfg.get("storage", "transcript_dir", default="~/Otis/transcripts")
-    ).expanduser()
-    store = TranscriptStore(transcript_dir)
-    engine = WhisperEngine(
-        model_name=str(cfg.get("transcription", "model", default="small")),
-    )
-    processor = TranscriptProcessor(
-        engine=engine,
-        store=store,
-        audio_dir=audio_dir,
-        model_name=engine.model_name,
-    )
+    # ---- recording + transcription pipeline --------------------------------
+    pipeline = build_pipeline(cfg)
+    recorder_factory = make_recorder_factory(cfg)
 
     # ---- audio retention ---------------------------------------------------
     retention = AudioRetentionManager(
-        audio_dir=audio_dir,
-        transcript_store=store,
+        audio_dir=pipeline.audio_dir,
+        transcript_store=pipeline.store,
         retention_days=int(cfg.get("storage", "audio_retention_days", default=30)),
     )
     retention.start_periodic()
 
-    # ---- transcription handler the menu bar calls on Stop ------------------
     notifications = NotificationManager()
 
-    def transcription_handler(metadata: dict[str, Any]) -> None:
-        """Bridge from the menu bar's Stop & Transcribe to the real pipeline."""
-        session = RecordingSession.from_recorder_metadata(metadata, audio_dir=audio_dir)
-        meeting_dict = metadata.get("_meeting") or {}
-        meeting = MeetingSnapshot(
-            title=meeting_dict.get("title"),
-            app=meeting_dict.get("app"),
-            participants=list(meeting_dict.get("participants") or []),
-            meeting_link=meeting_dict.get("meeting_link"),
-            calendar_event_id=meeting_dict.get("calendar_event_id"),
+    # The progress sink is late-bound: the handler is built before the app
+    # exists, but transcriptions can only start once app.run() is live.
+    app_ref: list[Any] = []
+
+    def on_progress_pct(pct: int) -> None:
+        if app_ref:
+            app_ref[0].notify_transcription_progress(pct)
+
+    transcription_handler = make_transcription_handler(
+        pipeline, on_progress_pct=on_progress_pct
+    )
+
+    # ---- local web UI -------------------------------------------------------
+    web_host = str(cfg.get("web", "host", default="127.0.0.1"))
+    web_port = int(cfg.get("web", "port", default=8765))
+    try:
+        from src.web.server import serve_in_background
+
+        serve_in_background(pipeline.store, host=web_host, port=web_port)
+        logger.info("Web UI listening on http://%s:%d", web_host, web_port)
+    except OSError as exc:
+        logger.warning(
+            "Web UI disabled: could not bind %s:%d (%s)", web_host, web_port, exc
         )
-        language = metadata.get("_language")
-
-        # Log progress at every integer-percent change. The underlying
-        # estimator ticks every 0.5s, so we throttle to avoid spamming the
-        # log file — but still get a clear "still alive" heartbeat the user
-        # can tail to gauge how far along a multi-hour transcription is.
-        last_logged_pct = [-1]
-        sid = metadata.get("session_id") or "unknown"
-
-        def on_progress(pct: float) -> None:
-            current = int(pct)
-            if current != last_logged_pct[0]:
-                last_logged_pct[0] = current
-                logger.info("Transcription progress: %d%% (session=%s)", current, sid)
-
-        # process() is synchronous; the menu bar already runs us in a worker
-        # thread, so we stay there to keep PROCESSING state coherent.
-        processor.process(
-            session, meeting=meeting, language=language, on_progress=on_progress,
+        notifications.notify(
+            NotificationType.ERROR,
+            "Web UI unavailable",
+            f"Port {web_port} is busy — transcripts still save normally.",
+            force=True,
         )
+    except Exception:
+        logger.exception("Web UI failed to start; continuing without it")
 
     app = MenuBarApp(
         config=cfg,
@@ -249,13 +224,14 @@ def _run_menubar(cfg: Config) -> int:
         recorder_factory=recorder_factory,
         notifications=notifications,
         transcription_handler=transcription_handler,
-        transcript_store=store,
+        transcript_store=pipeline.store,
     )
+    app_ref.append(app)
     try:
         app.run()
     finally:
         retention.stop()
-        engine.shutdown()
+        pipeline.shutdown()
     return 0
 
 
@@ -263,12 +239,10 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     _configure_logging(args.log_level)
 
-    # Menu-bar app picks up user overrides; the headless modes use the bundled
-    # defaults to keep behaviour predictable when running over SSH / scripts.
-    if args.command == "ui" or (args.command is None and not args.check_audio):
-        cfg = load_user_config(args.config)
-    else:
-        cfg = load_config(args.config)
+    # Every mode honours ~/.otis/config.yaml — the settings toggled in the
+    # menu bar (model, whitelist, working hours) apply to the headless
+    # daemon too, instead of silently reverting to bundled defaults.
+    cfg = load_user_config(args.config)
     logger.info("Loaded config; storage at %s", cfg.get("storage", "transcript_dir"))
 
     command = args.command or ("check-audio" if args.check_audio else "ui")

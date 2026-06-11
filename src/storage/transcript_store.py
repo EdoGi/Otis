@@ -233,6 +233,23 @@ class TranscriptStore:
                 return path
         return None
 
+    def completed_session_ids(self) -> set[str]:
+        """ids of every transcript that is NOT a failure placeholder.
+
+        One rglob scan — callers checking many ids (orphan discovery) use
+        this instead of per-id :meth:`has_completed_transcript` lookups.
+        """
+        ids: set[str] = set()
+        for path in self._iter_transcripts():
+            try:
+                fm = self._read_frontmatter_fast(path)
+            except Exception:
+                continue
+            sid = fm.get("id")
+            if sid and fm.get("status") != "failed":
+                ids.add(str(sid))
+        return ids
+
     def has_completed_transcript(self, transcript_id: str) -> bool:
         """True if a transcript exists that is NOT a failure placeholder.
 

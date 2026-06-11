@@ -27,6 +27,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from src.audio.wav_repair import repair_if_needed
 from src.config import load_user_config
 from src.storage.transcript_store import TranscriptStore
 from src.transcription.processor import (
@@ -135,6 +136,11 @@ def main() -> int:
         if mic_path is None:
             print(f"  ✗ {sid[:8]}: mic file missing (looked next to {meta_path.name})")
             continue
+        # Sessions from a crashed recorder have 0-frame WAV headers with the
+        # PCM data intact — repair so Whisper sees the audio.
+        for repaired_path in (mic_path, sys_path):
+            if repair_if_needed(repaired_path):
+                print(f"  ⚒ {sid[:8]}: repaired truncated header on {repaired_path.name}")
         # Rewrite the metadata in-place so subsequent reads (frontmatter, retention)
         # see correct paths.
         recorder_meta["mic_wav"] = str(mic_path.relative_to(audio_dir))

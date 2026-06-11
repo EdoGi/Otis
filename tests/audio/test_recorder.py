@@ -125,6 +125,55 @@ def test_pause_and_resume_logged_in_metadata(
     assert p["resumed_at"] > p["paused_at"]
 
 
+def test_callback_stops_queueing_after_writer_death(
+    fake_sounddevice, tmp_path: Path  # noqa: ARG001
+) -> None:
+    """Once the writer thread dies, the audio callback must drop frames
+    instead of growing the queue without bound."""
+    rec = _make_recorder(tmp_path)
+    rec.start()
+    time.sleep(0.05)
+
+    mic_state = rec._mic_state
+    assert mic_state is not None
+    # Simulate writer death the way the writer loop reports it.
+    mic_state.error = RuntimeError("disk full")
+    time.sleep(0.05)  # fake stream keeps firing the callback
+    size_after_death = mic_state.queue.qsize()
+    time.sleep(0.1)
+    assert mic_state.queue.qsize() <= size_after_death + 1  # no unbounded growth
+    rec.stop()
+
+
+def test_on_device_error_setter_fires_on_writer_crash(
+    fake_sounddevice, tmp_path: Path, monkeypatch  # noqa: ARG001
+) -> None:
+    """The late-bound callback (set after construction, before start) must
+    be invoked when the writer loop crashes."""
+    import wave as wave_module
+
+    failures: list[tuple[str, Exception]] = []
+    rec = _make_recorder(tmp_path)
+    rec.on_device_error = lambda label, exc: failures.append((label, exc))
+    assert rec.on_device_error is not None
+
+    real_open = wave_module.open
+
+    def exploding_open(path, mode="rb"):
+        if "_mic.wav" in str(path):
+            raise OSError("simulated disk failure")
+        return real_open(path, mode)
+
+    monkeypatch.setattr("src.audio.recorder.wave.open", exploding_open)
+    rec.start()
+    time.sleep(0.1)
+    rec.stop()
+
+    assert failures, "on_device_error was never invoked"
+    assert failures[0][0] == "mic"
+    assert "disk failure" in str(failures[0][1])
+
+
 def test_wake_does_not_resume_user_initiated_pause(
     fake_sounddevice, tmp_path: Path  # noqa: ARG001
 ) -> None:

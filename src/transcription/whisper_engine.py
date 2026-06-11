@@ -161,6 +161,10 @@ class WhisperEngine:
         # "warm", and the idle timer that flags us cold again.
         self._warm = False
         self._idle_timer: threading.Timer | None = None
+        # Measured real-time factor (audio seconds per wall-clock second),
+        # EMA-updated after each successful run so progress estimates adapt
+        # to this machine + model instead of assuming the M1-Pro/small 8×.
+        self._measured_rtf: float | None = None
 
     # -------------------------------------------------------------------
     # Properties
@@ -214,10 +218,15 @@ class WhisperEngine:
             )
 
         duration = _safe_wav_duration_seconds(path)
-        progress = _ProgressEstimator(duration, on_progress) if on_progress else None
+        progress = (
+            _ProgressEstimator(duration, on_progress, rtf=self._current_rtf())
+            if on_progress
+            else None
+        )
         if progress is not None:
             progress.start()
 
+        started = time.monotonic()
         try:
             with self._lock:
                 self._warm = True
@@ -246,6 +255,7 @@ class WhisperEngine:
                 progress.stop()
 
         result = self._parse_result(raw, language)
+        self._record_rtf(duration, time.monotonic() - started)
 
         if on_progress is not None:
             try:
@@ -304,6 +314,26 @@ class WhisperEngine:
             raw=raw,
         )
 
+    def _current_rtf(self) -> float:
+        with self._lock:
+            return self._measured_rtf or _ProgressEstimator.REAL_TIME_FACTOR
+
+    def _record_rtf(self, audio_seconds: float, elapsed_seconds: float) -> None:
+        """EMA-update the measured real-time factor after a successful run.
+
+        Short clips and sub-half-second runs are skipped — they're dominated
+        by model load / fixed overhead and would skew the estimate.
+        """
+        if audio_seconds <= 5.0 or elapsed_seconds <= 0.5:
+            return
+        measured = audio_seconds / elapsed_seconds
+        with self._lock:
+            if self._measured_rtf is None:
+                self._measured_rtf = measured
+            else:
+                self._measured_rtf = 0.5 * self._measured_rtf + 0.5 * measured
+        logger.debug("Measured RTF %.1fx (smoothed %.1fx)", measured, self._measured_rtf)
+
     def _reset_idle_timer(self) -> None:
         if self._idle_timer is not None:
             self._idle_timer.cancel()
@@ -332,11 +362,18 @@ class _ProgressEstimator:
     every 0.5 s.
     """
 
-    REAL_TIME_FACTOR = 8.0  # conservative; user sees a slowly-rising bar
+    REAL_TIME_FACTOR = 8.0  # default until the engine has measured this machine
 
-    def __init__(self, duration_seconds: float, callback: ProgressCallback) -> None:
+    def __init__(
+        self,
+        duration_seconds: float,
+        callback: ProgressCallback,
+        *,
+        rtf: float | None = None,
+    ) -> None:
         self._duration = max(1.0, duration_seconds)
         self._callback = callback
+        self._rtf = float(rtf) if rtf else self.REAL_TIME_FACTOR
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -351,7 +388,7 @@ class _ProgressEstimator:
 
     def _loop(self) -> None:
         start = time.monotonic()
-        estimated_total = self._duration / self.REAL_TIME_FACTOR
+        estimated_total = self._duration / self._rtf
         while not self._stop.is_set():
             elapsed = time.monotonic() - start
             pct = min(99.0, 100.0 * elapsed / estimated_total)

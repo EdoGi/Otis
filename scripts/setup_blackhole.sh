@@ -69,15 +69,19 @@ NEXT STEP — create a Multi-Output Device (manual, ~30 seconds):
      option-click the volume in the menu bar).
 
 After creating the device, you can verify with:
-    python -c "from src.audio.blackhole_check import verify_blackhole_setup; \
+    .venv/bin/python -c "from src.audio.blackhole_check import verify_blackhole_setup; \
                 print(verify_blackhole_setup())"
 ------------------------------------------------------------------------------
 EOF
 
 # ------------------------------------------------------------ List audio devices
 info "Current audio devices:"
-if command -v python3 >/dev/null 2>&1; then
-    python3 - <<'PY' || warn "Could not list devices via sounddevice (is it installed?)."
+# Prefer the project venv — sounddevice is installed there, not system-wide.
+PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PYTHON="${PROJECT_ROOT}/.venv/bin/python"
+[[ -x "${PYTHON}" ]] || PYTHON="python3"
+if command -v "${PYTHON}" >/dev/null 2>&1; then
+    "${PYTHON}" - <<'PY' || warn "Could not list devices via sounddevice (is it installed?)."
 try:
     import sounddevice as sd
     for i, d in enumerate(sd.query_devices()):

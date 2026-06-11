@@ -1,4 +1,4 @@
-"""Aggressive end-to-end stress test for Phases 1-4.
+"""Aggressive end-to-end stress test for Phases 1-6.
 
 Not a unit test — runs against a temp tree, exercises real edge cases:
 
@@ -558,6 +558,127 @@ def t_audio_retention_handles_concurrent_recording(tmp: Path) -> None:
     assert fresh.exists(), "in-progress recording must survive the sweep"
 
 
+def t_wav_repair_recovers_crashed_recording(tmp: Path) -> None:
+    """A killed recorder leaves a 0-frame WAV header; repair → full pipeline."""
+    from src.audio.wav_repair import repair_wav_header, wav_needs_repair
+
+    audio = tmp / "audio"
+    audio.mkdir()
+    sid = "c4a5bed0-0000-0000-0000-000000000001"
+    mic = audio / f"{sid}_mic.wav"
+    _audible_wav(mic, seconds=2.0)
+    # Zero the size fields the way an un-closed wave file looks after SIGKILL.
+    with mic.open("r+b") as fh:
+        fh.seek(4); fh.write(struct.pack("<I", 36))
+        fh.seek(40); fh.write(struct.pack("<I", 0))
+    with wave.open(str(mic), "rb") as wf:
+        assert wf.getnframes() == 0, "corruption fixture is wrong"
+
+    assert wav_needs_repair(mic)
+    assert repair_wav_header(mic)
+
+    engine = WhisperEngine(
+        model_name="tiny",
+        transcribe_fn=lambda *_a, **_k: {
+            "segments": [{"start": 0, "end": 2, "text": "recovered speech"}],
+            "language": "en",
+        },
+    )
+    store = TranscriptStore(tmp / "transcripts")
+    processor = TranscriptProcessor(engine=engine, store=store, audio_dir=audio)
+    session = RecordingSession(
+        session_id=sid, audio_dir=audio, mic_wav=mic, system_wav=None,
+        metadata_path=audio / f"{sid}_metadata.json",
+    )
+    result = processor.process(session, meeting=MeetingSnapshot())
+    assert "recovered speech" in result.body
+
+
+def t_completed_ids_index_consistent_at_scale(tmp: Path) -> None:
+    """completed_session_ids() agrees with per-id checks across 100 mixed files."""
+    store = TranscriptStore(tmp)
+    expected: set[str] = set()
+    for i in range(80):
+        sid = f"ok-{i:03d}"
+        store.save(
+            _basic_frontmatter(id=sid, title=f"Meeting {i}",
+                               start_time=f"{8 + i % 10}:0{i % 6}"),
+            "## Transcript\n\nbody",
+        )
+        expected.add(sid)
+    for i in range(15):
+        store.save_failure(session_id=f"bad-{i:03d}", error=RuntimeError("x"),
+                           title=f"Broken {i}")
+    # A few corrupt files for good measure.
+    junk_dir = tmp / "2026" / "01"
+    junk_dir.mkdir(parents=True, exist_ok=True)
+    for i in range(5):
+        (junk_dir / f"corrupt-{i}.md").write_text("---\n:[bad yaml\n---\nbody")
+
+    ids = store.completed_session_ids()
+    assert ids == expected, f"index mismatch: {ids ^ expected}"
+    for sid in sorted(expected)[:10]:
+        assert store.has_completed_transcript(sid)
+    assert not store.has_completed_transcript("bad-000")
+
+
+def t_web_routes_smoke(tmp: Path) -> None:
+    """Flask UI: list, view, search, 404, and XSS escaping."""
+    from src.web.server import create_app
+
+    store = TranscriptStore(tmp)
+    store.save(_basic_frontmatter(id="web-1", title="Web Check"),
+               "## Transcript\n\n**[00:01]** Me: hello web\n")
+    store.save(_basic_frontmatter(id="web-2", title="<script>alert(1)</script>",
+                                  start_time="15:00"),
+               "## Transcript\n\n<img src=x onerror=alert(1)>\n")
+    client = create_app(store).test_client()
+
+    index = client.get("/").get_data(as_text=True)
+    assert "Web Check" in index
+    assert "<script>alert(1)</script>" not in index
+
+    view = client.get("/transcript/web-1").get_data(as_text=True)
+    assert "<strong>[00:01]</strong> Me: hello web" in view
+
+    evil = client.get("/transcript/web-2").get_data(as_text=True)
+    assert "<img src=x" not in evil and "&lt;script&gt;" in evil
+
+    assert client.get("/transcript/missing").status_code == 404
+    search = client.get("/search?q=hello").get_data(as_text=True)
+    assert "Web Check" in search
+
+
+def t_mcp_core_tools_roundtrip(tmp: Path) -> None:
+    """MCP tool cores: list filters, search snippets, get — all JSON-safe."""
+    from src.mcp.core import (
+        get_transcript_core,
+        list_transcripts_core,
+        search_transcripts_core,
+    )
+
+    store = TranscriptStore(tmp)
+    store.save(_basic_frontmatter(id="mcp-1", title="Roadmap sync", date="2026-05-01"),
+               "## Transcript\n\nthe quarterly roadmap is green\n")
+    store.save(_basic_frontmatter(id="mcp-2", title="Retro", date="2026-06-01",
+                                  start_time="16:00"),
+               "## Transcript\n\nretro went fine\n")
+
+    listed = list_transcripts_core(store, date_from="2026-05-15")
+    assert [fm["id"] for fm in listed] == ["mcp-2"]
+    json.dumps(listed)
+
+    hits = search_transcripts_core(store, "roadmap")
+    assert len(hits) == 1 and hits[0]["metadata"]["id"] == "mcp-1"
+    assert any("roadmap" in s for s in hits[0]["snippets"])
+    json.dumps(hits)
+
+    got = get_transcript_core(store, "mcp-1")
+    assert "quarterly roadmap" in got["body"]
+    assert "error" in get_transcript_core(store, "ghost")
+    json.dumps(got)
+
+
 # ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
@@ -580,12 +701,16 @@ TESTS = [
     ("orphan finder handles mixed layouts coherently", t_orphan_finder_handles_mixed_layouts),
     ("orphan finder excludes the active-recording session", t_orphan_finder_excludes_active_recording),
     ("save_failure writes a status:failed placeholder transcript", t_failure_placeholder_lands_on_disk),
+    ("crashed-recorder WAV header repairs and transcribes", t_wav_repair_recovers_crashed_recording),
+    ("completed-ids index matches per-id checks at scale", t_completed_ids_index_consistent_at_scale),
+    ("web UI routes serve, search, 404, and escape HTML", t_web_routes_smoke),
+    ("MCP tool cores: list / search / get round-trip as JSON", t_mcp_core_tools_roundtrip),
 ]
 
 
 def main() -> int:
     suite = Suite()
-    print("Otis stress test (Phases 1-4)")
+    print("Otis stress test (Phases 1-6)")
     print("=" * 50)
     for name, fn in TESTS:
         with tempfile.TemporaryDirectory() as tmp:

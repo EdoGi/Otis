@@ -14,6 +14,8 @@ set -euo pipefail
 
 LABEL="${1:-personal}"
 
+PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
 CRED_DIR="${HOME}/.otis"
 CRED_FILE="${CRED_DIR}/credentials.json"
 if [[ "${LABEL}" == "personal" || "${LABEL}" == "default" || "${LABEL}" == "primary" ]]; then
@@ -96,8 +98,18 @@ fi
 echo
 info "Running an interactive OAuth test (a browser tab will open)."
 info "Sign in with the Google account you want to label '${LABEL}'."
-PYTHONPATH="$(cd "$(dirname "$0")/.." && pwd)" \
-python3 - <<PY
+
+# The Google API libraries live in the project venv — bare python3 would
+# fail with ModuleNotFoundError on a fresh machine.
+PYTHON="${PROJECT_ROOT}/.venv/bin/python"
+if [[ ! -x "${PYTHON}" ]]; then
+    warn "No venv at ${PROJECT_ROOT}/.venv — run scripts/setup.sh first. Falling back to python3."
+    PYTHON="python3"
+fi
+
+# `if <command>` keeps set -e from aborting on failure, so the hints below
+# actually print when the auth test fails.
+if PYTHONPATH="${PROJECT_ROOT}" "${PYTHON}" - <<PY
 from src.detection.calendar_poller import GoogleCalendarPoller, CalendarAuthError
 import sys
 
@@ -122,8 +134,7 @@ for ev in events[:5]:
         line += f"  → {ev.meeting_link}"
     print(line)
 PY
-
-if [[ $? -eq 0 ]]; then
+then
     ok "Account '${LABEL}' is authenticated."
     ok "Token cached at ${TOKEN_FILE} (chmod 600)."
     echo
