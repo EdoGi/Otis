@@ -66,5 +66,5 @@ web:
   host: "127.0.0.1"
 
 # The MCP server runs over stdio and is launched by the MCP client itself
-# (e.g. `claude mcp add otis -- <repo>/.venv/bin/python -m src.mcp.server`),
+# (e.g. `claude mcp add otis -- <repo>/.venv/bin/python -P -m src.mcp.server`),
 # so it needs no configuration here.

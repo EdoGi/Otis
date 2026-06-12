@@ -4,7 +4,10 @@ Runs over **stdio** — the MCP client (Claude Desktop, Claude Code, …)
 launches this process itself, so there's nothing to start from the Otis app
 and no port to configure:
 
-    claude mcp add otis -- /path/to/Otis/.venv/bin/python -m src.mcp.server
+    claude mcp add otis -- /path/to/Otis/.venv/bin/python -P -m src.mcp.server
+
+(``-P`` keeps the MCP client's cwd off ``sys.path`` so a foreign ``src``
+package there can't shadow Otis's modules.)
 
 All tools are read-only; nothing leaves the machine. Tool logic lives in
 :mod:`src.mcp.core` so it stays unit-testable without the MCP runtime.

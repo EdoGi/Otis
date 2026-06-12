@@ -197,7 +197,8 @@ def create_app(store: TranscriptStore) -> "Flask":
         if record is None:
             abort(404)
         fm = record["metadata"]
-        title = html.escape(str(fm.get("title") or "(untitled)"))
+        raw_title = str(fm.get("title") or "(untitled)")
+        title = html.escape(raw_title)
         meta_bits: list[str] = []
         for label, key in (("Date", "date"), ("Start", "start_time"),
                            ("End", "end_time"), ("Language", "language"),
@@ -214,7 +215,9 @@ def create_app(store: TranscriptStore) -> "Flask":
             f'<div class="meta-card"><dl>{"".join(meta_bits)}</dl></div>'
             + render_markdown_min(record["body"])
         )
-        return page(title, body_html)
+        # Raw title here: the <title> placeholder is Jinja-autoescaped, so
+        # passing the pre-escaped form would double-escape ("Q&amp;A").
+        return page(raw_title, body_html)
 
     @app.errorhandler(404)
     def not_found(_e: Any) -> tuple[str, int]:
@@ -240,7 +243,10 @@ def serve_in_background(
     from werkzeug.serving import make_server
 
     try:
-        server = make_server(host, port, create_app(store))
+        # threaded=True is essential: the default single-threaded server
+        # services one connection at a time, so a browser's idle preconnect
+        # socket (no request bytes) would block every real request behind it.
+        server = make_server(host, port, create_app(store), threaded=True)
     except SystemExit as exc:
         # werkzeug calls sys.exit(1) when the port is taken — re-raise as a
         # normal error so a busy port can't take down the menu-bar app.

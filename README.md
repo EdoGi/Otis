@@ -153,7 +153,7 @@ start or keep running):
 
 ```bash
 # Claude Code:
-claude mcp add otis -- /path/to/Otis/.venv/bin/python -m src.mcp.server
+claude mcp add otis -- /path/to/Otis/.venv/bin/python -P -m src.mcp.server
 ```
 
 Or in Claude Desktop's `claude_desktop_config.json`:
@@ -163,11 +163,15 @@ Or in Claude Desktop's `claude_desktop_config.json`:
   "mcpServers": {
     "otis": {
       "command": "/path/to/Otis/.venv/bin/python",
-      "args": ["-m", "src.mcp.server"]
+      "args": ["-P", "-m", "src.mcp.server"]
     }
   }
 }
 ```
+
+(`-P` keeps the client's working directory off `sys.path`, so launching
+Claude inside some other project that happens to have its own `src/`
+package can't shadow Otis's modules.)
 
 Three read-only tools are exposed:
 

@@ -167,3 +167,13 @@ def test_serve_in_background_serves_real_requests(tmp_path: Path) -> None:
         f"http://127.0.0.1:{port}/", timeout=5
     ).read().decode()
     assert "Live Check" in body
+
+
+def test_page_title_is_escaped_exactly_once(tmp_path: Path) -> None:
+    """'Q&A — <sync>' must render in <title> as 'Q&amp;A — &lt;sync&gt;',
+    not the double-escaped 'Q&amp;amp;A'."""
+    store = TranscriptStore(tmp_path / "transcripts")
+    store.save(_fm("amp-1", title="Q&A — <sync>"), "## Transcript\n\nbody\n")
+    text = create_app(store).test_client().get("/transcript/amp-1").get_data(as_text=True)
+    assert "<title>Q&amp;A — &lt;sync&gt; — Otis</title>" in text
+    assert "&amp;amp;" not in text

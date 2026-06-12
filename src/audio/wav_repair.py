@@ -57,7 +57,8 @@ def wav_needs_repair(path: Path) -> bool:
     except Exception:
         return False
     try:
-        head = path.read_bytes()[: 64 * 1024]
+        with path.open("rb") as fh:
+            head = fh.read(64 * 1024)
         if head[:4] != b"RIFF" or head[8:12] != b"WAVE":
             return False
         chunks = _find_chunks(head)
@@ -80,7 +81,8 @@ def repair_wav_header(path: Path) -> bool:
         size = path.stat().st_size
         if size <= _RIFF_HEADER_BYTES:
             return False
-        head = path.read_bytes()[: 64 * 1024]
+        with path.open("rb") as fh:
+            head = fh.read(64 * 1024)
         if head[:4] != b"RIFF" or head[8:12] != b"WAVE":
             return False
         chunks = _find_chunks(head)
@@ -96,12 +98,18 @@ def repair_wav_header(path: Path) -> bool:
             return False  # not plain PCM — don't guess
 
         data_offset, declared_size = chunks[b"data"]
+        if declared_size != 0:
+            # Only the crash signature (size patched as 0 at open time) is
+            # repairable. A non-zero size that disagrees with the file size
+            # can be legitimate — e.g. trailing LIST/INFO chunks after data —
+            # and "repairing" it would swallow that metadata into the audio.
+            return False
         body = size - (data_offset + 8)
         if body <= 0:
             return False
         # Truncate to a whole number of frames (a crash can land mid-frame).
         body -= body % block_align
-        if body <= 0 or declared_size == body:
+        if body <= 0:
             return False
 
         with path.open("r+b") as fh:

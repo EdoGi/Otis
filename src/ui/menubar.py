@@ -29,9 +29,9 @@ What's wired up
   ProcessMonitor rebuild (whitelist edits) take effect on next launch and we
   surface that with a notification.
 * The transcription handler is pluggable: pass ``transcription_handler`` to
-  the constructor; default is a no-op stub that just logs.
-
-Phase 4 (transcription) replaces the stub with the real pipeline.
+  the constructor (``main.py`` wires the real mlx-whisper pipeline from
+  ``src.pipeline``); the default no-op just logs, which keeps bare test
+  instances recording-only.
 """
 
 from __future__ import annotations
@@ -1447,10 +1447,9 @@ class MenuBarApp:
 # Defaults
 # ============================================================================
 def _default_transcription_handler(metadata: dict[str, Any]) -> None:
-    """No-op stub used until Phase 4 wires up the real pipeline."""
+    """No-op fallback when no handler is injected (bare/test instances)."""
     logger.info(
-        "Transcription handler not configured — keeping the recording at %r. "
-        "(Phase 4 will replace this with mlx-whisper.)",
+        "Transcription handler not configured — keeping the recording at %r.",
         metadata.get("mic_wav"),
     )
 

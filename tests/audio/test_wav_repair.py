@@ -96,3 +96,16 @@ def test_truncation_lands_on_frame_boundary(tmp_path: Path) -> None:
 def test_repair_if_needed_handles_none_and_missing(tmp_path: Path) -> None:
     assert repair_if_needed(None) is False
     assert repair_if_needed(tmp_path / "nope.wav") is False
+
+
+def test_repair_refuses_nonzero_declared_size_with_trailing_data(tmp_path: Path) -> None:
+    """A valid WAV with chunks AFTER data (e.g. LIST/INFO metadata) must not
+    be 'repaired' into swallowing that metadata as audio."""
+    path = tmp_path / "trailing.wav"
+    _write_wav(path)
+    with path.open("ab") as fh:
+        fh.write(b"LIST" + struct.pack("<I", 4) + b"INFO")  # trailing chunk
+    before = path.read_bytes()
+    assert wav_needs_repair(path) is False
+    assert repair_wav_header(path) is False  # even when called directly
+    assert path.read_bytes() == before

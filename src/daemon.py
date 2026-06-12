@@ -93,7 +93,10 @@ class OtisDaemon:
             else None
         )
         self._transcribe_lock = threading.Lock()
-        self._transcribe_thread: threading.Thread | None = None
+        # Every spawned transcription worker, so shutdown can join them ALL —
+        # back-to-back meetings queue on _transcribe_lock and a single slot
+        # would let the queued one die unrecorded at exit.
+        self._transcribe_threads: list[threading.Thread] = []
         self._current_meeting: MeetingContext | None = None
 
         # Working-hours gating.
@@ -239,8 +242,13 @@ class OtisDaemon:
             self._recorder = None
             meeting = self._current_meeting
             self._current_meeting = None
+            # Spawn + register the transcription worker BEFORE releasing the
+            # lock: a concurrent _shutdown() serializes on this lock, so it
+            # is guaranteed to see the worker and wait for it. Registering
+            # after the unlock left a window where shutdown saw no recorder
+            # AND no worker and exited, killing the transcription silently.
+            self._maybe_transcribe(metadata, meeting)
         self._notify(_format_save_line(metadata))
-        self._maybe_transcribe(metadata, meeting)
 
     # =====================================================================
     # Transcription (worker thread; same handler as the menu bar)
@@ -275,16 +283,27 @@ class OtisDaemon:
             daemon=True,
         )
         with self._lock:
-            self._transcribe_thread = thread
+            # Prune finished workers so back-to-back days don't accumulate.
+            self._transcribe_threads = [
+                t for t in self._transcribe_threads if t.is_alive()
+            ]
+            self._transcribe_threads.append(thread)
         thread.start()
 
     def _run_transcription(self, metadata: dict[str, Any]) -> None:
         session_id = str(metadata.get("session_id") or "unknown")
         with self._transcribe_lock:  # back-to-back stops serialize here
-            try:
-                self._detector.transcription_started()
-            except Exception:  # pragma: no cover
-                logger.exception("Detector transcription_started raised")
+            # Only drive the detector's PROCESSING/IDLE transitions when no
+            # NEW recording has started in the meantime — otherwise this
+            # worker would demote meeting B's RECORDING to PROCESSING and
+            # later reset the detector to IDLE while B is still capturing.
+            with self._lock:
+                manage_detector_state = self._recorder is None
+            if manage_detector_state:
+                try:
+                    self._detector.transcription_started()
+                except Exception:  # pragma: no cover
+                    logger.exception("Detector transcription_started raised")
             self._notify(f"📝  Transcribing session {session_id[:8]}…")
             try:
                 assert self._transcription_handler is not None
@@ -295,10 +314,11 @@ class OtisDaemon:
                 self._notify(f"❌  Transcription failed: {exc}")
                 self._save_failure_placeholder(metadata, exc)
             finally:
-                try:
-                    self._detector.transcription_finished()
-                except Exception:  # pragma: no cover
-                    logger.exception("Detector transcription_finished raised")
+                if manage_detector_state:
+                    try:
+                        self._detector.transcription_finished()
+                    except Exception:  # pragma: no cover
+                        logger.exception("Detector transcription_finished raised")
 
     def _save_failure_placeholder(
         self, metadata: dict[str, Any], error: BaseException,
@@ -375,14 +395,15 @@ class OtisDaemon:
     def _shutdown(self) -> None:
         self._stop_recording()
         with self._lock:
-            transcribe_thread = self._transcribe_thread
-        if transcribe_thread is not None and transcribe_thread.is_alive():
+            pending = [t for t in self._transcribe_threads if t.is_alive()]
+        if pending:
             self._notify(
-                "⏳  Waiting for the transcription to finish "
-                f"(up to {int(TRANSCRIBE_SHUTDOWN_JOIN_SECONDS / 60)} min)…"
+                f"⏳  Waiting for {len(pending)} transcription(s) to finish "
+                f"(up to {int(TRANSCRIBE_SHUTDOWN_JOIN_SECONDS / 60)} min each)…"
             )
-            transcribe_thread.join(timeout=TRANSCRIBE_SHUTDOWN_JOIN_SECONDS)
-            if transcribe_thread.is_alive():  # pragma: no cover (very long audio)
+        for thread in pending:
+            thread.join(timeout=TRANSCRIBE_SHUTDOWN_JOIN_SECONDS)
+            if thread.is_alive():  # pragma: no cover (very long audio)
                 self._notify(
                     "⚠️   Transcription still running at shutdown — a failure "
                     "placeholder may be missing; retry via scripts/retranscribe.py."

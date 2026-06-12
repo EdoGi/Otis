@@ -293,8 +293,7 @@ def _make_daemon_with_pipeline(detector, tmp_path, processor):
 
 
 def _join_transcription(daemon: OtisDaemon) -> None:
-    thread = daemon._transcribe_thread
-    if thread is not None:
+    for thread in list(daemon._transcribe_threads):
         thread.join(timeout=5.0)
 
 
@@ -360,7 +359,7 @@ def test_no_pipeline_means_record_only(tmp_path) -> None:
     pm.fire_detected("zoom.us")
     detector.user_stopped_recording()
     assert rec.stopped
-    assert daemon._transcribe_thread is None  # no worker spawned
+    assert daemon._transcribe_threads == []  # no worker spawned
 
 
 # ============================================================================
@@ -424,3 +423,82 @@ def test_window_closing_stops_detector_but_never_mid_recording() -> None:
     daemon._apply_schedule()
     assert pm.stopped
     assert any("detection paused" in n.lower() for n in notes)
+
+
+# ============================================================================
+# Review-fix regressions
+# ============================================================================
+def test_transcription_worker_registered_before_stop_returns(tmp_path) -> None:
+    """_stop_recording must register the worker under its lock, so a
+    concurrent _shutdown can never miss an in-flight transcription."""
+    import threading as threading_mod
+
+    pm = _FakeProcessMonitor()
+    detector = MeetingDetector(
+        process_monitor=pm,  # type: ignore[arg-type]
+        calendar_pollers=[],
+        clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc),
+    )
+
+    gate = threading_mod.Event()
+
+    class _SlowProcessor:
+        def process(self, *_a, **_k):
+            gate.wait(timeout=5.0)
+
+    daemon, _notes, _rec, _pipeline = _make_daemon_with_pipeline(
+        detector, tmp_path, _SlowProcessor()
+    )
+    pm.fire_detected("zoom.us")
+    detector.user_stopped_recording()  # runs _stop_recording synchronously
+    # The worker must already be visible the instant _stop_recording returned.
+    assert daemon._transcribe_threads and daemon._transcribe_threads[0].is_alive()
+    gate.set()
+    _join_transcription(daemon)
+
+
+def test_shutdown_waits_for_all_queued_transcriptions(tmp_path) -> None:
+    pm = _FakeProcessMonitor()
+    detector = MeetingDetector(
+        process_monitor=pm,  # type: ignore[arg-type]
+        calendar_pollers=[],
+        clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc),
+    )
+    processor = _RecordingProcessor()
+    daemon, _notes, _rec, _pipeline = _make_daemon_with_pipeline(
+        detector, tmp_path, processor
+    )
+
+    # Two back-to-back meetings → two workers (second queues on the lock).
+    pm.fire_detected("zoom.us")
+    detector.user_stopped_recording()
+    pm.fire_detected("zoom.us")
+    detector.user_stopped_recording()
+
+    daemon._shutdown()
+    assert len(processor.calls) == 2, "shutdown must wait for BOTH transcriptions"
+
+
+def test_worker_leaves_detector_alone_while_new_recording_active(tmp_path) -> None:
+    """A transcription finishing while meeting B records must not demote
+    B's RECORDING state or reset the detector to IDLE."""
+    pm = _FakeProcessMonitor()
+    detector = MeetingDetector(
+        process_monitor=pm,  # type: ignore[arg-type]
+        calendar_pollers=[],
+        clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc),
+    )
+    processor = _RecordingProcessor()
+    daemon, _notes, _rec, _pipeline = _make_daemon_with_pipeline(
+        detector, tmp_path, processor
+    )
+
+    # Meeting B is actively recording while worker A runs.
+    pm.fire_detected("zoom.us")
+    assert detector.get_state() == MeetingState.RECORDING
+    daemon._run_transcription(
+        {"session_id": "old-A", "mic_wav": "old-A_mic.wav", "system_wav": None,
+         "_meeting": {"title": None, "app": None, "participants": []}}
+    )
+    assert len(processor.calls) == 1  # A still got transcribed
+    assert detector.get_state() == MeetingState.RECORDING  # B untouched
