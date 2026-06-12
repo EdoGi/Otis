@@ -30,6 +30,8 @@ class FakeInputStream:
     dtype: str
     device: int
     callback: Callable[..., None]
+    blocksize: int = 0
+    latency: str | float | None = None
     _running: threading.Event = field(default_factory=threading.Event)
     _thread: threading.Thread | None = None
 

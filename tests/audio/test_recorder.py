@@ -295,3 +295,22 @@ def test_open_pause_window_closed_on_stop(fake_sounddevice, tmp_path: Path) -> N
     assert len(meta["pauses"]) == 1
     p = meta["pauses"][0]
     assert p["resumed_at"] >= p["paused_at"]
+
+
+def test_streams_open_with_low_power_capture_settings(
+    fake_sounddevice, tmp_path: Path  # noqa: ARG001
+) -> None:
+    """Large capture blocks are the difference between ~19% and ~6% CPU
+    during a meeting — never silently regress to PortAudio's ~9 ms default."""
+    from src.audio.recorder import CAPTURE_BLOCKSIZE_FRAMES, CAPTURE_LATENCY
+
+    rec = _make_recorder(tmp_path)
+    rec.start()
+    try:
+        for st in (rec._mic_state, rec._system_state):
+            assert st is not None
+            assert st.stream.blocksize == CAPTURE_BLOCKSIZE_FRAMES
+            assert st.stream.latency == CAPTURE_LATENCY
+    finally:
+        rec.stop()
+    assert CAPTURE_BLOCKSIZE_FRAMES >= 2048  # ≥128 ms at 16 kHz
