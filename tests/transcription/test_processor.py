@@ -444,6 +444,75 @@ def test_process_retranscribe_relocated_audio_reuses_paths(tmp_path: Path) -> No
     assert len(list((tmp_path / "audio").rglob("*_mic.wav"))) == 1
 
 
+# A transcript long enough to clear the title heuristic's minimum-words bar.
+_ONBOARDING_SEGMENTS = [
+    (0.0, 4.0, "So let's walk through the onboarding flow together today."),
+    (4.0, 8.0, "The onboarding starts with the import screen, as Acme requested."),
+    (8.0, 12.0, "I showed Acme the onboarding checklist and the import settings."),
+    (12.0, 16.0, "For Acme the onboarding should skip the import of legacy data."),
+    (16.0, 20.0, "Then onboarding emails go out and the import finishes overnight."),
+]
+
+
+def test_adhoc_recording_gets_suggested_title_and_filename(tmp_path: Path) -> None:
+    """No calendar title → transcript-derived title; filename keeps the
+    date+time prefix and uses the suggested slug."""
+    session = _make_recording_session(tmp_path)
+    engine = _engine_returning(mic_segments=_ONBOARDING_SEGMENTS, system_segments=[])
+    store = TranscriptStore(tmp_path / "transcripts")
+    processor = TranscriptProcessor(
+        engine=engine, store=store, audio_dir=session.audio_dir
+    )
+
+    result = processor.process(session, meeting=MeetingSnapshot(title=None))
+
+    assert result.metadata["title"] == "Onboarding with Acme"
+    local_start = session.start_wall_clock.astimezone()
+    expected_prefix = local_start.strftime("%Y-%m-%d_%H%M")
+    assert result.transcript_path.name == (
+        f"{expected_prefix}_onboarding-with-acme.md"
+    )
+
+
+def test_calendar_title_is_never_overridden(tmp_path: Path) -> None:
+    session = _make_recording_session(tmp_path)
+    engine = _engine_returning(mic_segments=_ONBOARDING_SEGMENTS, system_segments=[])
+    store = TranscriptStore(tmp_path / "transcripts")
+    processor = TranscriptProcessor(
+        engine=engine, store=store, audio_dir=session.audio_dir
+    )
+
+    result = processor.process(
+        session, meeting=MeetingSnapshot(title="Weekly sync w/ TenderStrike")
+    )
+    assert result.metadata["title"] == "Weekly sync w/ TenderStrike"
+
+
+def test_short_adhoc_recording_keeps_fallback_title(tmp_path: Path) -> None:
+    session = _make_recording_session(tmp_path)
+    engine = _engine_returning(
+        mic_segments=[(0.0, 1.0, "hello can you hear me")], system_segments=[]
+    )
+    store = TranscriptStore(tmp_path / "transcripts")
+    processor = TranscriptProcessor(
+        engine=engine, store=store, audio_dir=session.audio_dir
+    )
+    result = processor.process(session, meeting=MeetingSnapshot())
+    assert result.metadata["title"] == "Ad-hoc Recording"
+
+
+def test_suggest_titles_can_be_disabled(tmp_path: Path) -> None:
+    session = _make_recording_session(tmp_path)
+    engine = _engine_returning(mic_segments=_ONBOARDING_SEGMENTS, system_segments=[])
+    store = TranscriptStore(tmp_path / "transcripts")
+    processor = TranscriptProcessor(
+        engine=engine, store=store, audio_dir=session.audio_dir,
+        suggest_titles=False,
+    )
+    result = processor.process(session, meeting=MeetingSnapshot())
+    assert result.metadata["title"] == "Ad-hoc Recording"
+
+
 def test_process_progress_reaches_100(tmp_path: Path) -> None:
     session = _make_recording_session(tmp_path)
     engine = _engine_returning(

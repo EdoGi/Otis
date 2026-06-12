@@ -62,6 +62,7 @@ def build_pipeline(cfg: Config) -> TranscriptionPipeline:
         store=store,
         audio_dir=audio_dir,
         model_name=engine.model_name,
+        suggest_titles=bool(cfg.get("transcription", "suggest_titles", default=True)),
     )
     return TranscriptionPipeline(
         audio_dir=audio_dir,

@@ -54,6 +54,10 @@ detection:
 transcription:
   model: "small"  # tiny, base, small, medium, large-v3
   language: null  # null = auto-detect
+  # Ad-hoc recordings (no calendar event) get a transcript-derived title
+  # like "Onboarding with Acme" instead of "Ad-hoc Recording". The filename
+  # keeps its date+time prefix. Local heuristic — nothing leaves the Mac.
+  suggest_titles: true
 
 storage:
   transcript_dir: "~/Otis/transcripts"

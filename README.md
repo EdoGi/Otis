@@ -221,6 +221,7 @@ The most relevant knobs:
 | `storage.audio_dir` | `~/Otis/audio` | WAVs + metadata land here. |
 | `storage.transcript_dir` | `~/Otis/transcripts` | Phase 4. |
 | `transcription.model` | `small` | `tiny` / `base` / `small` / `medium` / `large-v3`. |
+| `transcription.suggest_titles` | `true` | Ad-hoc recordings get a transcript-derived title ("Onboarding with Acme") instead of "Ad-hoc Recording"; the file keeps its date+time prefix. Local heuristic only. |
 
 Multi-account Google Calendar lives under `detection.calendar.accounts` —
 see the inline comment in the YAML.

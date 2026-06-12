@@ -71,6 +71,7 @@ DEFAULTS: dict[str, Any] = {
     "transcription": {
         "model": "small",
         "language": None,
+        "suggest_titles": True,
     },
     "storage": {
         "transcript_dir": "~/Otis/transcripts",

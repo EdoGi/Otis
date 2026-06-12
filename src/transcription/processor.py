@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Any
 
 from src.storage.transcript_store import TranscriptStore, slugify
+from src.transcription.titling import suggest_title
 from src.transcription.whisper_engine import (
     Segment,
     TranscriptionResult,
@@ -160,11 +161,16 @@ class TranscriptProcessor:
         audio_dir: str | Path,
         model_name: str | None = None,
         dedup_echoes: bool = False,
+        suggest_titles: bool = True,
     ) -> None:
         self._engine = engine
         self._store = store
         self._audio_dir = Path(audio_dir).expanduser()
         self._model_name = model_name or engine.model_name
+        # When a recording has no calendar title, mine the transcript for a
+        # descriptive one ("Onboarding with Acme") instead of saving every
+        # ad-hoc session as "Ad-hoc Recording". Local heuristic only.
+        self._suggest_titles = suggest_titles
         # Echo dedup off by default. Real meetings often have both streams
         # carrying the other person's voice (mic picks up speakers / earphone
         # leak), and our heuristic was preferring the mic copy and dropping
@@ -255,6 +261,18 @@ class TranscriptProcessor:
         # Where the audio files will live after rename — relative to audio_dir.
         relocated_relative = self._relocated_audio_paths(session, local_start)
 
+        # Ad-hoc recordings (no calendar title) get a transcript-derived
+        # title; the filename slug — and so the saved name — follows it,
+        # keeping the date+time prefix: 2026-06-12_1430_onboarding-with-acme.md
+        suggested_title: str | None = None
+        if self._suggest_titles and not (meeting.title or "").strip():
+            transcript_text = " ".join(ls.segment.text for ls, _ in merged)
+            suggested_title = suggest_title(
+                transcript_text, participants=meeting.participants
+            )
+            if suggested_title:
+                logger.info("Suggested title for ad-hoc session: %r", suggested_title)
+
         frontmatter = self._build_frontmatter(
             session=session,
             meeting=meeting,
@@ -263,6 +281,7 @@ class TranscriptProcessor:
             duration_seconds=duration_seconds,
             language=detected_language or language,
             audio_relative_paths=relocated_relative,
+            suggested_title=suggested_title,
         )
 
         body = render_markdown_body(
@@ -340,8 +359,9 @@ class TranscriptProcessor:
         duration_seconds: float,
         language: str | None,
         audio_relative_paths: dict[str, str | None],
+        suggested_title: str | None = None,
     ) -> dict[str, Any]:
-        title = (meeting.title or "").strip() or "Ad-hoc Recording"
+        title = (meeting.title or "").strip() or suggested_title or "Ad-hoc Recording"
         return {
             "id": session.session_id,
             "title": title,
