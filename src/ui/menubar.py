@@ -1338,6 +1338,12 @@ class MenuBarApp:
         return metadata
 
     def _run_transcription(self, metadata: dict[str, Any]) -> None:
+        # Whisper saturates the GPU/CPU for many minutes — never compete
+        # with a live call (e.g. back-to-back meetings). Wait until the mic
+        # frees up before starting the heavy work; the recording is safe on
+        # disk either way.
+        self._defer_while_in_call()
+
         try:
             self._detector.transcription_started()
         except Exception:  # pragma: no cover
@@ -1377,6 +1383,29 @@ class MenuBarApp:
         self._events.put(("force_state", UiState.IDLE))
         # Whether we succeeded or not, the Recent menu has new content to show.
         self._events.put(("refresh_recent", None))
+
+    def _defer_while_in_call(self) -> None:
+        if not self._config.get("transcription", "defer_while_in_call", default=True):
+            return
+        from src.pipeline import make_call_probe, wait_for_call_to_end
+
+        probe = make_call_probe(self._config)
+
+        def busy() -> bool:
+            with self._lock:
+                if self._recorder is not None:
+                    return True
+            return probe()
+
+        def notify_deferred() -> None:
+            self._notifications.notify(
+                NotificationType.RECORDING_STARTED,
+                "Transcription deferred",
+                "Waiting for your call to finish so the laptop stays fast.",
+                force=True,
+            )
+
+        wait_for_call_to_end(is_busy=busy, on_first_wait=notify_deferred)
 
     def _save_failure_placeholder(
         self, metadata: dict[str, Any], error: BaseException,

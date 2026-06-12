@@ -129,3 +129,68 @@ def test_handler_survives_progress_sink_exception(tmp_path: Path) -> None:
     handler = make_transcription_handler(pipeline, on_progress_pct=bad_sink)
     handler({"session_id": "s", "mic_wav": "s_mic.wav", "system_wav": None})
     assert len(fake.calls) == 1  # processing completed despite sink errors
+
+
+# ---------------------------------------------------------------------------
+# Defer-while-in-call
+# ---------------------------------------------------------------------------
+def test_wait_returns_immediately_when_not_busy() -> None:
+    from src.pipeline import wait_for_call_to_end
+
+    waited = wait_for_call_to_end(is_busy=lambda: False, sleep=lambda _s: None)
+    assert waited == 0.0
+
+
+def test_wait_polls_until_call_ends_and_notifies_once() -> None:
+    from src.pipeline import wait_for_call_to_end
+
+    busy_answers = [True, True, True, False]
+    notifications: list[str] = []
+    waited = wait_for_call_to_end(
+        is_busy=lambda: busy_answers.pop(0),
+        on_first_wait=lambda: notifications.append("deferred"),
+        poll_seconds=30.0,
+        sleep=lambda _s: None,
+    )
+    assert waited == 90.0  # three busy polls
+    assert notifications == ["deferred"]  # only one toast
+
+
+def test_wait_gives_up_after_max_and_proceeds() -> None:
+    from src.pipeline import wait_for_call_to_end
+
+    waited = wait_for_call_to_end(
+        is_busy=lambda: True,
+        poll_seconds=30.0,
+        max_seconds=120.0,
+        sleep=lambda _s: None,
+    )
+    assert waited == 120.0  # bounded — transcription still happens
+
+
+def test_wait_aborts_on_shutdown_signal() -> None:
+    from src.pipeline import wait_for_call_to_end
+
+    calls = {"n": 0}
+
+    def should_abort() -> bool:
+        calls["n"] += 1
+        return calls["n"] >= 3
+
+    waited = wait_for_call_to_end(
+        is_busy=lambda: True,
+        should_abort=should_abort,
+        poll_seconds=30.0,
+        sleep=lambda _s: None,
+    )
+    assert waited == 60.0
+
+
+def test_call_probe_disabled_when_mic_signal_invalid(tmp_path: Path) -> None:
+    """mic_activation disabled (dictation app holds the mic) ⇒ never defer
+    on the mic signal."""
+    from src.pipeline import make_call_probe
+
+    cfg = Config({"detection": {"mic_activation": {"enabled": False}}})
+    probe = make_call_probe(cfg)
+    assert probe() is False

@@ -54,6 +54,10 @@ detection:
 transcription:
   model: "small"  # tiny, base, small, medium, large-v3
   language: null  # null = auto-detect
+  # Whisper saturates the GPU/CPU for many minutes on long meetings. With
+  # this on, a transcription waits until your current call ends (mic free)
+  # instead of competing with it — the recording is safe on disk meanwhile.
+  defer_while_in_call: true
   # Ad-hoc recordings (no calendar event) get a transcript-derived title
   # like "Onboarding with Acme" instead of "Ad-hoc Recording". The filename
   # keeps its date+time prefix. Local heuristic — nothing leaves the Mac.

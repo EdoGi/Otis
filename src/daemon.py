@@ -293,6 +293,7 @@ class OtisDaemon:
     def _run_transcription(self, metadata: dict[str, Any]) -> None:
         session_id = str(metadata.get("session_id") or "unknown")
         with self._transcribe_lock:  # back-to-back stops serialize here
+            self._defer_while_in_call()
             # Only drive the detector's PROCESSING/IDLE transitions when no
             # NEW recording has started in the meantime — otherwise this
             # worker would demote meeting B's RECORDING to PROCESSING and
@@ -319,6 +320,30 @@ class OtisDaemon:
                         self._detector.transcription_finished()
                     except Exception:  # pragma: no cover
                         logger.exception("Detector transcription_finished raised")
+
+    def _defer_while_in_call(self) -> None:
+        """Hold the heavy whisper work while a call / new recording is live."""
+        if not self._config.get("transcription", "defer_while_in_call", default=True):
+            return
+        from src.pipeline import make_call_probe, wait_for_call_to_end
+
+        probe = make_call_probe(self._config)
+
+        def busy() -> bool:
+            with self._lock:
+                if self._recorder is not None:
+                    return True
+            return probe()
+
+        waited = wait_for_call_to_end(
+            is_busy=busy,
+            on_first_wait=lambda: self._notify(
+                "⏸  Transcription deferred until your call ends."
+            ),
+            should_abort=self._stop_event.is_set,
+        )
+        if waited:
+            self._notify("▶️  Call over — starting transcription.")
 
     def _save_failure_placeholder(
         self, metadata: dict[str, Any], error: BaseException,

@@ -27,7 +27,9 @@ def app(tmp_path: Path):
                 "working_days": [0, 1, 2, 3, 4],
                 "working_hours": {"start": "08:00", "end": "20:00"},
             },
-            "transcription": {"model": "small", "language": None},
+            # defer_while_in_call off: tests must never block on the real mic.
+            "transcription": {"model": "small", "language": None,
+                              "defer_while_in_call": False},
             "storage": {
                 "audio_dir": str(tmp_path / "audio"),
                 "transcript_dir": str(tmp_path / "transcripts"),
@@ -116,3 +118,51 @@ def test_device_error_event_notifies_without_stopping(app) -> None:
     titles = [t for t, _s, _m in app._test_notifications]
     assert any("Mic stream failed" in t for t in titles)
     assert app.snapshot.state == UiState.RECORDING  # recording untouched
+
+
+# ---------------------------------------------------------------------------
+# Defer-while-in-call wiring
+# ---------------------------------------------------------------------------
+def test_transcription_defers_until_call_ends(app, monkeypatch) -> None:
+    import src.pipeline as pipeline_mod
+
+    captured: dict = {}
+
+    def fake_wait(*, is_busy, on_first_wait=None, should_abort=None, **_kw):
+        captured["is_busy"] = is_busy
+        captured["on_first_wait"] = on_first_wait
+        return 0.0
+
+    monkeypatch.setattr(pipeline_mod, "wait_for_call_to_end", fake_wait)
+    monkeypatch.setattr(pipeline_mod, "make_call_probe", lambda _cfg: lambda: False)
+
+    # The fixture disables deferral so other tests never touch the real
+    # mic; this test exercises it with the wait fully faked.
+    app._config.apply_overrides({"transcription": {"defer_while_in_call": True}})
+
+    app._defer_while_in_call()
+    assert "is_busy" in captured, "deferral gate was never consulted"
+
+    # An active recorder makes the gate report busy regardless of the mic.
+    app._recorder = object()
+    assert captured["is_busy"]() is True
+    app._recorder = None
+    assert captured["is_busy"]() is False
+
+    # The first-wait callback sends a user-facing notification.
+    captured["on_first_wait"]()
+    titles = [t for t, _s, _m in app._test_notifications]
+    assert any("deferred" in t.lower() for t in titles)
+
+
+def test_deferral_can_be_disabled_in_config(app, monkeypatch) -> None:
+    import src.pipeline as pipeline_mod
+
+    called = {"n": 0}
+    monkeypatch.setattr(
+        pipeline_mod, "wait_for_call_to_end",
+        lambda **_kw: called.__setitem__("n", called["n"] + 1) or 0.0,
+    )
+    app._config.apply_overrides({"transcription": {"defer_while_in_call": False}})
+    app._defer_while_in_call()
+    assert called["n"] == 0

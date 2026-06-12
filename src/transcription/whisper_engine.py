@@ -145,6 +145,7 @@ class WhisperEngine:
         model_name: str = "small",
         idle_timeout_seconds: float = DEFAULT_IDLE_TIMEOUT_SECONDS,
         transcribe_fn: TranscribeFn | None = None,
+        rtf_state_path: str | Path | None = None,
     ) -> None:
         if model_name not in _MODEL_REPO_MAP:
             raise ValueError(
@@ -156,15 +157,20 @@ class WhisperEngine:
         self._transcribe_fn = transcribe_fn or _default_mlx_transcribe
 
         self._lock = threading.RLock()
-        # We don't actually keep the model object in Python — mlx-whisper
-        # caches it in its own module state. What we track is whether we're
-        # "warm", and the idle timer that flags us cold again.
+        # mlx-whisper caches the loaded model in its own module state
+        # (ModelHolder) — 0.5–2 GB of unified memory depending on the model.
+        # We track warmth + an idle timer, and on expiry we actually CLEAR
+        # that cache so the memory goes back to the OS instead of being held
+        # until the app quits.
         self._warm = False
         self._idle_timer: threading.Timer | None = None
+        self._inflight = 0  # transcriptions currently running
         # Measured real-time factor (audio seconds per wall-clock second),
         # EMA-updated after each successful run so progress estimates adapt
         # to this machine + model instead of assuming the M1-Pro/small 8×.
-        self._measured_rtf: float | None = None
+        # Optionally persisted per-model so restarts keep honest estimates.
+        self._rtf_state_path = Path(rtf_state_path).expanduser() if rtf_state_path else None
+        self._measured_rtf: float | None = self._load_persisted_rtf()
 
     # -------------------------------------------------------------------
     # Properties
@@ -230,6 +236,7 @@ class WhisperEngine:
         try:
             with self._lock:
                 self._warm = True
+                self._inflight += 1
                 self._reset_idle_timer()
 
             raw = self._call_transcribe(path, language)
@@ -253,6 +260,12 @@ class WhisperEngine:
         finally:
             if progress is not None:
                 progress.stop()
+            with self._lock:
+                self._inflight = max(0, self._inflight - 1)
+                # Long meetings transcribe for far more than the idle
+                # timeout — re-arm at the END too, so the cooldown counts
+                # from when we actually went quiet.
+                self._reset_idle_timer()
 
         result = self._parse_result(raw, language)
         self._record_rtf(duration, time.monotonic() - started)
@@ -265,12 +278,15 @@ class WhisperEngine:
         return result
 
     def shutdown(self) -> None:
-        """Cancel the idle timer and drop the warm flag (for clean teardown)."""
+        """Cancel the idle timer, drop the warm flag, release model memory."""
         with self._lock:
             self._warm = False
             if self._idle_timer is not None:
                 self._idle_timer.cancel()
                 self._idle_timer = None
+            release = self._inflight == 0
+        if release:
+            _release_mlx_model_cache()
 
     # -------------------------------------------------------------------
     # Internals
@@ -332,7 +348,9 @@ class WhisperEngine:
                 self._measured_rtf = measured
             else:
                 self._measured_rtf = 0.5 * self._measured_rtf + 0.5 * measured
-        logger.debug("Measured RTF %.1fx (smoothed %.1fx)", measured, self._measured_rtf)
+            smoothed = self._measured_rtf
+        self._persist_rtf(smoothed)
+        logger.debug("Measured RTF %.1fx (smoothed %.1fx)", measured, smoothed)
 
     def _reset_idle_timer(self) -> None:
         if self._idle_timer is not None:
@@ -343,11 +361,49 @@ class WhisperEngine:
 
     def _on_idle_expired(self) -> None:
         with self._lock:
+            if self._inflight > 0:
+                # A long transcription is still running — not actually idle.
+                # Re-arm and check again later.
+                self._reset_idle_timer()
+                return
             self._warm = False
             self._idle_timer = None
+        _release_mlx_model_cache()
         logger.info(
-            "WhisperEngine cooled down after %.0fs of inactivity.", self._idle_timeout
+            "WhisperEngine cooled down after %.0fs of inactivity — "
+            "model memory released.",
+            self._idle_timeout,
         )
+
+    # ----------------------------------------------------------- RTF state
+    def _load_persisted_rtf(self) -> float | None:
+        if self._rtf_state_path is None or not self._rtf_state_path.exists():
+            return None
+        try:
+            import json
+
+            data = json.loads(self._rtf_state_path.read_text(encoding="utf-8"))
+            value = data.get(self._model_name)
+            return float(value) if value else None
+        except Exception:
+            return None
+
+    def _persist_rtf(self, value: float) -> None:
+        if self._rtf_state_path is None:
+            return
+        try:
+            import json
+
+            data: dict[str, Any] = {}
+            if self._rtf_state_path.exists():
+                loaded = json.loads(self._rtf_state_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    data = loaded
+            data[self._model_name] = round(value, 2)
+            self._rtf_state_path.parent.mkdir(parents=True, exist_ok=True)
+            self._rtf_state_path.write_text(json.dumps(data), encoding="utf-8")
+        except Exception:
+            logger.debug("Could not persist RTF state", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +454,36 @@ class _ProgressEstimator:
                 logger.exception("progress callback raised")
             if self._stop.wait(0.5):
                 break
+
+
+def _release_mlx_model_cache() -> None:
+    """Drop mlx-whisper's module-level model cache and flush Metal buffers.
+
+    mlx-whisper keeps the last-used model in ``transcribe.ModelHolder`` —
+    0.5–2 GB of unified memory depending on the model — until the process
+    exits. Clearing the holder + ``mx.clear_cache()`` actually returns that
+    memory to the OS. No-op when mlx isn't installed (tests, CI).
+
+    Only call while no transcription is in flight: an active run keeps its
+    own reference to the model (safe), but the next run would reload it.
+    """
+    try:
+        # NB: ``from mlx_whisper import transcribe`` yields the FUNCTION
+        # (the package __init__ shadows the submodule); import_module gets
+        # the actual module that owns ModelHolder.
+        import importlib
+
+        mlx_transcribe_mod = importlib.import_module("mlx_whisper.transcribe")
+        mlx_transcribe_mod.ModelHolder.model = None
+        mlx_transcribe_mod.ModelHolder.model_path = None
+    except Exception:
+        return
+    try:
+        import mlx.core as mx
+
+        mx.clear_cache()
+    except Exception:  # pragma: no cover (older mlx)
+        logger.debug("mx.clear_cache unavailable", exc_info=True)
 
 
 # ---------------------------------------------------------------------------

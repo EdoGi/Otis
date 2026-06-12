@@ -56,6 +56,7 @@ def build_pipeline(cfg: Config) -> TranscriptionPipeline:
     store = TranscriptStore(transcript_dir)
     engine = WhisperEngine(
         model_name=str(cfg.get("transcription", "model", default="small")),
+        rtf_state_path="~/.otis/rtf_state.json",
     )
     processor = TranscriptProcessor(
         engine=engine,
@@ -137,10 +138,97 @@ def make_transcription_handler(
     return transcription_handler
 
 
+# ---------------------------------------------------------------------------
+# Defer-while-in-call: transcription saturates the GPU/CPU for many minutes
+# (an hour-long meeting on the medium model ≈ 20-30 min of full load), which
+# wrecks a live call happening at the same time. Both front ends use this to
+# hold the transcription until the user is off the call.
+# ---------------------------------------------------------------------------
+DEFER_POLL_SECONDS = 30.0
+DEFER_MAX_SECONDS = 2 * 60 * 60  # safety valve: never wait forever
+
+
+def make_call_probe(cfg: Config) -> Callable[[], bool]:
+    """Build a "is the user probably on a call right now?" check.
+
+    Uses the CoreAudio default-input-in-use probe — the same signal that
+    powers browser-meeting detection. When ``detection.mic_activation`` is
+    disabled (a dictation tool keeps the mic permanently open, making the
+    signal meaningless), the probe always reports False so transcriptions
+    are never deferred on a bogus signal.
+    """
+    mic_signal_valid = bool(
+        cfg.get("detection", "mic_activation", "enabled", default=True)
+    )
+
+    def probe() -> bool:
+        if not mic_signal_valid:
+            return False
+        try:
+            from src.audio.coreaudio_probe import is_default_input_running
+
+            return bool(is_default_input_running())
+        except Exception:
+            return False
+
+    return probe
+
+
+def wait_for_call_to_end(
+    *,
+    is_busy: Callable[[], bool],
+    on_first_wait: Callable[[], None] | None = None,
+    should_abort: Callable[[], bool] | None = None,
+    poll_seconds: float = DEFER_POLL_SECONDS,
+    max_seconds: float = DEFER_MAX_SECONDS,
+    sleep: Callable[[float], None] | None = None,
+) -> float:
+    """Block until ``is_busy()`` goes False. Returns seconds waited.
+
+    Bounded by ``max_seconds`` so a stuck signal (mic held open by some
+    app) can only delay, never lose, a transcription. ``should_abort``
+    (e.g. daemon shutdown) ends the wait immediately.
+    """
+    import time as _time
+
+    do_sleep = sleep or _time.sleep
+    waited = 0.0
+    notified = False
+    while waited < max_seconds:
+        if should_abort is not None and should_abort():
+            break
+        if not is_busy():
+            break
+        if not notified:
+            notified = True
+            logger.info(
+                "Transcription deferred — a call appears to be in progress "
+                "(re-checking every %.0fs).",
+                poll_seconds,
+            )
+            if on_first_wait is not None:
+                try:
+                    on_first_wait()
+                except Exception:
+                    logger.exception("on_first_wait callback raised")
+        do_sleep(poll_seconds)
+        waited += poll_seconds
+    if waited and waited >= max_seconds:
+        logger.warning(
+            "Deferred transcription waited %.0f min; proceeding anyway.",
+            waited / 60,
+        )
+    return waited
+
+
 __all__ = [
+    "DEFER_MAX_SECONDS",
+    "DEFER_POLL_SECONDS",
     "TranscriptionHandler",
     "TranscriptionPipeline",
     "build_pipeline",
+    "make_call_probe",
     "make_recorder_factory",
     "make_transcription_handler",
+    "wait_for_call_to_end",
 ]

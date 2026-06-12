@@ -86,6 +86,10 @@ def _make_config() -> Config:
             "process_monitor": {"enabled": False},  # we wire our own
             "calendar": {"enabled": False},
         },
+        # Deferral polls the REAL CoreAudio mic with 30s sleeps — tests
+        # must never block on the developer's actual microphone state.
+        # The dedicated deferral test re-enables it with patched waits.
+        "transcription": {"defer_while_in_call": False},
     })
 
 
@@ -502,3 +506,53 @@ def test_worker_leaves_detector_alone_while_new_recording_active(tmp_path) -> No
     )
     assert len(processor.calls) == 1  # A still got transcribed
     assert detector.get_state() == MeetingState.RECORDING  # B untouched
+
+
+def test_daemon_transcription_defers_while_next_recording_active(tmp_path, monkeypatch) -> None:
+    """Worker A must wait while meeting B records, then proceed."""
+    import src.pipeline as pipeline_mod
+
+    pm = _FakeProcessMonitor()
+    detector = MeetingDetector(
+        process_monitor=pm,  # type: ignore[arg-type]
+        calendar_pollers=[],
+        clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc),
+    )
+    processor = _RecordingProcessor()
+    daemon, notes, _rec, _pipeline = _make_daemon_with_pipeline(
+        detector, tmp_path, processor
+    )
+
+    monkeypatch.setattr(pipeline_mod, "make_call_probe", lambda _cfg: lambda: False)
+
+    polls = {"n": 0}
+
+    def fake_sleep(_s: float) -> None:
+        polls["n"] += 1
+        if polls["n"] >= 2:
+            with daemon._lock:
+                daemon._recorder = None  # meeting B ends
+
+    real_wait = pipeline_mod.wait_for_call_to_end
+
+    def fast_wait(**kw):
+        kw["sleep"] = fake_sleep
+        kw["poll_seconds"] = 0.001
+        return real_wait(**kw)
+
+    monkeypatch.setattr(pipeline_mod, "wait_for_call_to_end", fast_wait)
+
+    # This test exercises deferral itself — turn it back on (the shared
+    # config disables it so other tests never touch the real mic).
+    daemon._config.apply_overrides({"transcription": {"defer_while_in_call": True}})
+
+    with daemon._lock:
+        daemon._recorder = object()  # meeting B is recording
+    daemon._run_transcription(
+        {"session_id": "A", "mic_wav": "A_mic.wav", "system_wav": None,
+         "_meeting": {"title": None, "app": None, "participants": []}}
+    )
+
+    assert polls["n"] >= 2, "worker should have waited for the recording"
+    assert len(processor.calls) == 1  # and then transcribed
+    assert any("deferred" in n.lower() for n in notes)

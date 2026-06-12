@@ -292,8 +292,19 @@ class ProcessMonitor:
             and (now - state.last_alert_monotonic) < self._debounce
         ):
             return
+        first_alert = state.last_alert_monotonic is None
         state.last_alert_monotonic = now
-        logger.info("Meeting app detected: %s (pids=%s)", state.name, sorted(state.pids))
+        if first_alert:
+            logger.info(
+                "Meeting app detected: %s (pids=%s)", state.name, sorted(state.pids)
+            )
+        else:
+            # Continuously-running apps re-fire every debounce window (the
+            # detector needs that to pick up back-to-back meetings), but a
+            # log line every 30s for the entire call is pure noise.
+            logger.debug(
+                "Meeting app still present: %s (re-fire)", state.name
+            )
         _safe_call_each(self._on_detected, state.name)
 
 

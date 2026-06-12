@@ -382,3 +382,108 @@ def test_progress_estimator_uses_injected_rtf() -> None:
     assert est._rtf == 30.0
     est_default = _ProgressEstimator(60.0, lambda _p: None)
     assert est_default._rtf == _ProgressEstimator.REAL_TIME_FACTOR
+
+
+# ---------------------------------------------------------------------------
+# Model memory release on idle / shutdown
+# ---------------------------------------------------------------------------
+def test_idle_expiry_releases_mlx_model_cache(sample_wav: Path) -> None:
+    mlx_transcribe = pytest.importorskip("mlx_whisper.transcribe")
+
+    engine = WhisperEngine(
+        transcribe_fn=lambda *_a, **_k: {"segments": []}, idle_timeout_seconds=9999
+    )
+    engine.transcribe(sample_wav)
+    sentinel = object()
+    mlx_transcribe.ModelHolder.model = sentinel
+    mlx_transcribe.ModelHolder.model_path = "fake/path"
+
+    engine._on_idle_expired()
+
+    assert mlx_transcribe.ModelHolder.model is None
+    assert mlx_transcribe.ModelHolder.model_path is None
+    assert engine.is_warm is False
+
+
+def test_idle_expiry_skips_release_while_transcribing(sample_wav: Path) -> None:
+    mlx_transcribe = pytest.importorskip("mlx_whisper.transcribe")
+
+    engine = WhisperEngine(
+        transcribe_fn=lambda *_a, **_k: {"segments": []}, idle_timeout_seconds=9999
+    )
+    sentinel = object()
+    mlx_transcribe.ModelHolder.model = sentinel
+    try:
+        with engine._lock:
+            engine._inflight = 1
+        engine._on_idle_expired()
+        assert mlx_transcribe.ModelHolder.model is sentinel  # untouched
+        assert engine._idle_timer is not None  # re-armed, not dropped
+    finally:
+        mlx_transcribe.ModelHolder.model = None
+        with engine._lock:
+            engine._inflight = 0
+        engine.shutdown()
+
+
+def test_shutdown_releases_mlx_model_cache() -> None:
+    mlx_transcribe = pytest.importorskip("mlx_whisper.transcribe")
+
+    engine = WhisperEngine(transcribe_fn=lambda *_a, **_k: {"segments": []})
+    mlx_transcribe.ModelHolder.model = object()
+    engine.shutdown()
+    assert mlx_transcribe.ModelHolder.model is None
+
+
+# ---------------------------------------------------------------------------
+# RTF persistence across restarts
+# ---------------------------------------------------------------------------
+def test_measured_rtf_persists_across_engine_instances(
+    sample_wav: Path, tmp_path: Path, monkeypatch
+) -> None:
+    import time as time_module
+
+    state = tmp_path / "rtf_state.json"
+
+    def slow_fake(*_a, **_k):
+        time_module.sleep(0.55)
+        return {"segments": [{"start": 0, "end": 10, "text": "hello world ok"}]}
+
+    monkeypatch.setattr(
+        "src.transcription.whisper_engine._safe_wav_duration_seconds",
+        lambda _p: 10.0,
+    )
+    first = WhisperEngine(transcribe_fn=slow_fake, rtf_state_path=state)
+    first.transcribe(sample_wav)
+    measured = first._current_rtf()
+    assert state.exists()
+
+    # A fresh engine (app restart) starts from the persisted value.
+    second = WhisperEngine(
+        transcribe_fn=lambda *_a, **_k: {"segments": []}, rtf_state_path=state
+    )
+    assert second._current_rtf() == pytest.approx(measured, abs=0.1)
+
+
+def test_rtf_state_is_per_model(tmp_path: Path) -> None:
+    state = tmp_path / "rtf_state.json"
+    state.write_text('{"medium": 2.9}')
+    medium = WhisperEngine(
+        model_name="medium", transcribe_fn=lambda *_a, **_k: {}, rtf_state_path=state
+    )
+    small = WhisperEngine(
+        model_name="small", transcribe_fn=lambda *_a, **_k: {}, rtf_state_path=state
+    )
+    assert medium._current_rtf() == pytest.approx(2.9)
+    from src.transcription.whisper_engine import _ProgressEstimator
+
+    assert small._current_rtf() == _ProgressEstimator.REAL_TIME_FACTOR
+
+
+def test_corrupt_rtf_state_is_ignored(tmp_path: Path) -> None:
+    state = tmp_path / "rtf_state.json"
+    state.write_text("{not json")
+    engine = WhisperEngine(transcribe_fn=lambda *_a, **_k: {}, rtf_state_path=state)
+    from src.transcription.whisper_engine import _ProgressEstimator
+
+    assert engine._current_rtf() == _ProgressEstimator.REAL_TIME_FACTOR

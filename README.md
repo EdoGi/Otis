@@ -220,7 +220,8 @@ The most relevant knobs:
 | `app.working_hours` | `08:00 → 20:00` | Outside this, detection is paused. |
 | `storage.audio_dir` | `~/Otis/audio` | WAVs + metadata land here. |
 | `storage.transcript_dir` | `~/Otis/transcripts` | Phase 4. |
-| `transcription.model` | `small` | `tiny` / `base` / `small` / `medium` / `large-v3`. |
+| `transcription.model` | `small` | `tiny` / `base` / `small` / `medium` / `large-v3`. **Heat warning:** `medium` runs at ~3× realtime — an hour-long meeting means ~20-30 min of full GPU load; `small` is ~3× faster with a modest quality cost. |
+| `transcription.defer_while_in_call` | `true` | Don't start the GPU-heavy transcription while the mic is in use — wait for the call to end (max 2 h), so back-to-back meetings stay smooth. |
 | `transcription.suggest_titles` | `true` | Ad-hoc recordings get a transcript-derived title ("Onboarding with Acme") instead of "Ad-hoc Recording"; the file keeps its date+time prefix. Local heuristic only. |
 
 Multi-account Google Calendar lives under `detection.calendar.accounts` —
