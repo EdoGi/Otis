@@ -18,13 +18,42 @@ restarting Zoom doesn't spam listeners.
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=256)
+def _boundary_pattern(entry: str) -> re.Pattern[str]:
+    return re.compile(rf"\b{re.escape(entry)}\b")
+
+
+def app_name_matches(entry: str, process_name: str) -> bool:
+    """True if ``process_name`` belongs to the app named by ``entry``.
+
+    Matching used to be a raw ``entry in process_name`` substring test, which
+    is how ``'arc'`` matched ``searchpartyd`` and ``'safari'`` matched
+    ``SafariWidgetExtension`` — Apple daemons that run 24/7 on every Mac. With
+    mic-activation on, that made the browser set permanently non-empty and
+    produced 398 phantom "Meeting detected" events against 8 real recordings.
+
+    Exact match, or a word-boundary match so genuine helper processes
+    ("Slack Helper", "Microsoft Teams Helper (Renderer)") still count as their
+    parent app. ``re.escape`` keeps ``zoom.us``'s dot literal.
+    """
+    if not entry or not process_name:
+        return False
+    entry = entry.lower()
+    name = process_name.lower()
+    if entry == name:
+        return True
+    return _boundary_pattern(entry).search(name) is not None
 
 # Browser process names we recognise. The presence of one of these is not
 # enough on its own — we additionally require the default mic to be active.
@@ -201,17 +230,17 @@ class ProcessMonitor:
             if not name:
                 continue
             lname = name.lower()
-            if any(b in lname for b in self._blacklist):
+            if any(app_name_matches(b, lname) for b in self._blacklist):
                 continue
             for white in self._whitelist:
-                if white in lname:
+                if app_name_matches(white, lname):
                     names_seen.add(white)
                     pids_by_name.setdefault(white, set())
                     if pid is not None:
                         pids_by_name[white].add(int(pid))
                     break
             for bro in self._browser_apps_lower:
-                if bro in lname:
+                if app_name_matches(bro, lname):
                     browser_names_seen.add(bro)
                     browser_pids.setdefault(bro, set())
                     if pid is not None:
