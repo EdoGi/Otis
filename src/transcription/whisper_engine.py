@@ -345,28 +345,17 @@ class WhisperEngine:
         registry = self._registry()
         if registry is None or label not in ("mic", "system"):
             return
-        from src.health import MICROPHONE, SYSTEM_AUDIO, HealthState
-
-        if label == "system":
-            key, name = SYSTEM_AUDIO, "System audio"
-            bad_state, bad_detail = (
-                HealthState.FAIL,
-                "captured silence — the other side of the call was not recorded",
-            )
-            hint = (
-                "Set your Mac's output device to the Otis Multi-Output device "
-                "(System Settings → Sound → Output)."
-            )
-        else:
-            key, name = MICROPHONE, "Microphone"
-            bad_state, bad_detail = (HealthState.WARN, "captured silence")
-            hint = "Check your input device and macOS microphone permission."
+        from src.health import report_stream_health
 
         if silent:
-            registry.report(key, label=name, state=bad_state, detail=bad_detail, hint=hint)
+            detail = (
+                "captured silence — the other side of the call was not recorded"
+                if label == "system"
+                else "captured silence"
+            )
         else:
             detail = f"signal ok (rms {rms:.3f})" if rms is not None else "signal ok"
-            registry.report(key, label=name, state=HealthState.OK, detail=detail)
+        report_stream_health(label, silent=silent, detail=detail, registry=registry)
 
     def _call_transcribe(self, path: Path, language: str | None) -> dict[str, Any]:
         # Tuning notes:

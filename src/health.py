@@ -221,6 +221,50 @@ def describe_health(registry: HealthRegistry) -> list[str]:
     return [rep.one_line() for rep in registry.snapshot()]
 
 
+#: The fix is the same whoever notices the stream is dead, so the hint lives
+#: here rather than being restated at each reporting site.
+STREAM_HINTS = {
+    "system": (
+        "Set your Mac's output device to the Otis Multi-Output device "
+        "(System Settings → Sound → Output)."
+    ),
+    "mic": "Check your input device and macOS microphone permission.",
+}
+
+_STREAM_COMPONENTS = {
+    "system": (SYSTEM_AUDIO, "System audio"),
+    "mic": (MICROPHONE, "Microphone"),
+}
+
+
+def report_stream_health(
+    stream: str,
+    *,
+    silent: bool,
+    detail: str,
+    registry: HealthRegistry | None = None,
+) -> None:
+    """Report a capture stream as healthy or silent.
+
+    Called from two places with the same meaning: the recorder's live level
+    monitor (during the call) and the transcription silence pre-check (after
+    it). A silent *system* stream means the far side of the meeting is being
+    lost, which is a hard failure with a known fix; a silent *mic* usually just
+    means nobody spoke on this side, so it is only a warning.
+    """
+    component = _STREAM_COMPONENTS.get(stream)
+    if component is None:
+        return
+    key, label = component
+    reg = registry if registry is not None else get_health()
+    if silent:
+        state = HealthState.FAIL if stream == "system" else HealthState.WARN
+        reg.report(key, label=label, state=state, detail=detail,
+                   hint=STREAM_HINTS.get(stream))
+    else:
+        reg.report(key, label=label, state=HealthState.OK, detail=detail)
+
+
 # ---------------------------------------------------------------------------
 # Process-global registry
 # ---------------------------------------------------------------------------

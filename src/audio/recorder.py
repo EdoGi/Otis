@@ -40,6 +40,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from src.audio.devices import AudioDevice, DeviceManager, DeviceNotFoundError
+from src.audio.levels import (
+    DEFAULT_SILENCE_SECONDS,
+    LevelMonitor,
+    render_meter,
+    rms_from_int16,
+)
+from src.health import report_stream_health
 
 if TYPE_CHECKING:  # pragma: no cover
     import numpy as np
@@ -92,6 +99,8 @@ class _StreamState:
     stream: Any = None  # sounddevice.InputStream
     writer_thread: threading.Thread | None = None
     error: Exception | None = None
+    #: Live signal level + sustained-silence detector. Set in _open_stream.
+    meter: Any = None
 
 
 class DualStreamRecorder:
@@ -132,6 +141,7 @@ class DualStreamRecorder:
         device_manager: DeviceManager | None = None,
         on_device_error: Callable[[str, Exception], None] | None = None,
         observe_sleep_wake: bool = True,
+        silence_alert_seconds: float = DEFAULT_SILENCE_SECONDS,
     ) -> None:
         self._audio_dir = Path(audio_dir).expanduser()
         self._sample_rate = int(sample_rate)
@@ -153,6 +163,9 @@ class DualStreamRecorder:
         self._session_id: str | None = None
         self._mic_state: _StreamState | None = None
         self._system_state: _StreamState | None = None
+        # Seconds of continuous digital silence before a stream is reported as
+        # broken. Long enough to survive a quiet stretch in a meeting.
+        self._silence_alert_seconds = float(silence_alert_seconds)
 
         # Pause bookkeeping. Offsets are seconds since ``start()`` returned.
         self._start_monotonic: float | None = None
@@ -391,6 +404,56 @@ class DualStreamRecorder:
             raise DeviceNotFoundError(f"Device index {spec} out of range.")
         return self._device_manager.require(spec, input_only=True)
 
+    # ------------------------------------------------------------- metering
+    def _make_meter(self, label: str) -> LevelMonitor:
+        """Build the level monitor for one stream, wired to the health panel."""
+
+        def on_silence(stream_label: str, seconds: float) -> None:
+            logger.warning(
+                "[%s] no signal for %.0fs — the stream is capturing silence.",
+                stream_label, seconds,
+            )
+            report_stream_health(
+                stream_label,
+                silent=True,
+                detail=f"no signal for {int(seconds)}s",
+            )
+
+        def on_signal(stream_label: str) -> None:
+            logger.info("[%s] signal returned.", stream_label)
+            report_stream_health(stream_label, silent=False, detail="signal ok")
+
+        return LevelMonitor(
+            label,
+            silence_seconds=self._silence_alert_seconds,
+            on_silence=on_silence,
+            on_signal=on_signal,
+        )
+
+    @property
+    def levels(self) -> dict[str, float]:
+        """Current smoothed input level per stream, 0.0–1.0 (for the menu)."""
+        out: dict[str, float] = {}
+        for st in (self._mic_state, self._system_state):
+            if st is not None and st.meter is not None:
+                out[st.label] = st.meter.level
+        return out
+
+    def level_meters(self, width: int = 8) -> dict[str, str]:
+        """Text meters per stream, ready to drop into a menu item title."""
+        return {
+            label: render_meter(level, width=width)
+            for label, level in self.levels.items()
+        }
+
+    def silent_streams(self) -> list[str]:
+        """Streams that have been silent long enough to look broken."""
+        out: list[str] = []
+        for st in (self._mic_state, self._system_state):
+            if st is not None and st.meter is not None and st.meter.is_silent:
+                out.append(st.label)
+        return out
+
     def _open_stream(self, st: _StreamState) -> None:
         """Open a sounddevice InputStream and start the writer thread."""
         import sounddevice as sd
@@ -399,6 +462,9 @@ class DualStreamRecorder:
         st.bytes_written = 0
         st.start_monotonic = None
         st.error = None
+        st.meter = self._make_meter(st.label)
+
+        block_seconds = CAPTURE_BLOCKSIZE_FRAMES / float(self._sample_rate)
 
         def callback(indata: "np.ndarray", frames: int, time_info: Any, status: Any) -> None:  # noqa: ARG001
             if status:
@@ -408,6 +474,13 @@ class DualStreamRecorder:
                 return  # writer thread is dead; queueing would grow unbounded
             if not self._active.is_set():
                 return  # paused — drop frames
+            # Measure before queueing: this is the only place the samples are
+            # seen live, and it's how a dead stream gets caught during the call
+            # instead of after transcription two months later.
+            try:
+                st.meter.observe(rms_from_int16(indata), block_seconds)
+            except Exception:  # pragma: no cover (never break capture)
+                pass
             try:
                 # ``indata`` is int16 because we requested dtype="int16".
                 st.queue.put_nowait(bytes(indata))

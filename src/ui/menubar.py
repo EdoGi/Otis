@@ -56,6 +56,15 @@ from src.detection.detector import (
     MeetingDetector,
     MeetingState,
 )
+from src.health import (
+    CALENDAR,
+    MICROPHONE,
+    SYSTEM_AUDIO,
+    HealthRegistry,
+    HealthReport,
+    HealthState,
+    get_health,
+)
 from src.schedule import is_within_working_hours, working_hours_from_config
 from src.storage.transcript_store import TranscriptStore
 from src.ui.icons import ensure_icons
@@ -92,6 +101,14 @@ QUEUE_DRAIN_INTERVAL = 0.1   # 100 ms — main-thread event drain
 BLINK_INTERVAL = 0.5         # 500 ms — DETECTED state blink
 DURATION_INTERVAL = 1.0      # 1 s — recording duration tick
 SCHEDULE_CHECK_INTERVAL = 60  # 60 s — off-hours window check
+
+# Suffix shown on the "Status" menu title when something is degraded.
+_GLYPH_FOR: dict[HealthState, str] = {
+    HealthState.OK: "",
+    HealthState.UNKNOWN: "·",
+    HealthState.WARN: "!",
+    HealthState.FAIL: "✕",
+}
 
 
 # ============================================================================
@@ -233,8 +250,10 @@ class MenuBarApp:
         icons_dir: Path | None = None,
         user_config_path: Path | None = None,
         rumps_app_factory: Callable[..., Any] | None = None,
+        health: HealthRegistry | None = None,
     ) -> None:
         self._config = config
+        self._health = health if health is not None else get_health()
         self._detector = detector
         self._recorder_factory = recorder_factory
         self._notifications = notifications or NotificationManager()
@@ -263,6 +282,11 @@ class MenuBarApp:
         self._icons = ensure_icons(self._icons_dir)
         self._app = self._build_app(rumps_app_factory)
         self._wire_detector_callbacks()
+        # Health transitions become notifications and a menu refresh. The
+        # registry only fires on an actual state change, so a subsystem can
+        # report on every poll tick without producing a single extra toast.
+        self._health.on_change(self._cb_health_changed)
+        self._refresh_health_menu()
         # Brand the *application* icon (used in the About box, the force-quit
         # window, Notification Center, etc.) so it isn't the Python framework
         # logo when we run via `python -m src.main`. When we run from Otis.app
@@ -300,30 +324,43 @@ class MenuBarApp:
             self._teardown()
 
     def _warn_if_blackhole_missing(self) -> None:
-        """Surface a one-time warning if BlackHole + Multi-Output isn't set up.
+        """Check system audio at startup — structurally *and* functionally.
 
-        Fully non-fatal — recording still works mic-only. We just nudge the
-        user so they know why the system audio file is empty.
+        The old version only asked whether BlackHole and some aggregate device
+        existed. That returned ok=True on this Mac for two months while the
+        output went to the built-in speakers and BlackHole captured pure
+        silence. Existence is not routing, so we now check both.
         """
         try:
-            from src.audio.blackhole_check import verify_blackhole_setup
+            from src.audio.blackhole_check import (
+                check_output_routing,
+                verify_blackhole_setup,
+            )
 
             status = verify_blackhole_setup()
         except Exception:  # pragma: no cover (defensive)
             logger.exception("BlackHole check raised on startup")
             return
-        if status.ok:
+
+        if not status.ok:
+            logger.warning(
+                "BlackHole / Multi-Output not configured: %s",
+                "; ".join(status.issues) or "see check-audio output",
+            )
+            self._health.report(
+                SYSTEM_AUDIO,
+                label="System audio",
+                state=HealthState.FAIL,
+                detail="BlackHole not installed or no Multi-Output device",
+                hint="Run scripts/setup_blackhole.sh.",
+            )
             return
-        logger.warning(
-            "BlackHole / Multi-Output not configured: %s",
-            "; ".join(status.issues) or "see check-audio output",
-        )
-        self._notifications.notify(
-            NotificationType.ERROR,
-            "BlackHole not configured",
-            "System audio won't be captured. Run scripts/setup_blackhole.sh.",
-            force=True,
-        )
+
+        # BlackHole exists. Is anything actually being routed into it?
+        try:
+            self._report_audio_routing(check_output_routing())
+        except Exception:  # pragma: no cover (defensive)
+            logger.exception("Audio routing check raised on startup")
 
     def notify_transcription_progress(self, pct: int) -> None:
         """Surface transcription progress in the menu-bar title (thread-safe).
@@ -417,11 +454,26 @@ class MenuBarApp:
         self._mi["recent_root"] = rumps.MenuItem("Recent Transcripts")
         self._refresh_recent_menu()
 
+        # Status — the panel whose absence let three failures run silently for
+        # months. Every subsystem reports here; a degraded component also puts
+        # a ⚠ next to the icon so it's visible without opening the menu.
+        self._mi["health_root"] = rumps.MenuItem("Status")
+        self._mi["reconnect_calendar"] = rumps.MenuItem(
+            "Reconnect Calendar…", callback=self._on_reconnect_calendar
+        )
+        self._mi["fix_audio"] = rumps.MenuItem(
+            "Fix System Audio…", callback=self._on_fix_audio
+        )
+
         # About / Quit
         self._mi["about"] = rumps.MenuItem("About Otis", callback=self._on_about)
         self._mi["quit"] = rumps.MenuItem("Quit", callback=self._on_quit_clicked)
 
         app.menu = [
+            self._mi["health_root"],
+            self._mi["reconnect_calendar"],
+            self._mi["fix_audio"],
+            None,
             self._mi["start"],
             self._mi["pause"],
             self._mi["resume"],
@@ -684,6 +736,8 @@ class MenuBarApp:
                     self._app.title = f"{payload}%"
                 except Exception:  # pragma: no cover
                     logger.exception("Could not set progress title")
+        elif event_type == "health":
+            self._handle_health_change(payload)
         elif event_type == "refresh_recent":
             # The transcription worker just landed (or failed); reload the
             # Recent Transcripts submenu so the new item shows up.
@@ -844,8 +898,33 @@ class MenuBarApp:
         if self._snapshot.state != UiState.RECORDING:
             self._timer_duration.stop()
             self._app.title = ""
+            self._apply_health_badge()
             return
         self._app.title = self._snapshot.title_text()
+        self._refresh_level_meters()
+
+    def _refresh_level_meters(self) -> None:
+        """Show live mic/system input levels in the Status panel while recording.
+
+        This is the check that would have caught the dead system stream during
+        the very first meeting instead of two months later.
+        """
+        with self._lock:
+            recorder = self._recorder
+        if recorder is None:
+            return
+        try:
+            meters = recorder.level_meters(width=8)
+        except Exception:  # pragma: no cover (defensive)
+            return
+        for label, bar in meters.items():
+            key = SYSTEM_AUDIO if label == "system" else MICROPHONE
+            if self._health.get(key) is None:
+                continue
+            # touch() updates the detail line without touching state, so a
+            # live meter never fires a notification.
+            self._health.touch(key, detail=bar)
+        self._refresh_health_menu()
 
     def _on_schedule_tick(self, _timer: Any) -> None:
         """Move into / out of OFF_HOURS based on the working-hours window.
@@ -980,12 +1059,171 @@ class MenuBarApp:
         self._set_visible(self._mi["pause"], s == UiState.RECORDING)
         self._set_visible(self._mi["resume"], s == UiState.PAUSED)
         self._set_visible(self._mi["stop"], s in (UiState.RECORDING, UiState.PAUSED))
+        # The two repair actions only appear when they'd actually do something.
+        cal = self._health.get(CALENDAR)
+        self._set_visible(
+            self._mi["reconnect_calendar"],
+            cal is not None and cal.state is HealthState.FAIL,
+        )
+        audio = self._health.get(SYSTEM_AUDIO)
+        self._set_visible(
+            self._mi["fix_audio"],
+            audio is not None and audio.state in (HealthState.WARN, HealthState.FAIL),
+        )
 
     def _set_visible(self, menu_item: Any, visible: bool) -> None:
         try:
             menu_item.hidden = not visible  # rumps proxies to NSMenuItem.setHidden_
         except Exception:  # pragma: no cover (older rumps)
             menu_item.set_callback(menu_item._callback if visible else None)
+
+    # =====================================================================
+    # Health panel
+    # =====================================================================
+    def _cb_health_changed(self, report: HealthReport, previous: HealthState) -> None:
+        """A component changed state (background thread) — tell the user."""
+        logger.info(
+            "health change: %s %s → %s", report.key, previous.value, report.state.value
+        )
+        self._events.put(("health", report))
+
+    def _handle_health_change(self, report: HealthReport) -> None:
+        """Main-thread half: repaint the panel and raise one notification."""
+        self._refresh_health_menu()
+        self._refresh_menu_visibility()
+        self._apply_health_badge()
+
+        if report.state in (HealthState.WARN, HealthState.FAIL):
+            body = report.detail or "needs attention"
+            if report.hint:
+                body = f"{body}. {report.hint}"
+            self._notifications.notify(
+                NotificationType.ERROR,
+                f"{report.label} problem",
+                body,
+                force=True,
+            )
+        elif report.state is HealthState.OK:
+            self._notifications.notify(
+                NotificationType.TRANSCRIPTION_COMPLETE,
+                f"{report.label} recovered",
+                report.detail or "working again",
+                force=True,
+            )
+
+    def _refresh_health_menu(self) -> None:
+        """Rebuild the Status submenu from the registry snapshot."""
+        import rumps
+
+        root = self._mi.get("health_root")
+        if root is None:
+            return
+        try:
+            for key in list(root.keys()):
+                del root[key]
+        except Exception:  # pragma: no cover (older rumps)
+            pass
+
+        reports = self._health.snapshot()
+        if not reports:
+            item = rumps.MenuItem("(no checks run yet)")
+            item.set_callback(None)
+            root.add(item)
+        else:
+            for rep in reports:
+                item = rumps.MenuItem(rep.one_line())
+                item.set_callback(None)  # informational, not clickable
+                root.add(item)
+
+        overall = self._health.overall()
+        root.title = "Status" if overall is HealthState.OK else f"Status  {_GLYPH_FOR[overall]}"
+
+    def _apply_health_badge(self) -> None:
+        """Show ⚠ next to the icon when something needs attention.
+
+        Only while idle — during a recording the title carries the MM:SS timer,
+        which matters more in the moment.
+        """
+        with self._lock:
+            state = self._snapshot.state
+        if state == UiState.RECORDING:
+            return
+        try:
+            self._app.title = "⚠" if self._health.is_degraded() else ""
+        except Exception:  # pragma: no cover
+            logger.exception("Could not set health badge")
+
+    def _on_reconnect_calendar(self, _sender: Any) -> None:
+        """Run the interactive OAuth flow for every configured account."""
+        import rumps
+
+        rumps.alert(
+            title="Reconnect Calendar",
+            message=(
+                "Otis will open your browser to re-authorise Google Calendar.\n\n"
+                "If you have more than one account, run this from a terminal "
+                "instead:\n\n    ./scripts/setup_google_cal.sh\n"
+                "    ./scripts/setup_google_cal.sh work"
+            ),
+        )
+        threading.Thread(
+            target=self._run_calendar_reauth, name="otis-calendar-reauth", daemon=True
+        ).start()
+
+    def _run_calendar_reauth(self) -> None:
+        pollers = list(getattr(self._detector, "calendar_pollers", ()) or ())
+        if not pollers:
+            self._notifications.notify(
+                NotificationType.ERROR, "No calendar configured",
+                "Add an account under detection.calendar.accounts first.", force=True,
+            )
+            return
+        for poller in pollers:
+            try:
+                poller.authenticate(headless=False)
+                poller.notify_auth_recovered()
+            except Exception as exc:
+                logger.exception("Calendar re-auth failed")
+                self._notifications.notify(
+                    NotificationType.ERROR, "Calendar reconnect failed", str(exc),
+                    force=True,
+                )
+                return
+        self._notifications.notify(
+            NotificationType.TRANSCRIPTION_COMPLETE, "Calendar reconnected",
+            f"{len(pollers)} account(s) authorised.", force=True,
+        )
+
+    def _on_fix_audio(self, _sender: Any) -> None:
+        """Explain exactly what's wrong with system-audio routing right now."""
+        import rumps
+
+        from src.audio.blackhole_check import check_output_routing
+
+        status = check_output_routing()
+        rumps.alert(title="System audio", message=status.message())
+        self._report_audio_routing(status)
+
+    def _report_audio_routing(self, status: Any) -> None:
+        """Fold a routing check result into the health registry."""
+        from src.audio.blackhole_check import RoutingState
+
+        if status.state is RoutingState.OK:
+            self._health.report(
+                SYSTEM_AUDIO, label="System audio", state=HealthState.OK,
+                detail=f"routed via {status.default_output_name}",
+            )
+        elif status.state is RoutingState.UNKNOWN:
+            self._health.report(
+                SYSTEM_AUDIO, label="System audio", state=HealthState.UNKNOWN,
+                detail="could not check routing", hint=status.message(),
+            )
+        else:
+            self._health.report(
+                SYSTEM_AUDIO, label="System audio", state=HealthState.FAIL,
+                detail=f"not routed (output: {status.default_output_name})",
+                hint=status.message(),
+            )
 
     def _refresh_generate_menu(self, *, limit: int = 10) -> None:
         """Rebuild the "Generate Transcript" submenu from disk.
