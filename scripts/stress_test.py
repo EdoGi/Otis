@@ -290,13 +290,28 @@ def t_retention_doesnt_touch_recent_files(tmp: Path) -> None:
 
 
 def t_concurrent_transcribe_calls(tmp: Path) -> None:
-    """Two transcribes in parallel must not deadlock or corrupt state."""
-    barrier = threading.Barrier(2)
+    """Two transcribes in parallel must serialise — and must not deadlock.
+
+    This check used to synchronise the two fake transcribes on a Barrier, which
+    only passed *because* both ran at once. That was the bug: _call_transcribe
+    ran outside every lock, so two workers could decode simultaneously on one
+    engine, contending for the GPU and thrashing mlx's ModelHolder. The engine
+    now holds a run lock, so the contract is one-at-a-time.
+    """
+    live = 0
+    peak = 0
+    guard = threading.Lock()
     seen: list[str] = []
 
     def fake(audio: str, **_kw):
-        barrier.wait(timeout=2.0)
-        seen.append(audio)
+        nonlocal live, peak
+        with guard:
+            live += 1
+            peak = max(peak, live)
+        time.sleep(0.05)  # long enough that an unserialised pair would overlap
+        with guard:
+            live -= 1
+            seen.append(audio)
         return {"text": "x", "segments": [{"start": 0, "end": 1, "text": "x"}], "language": "en"}
 
     engine = WhisperEngine(transcribe_fn=fake, idle_timeout_seconds=0.1)
@@ -318,8 +333,8 @@ def t_concurrent_transcribe_calls(tmp: Path) -> None:
         t.join(timeout=5.0)
     assert all(not t.is_alive() for t in threads), "transcribe threads deadlocked"
     assert len(results) == 2
-    # Idle timer fired between calls; engine must have re-warmed cleanly.
-    assert engine.is_warm or not engine.is_warm  # just exercise the property
+    assert len(seen) == 2, f"both calls must complete, saw {len(seen)}"
+    assert peak == 1, f"{peak} transcriptions ran at once; the engine is not serialised"
 
 
 def t_pure_function_correctness(_tmp: Path) -> None:

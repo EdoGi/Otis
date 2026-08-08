@@ -94,6 +94,12 @@ class TranscriptionResult:
     detected_language: str | None = None
     duration_seconds: float | None = None
     raw: dict[str, Any] = field(default_factory=dict)
+    #: True when the pre-check found the audio to be effectively silent and
+    #: Whisper was skipped. The caller records this in the transcript so a
+    #: half-lost meeting is visible in the file, not only in the log.
+    was_silent: bool = False
+    #: Peak-window RMS measured by the pre-check (``None`` if unmeasurable).
+    measured_rms: float | None = None
 
     @property
     def text(self) -> str:
@@ -146,6 +152,8 @@ class WhisperEngine:
         idle_timeout_seconds: float = DEFAULT_IDLE_TIMEOUT_SECONDS,
         transcribe_fn: TranscribeFn | None = None,
         rtf_state_path: str | Path | None = None,
+        health: Any | None = None,
+        report_health: bool = True,
     ) -> None:
         if model_name not in _MODEL_REPO_MAP:
             raise ValueError(
@@ -155,8 +163,16 @@ class WhisperEngine:
         self._model_repo = _MODEL_REPO_MAP[model_name]
         self._idle_timeout = float(idle_timeout_seconds)
         self._transcribe_fn = transcribe_fn or _default_mlx_transcribe
+        self._health = health
+        self._report_health = bool(report_health)
 
         self._lock = threading.RLock()
+        # Serialises the actual decode. The old code bumped an ``_inflight``
+        # counter under ``_lock`` and then called _call_transcribe OUTSIDE it,
+        # so two workers could decode simultaneously on one shared engine —
+        # contending for the GPU and thrashing mlx's ModelHolder. Counting
+        # concurrency is not the same as preventing it.
+        self._run_lock = threading.Lock()
         # mlx-whisper caches the loaded model in its own module state
         # (ModelHolder) — 0.5–2 GB of unified memory depending on the model.
         # We track warmth + an idle timer, and on expiry we actually CLEAR
@@ -192,6 +208,7 @@ class WhisperEngine:
         *,
         language: str | None = None,
         on_progress: ProgressCallback | None = None,
+        stream: str | None = None,
     ) -> TranscriptionResult:
         """Transcribe ``wav_path`` and return :class:`TranscriptionResult`.
 
@@ -213,15 +230,24 @@ class WhisperEngine:
         # transcription hallucination filter handles the rest.
         # Peak window RMS across the whole file — see _wav_rms docstring.
         rms = _wav_rms(path)
+        label = stream or _infer_stream_label(path)
         if rms is not None and rms < SILENCE_RMS_THRESHOLD:
             logger.info(
                 "Transcribe skipped — %s is essentially silent "
                 "(peak-window RMS=%.4f, threshold=%.4f).",
                 path.name, rms, SILENCE_RMS_THRESHOLD,
             )
+            # This exact line was logged at every transcription for two months
+            # while the app told the user "Transcript ready ✅". The signal now
+            # goes somewhere a human will actually see it.
+            self._report_stream_health(label, silent=True)
             return TranscriptionResult(
-                detected_language=language, duration_seconds=_safe_wav_duration_seconds(path),
+                detected_language=language,
+                duration_seconds=_safe_wav_duration_seconds(path),
+                was_silent=True,
+                measured_rms=rms,
             )
+        self._report_stream_health(label, silent=False, rms=rms)
 
         duration = _safe_wav_duration_seconds(path)
         progress = (
@@ -229,43 +255,47 @@ class WhisperEngine:
             if on_progress
             else None
         )
-        if progress is not None:
-            progress.start()
-
-        started = time.monotonic()
-        try:
-            with self._lock:
-                self._warm = True
-                self._inflight += 1
-                self._reset_idle_timer()
-
-            raw = self._call_transcribe(path, language)
-        except _MlxImportFailure as exc:
-            raise ModelDownloadError(
-                "mlx-whisper isn't installed; run `pip install mlx-whisper`."
-            ) from exc
-        except Exception as exc:
-            msg = str(exc).lower()
-            if "memory" in msg or "alloc" in msg or "oom" in msg:
-                raise OutOfMemoryError(
-                    f"Out of memory while running model={self._model_name!r}. "
-                    "Try a smaller model in Settings → Whisper Model."
-                ) from exc
-            if any(tok in msg for tok in ("download", "network", "connection", "resolve")):
-                raise ModelDownloadError(
-                    "Could not download the Whisper model. "
-                    "Check your internet connection and try again."
-                ) from exc
-            raise
-        finally:
+        # One decode at a time on this engine. We block here rather than inside
+        # the try so the progress estimator measures the run, not the queue —
+        # and so a queued job can't report 40% while it hasn't started.
+        with self._run_lock:
             if progress is not None:
-                progress.stop()
-            with self._lock:
-                self._inflight = max(0, self._inflight - 1)
-                # Long meetings transcribe for far more than the idle
-                # timeout — re-arm at the END too, so the cooldown counts
-                # from when we actually went quiet.
-                self._reset_idle_timer()
+                progress.start()
+
+            started = time.monotonic()
+            try:
+                with self._lock:
+                    self._warm = True
+                    self._inflight += 1
+                    self._reset_idle_timer()
+
+                raw = self._call_transcribe(path, language)
+            except _MlxImportFailure as exc:
+                raise ModelDownloadError(
+                    "mlx-whisper isn't installed; run `pip install mlx-whisper`."
+                ) from exc
+            except Exception as exc:
+                msg = str(exc).lower()
+                if "memory" in msg or "alloc" in msg or "oom" in msg:
+                    raise OutOfMemoryError(
+                        f"Out of memory while running model={self._model_name!r}. "
+                        "Try a smaller model in Settings → Whisper Model."
+                    ) from exc
+                if any(tok in msg for tok in ("download", "network", "connection", "resolve")):
+                    raise ModelDownloadError(
+                        "Could not download the Whisper model. "
+                        "Check your internet connection and try again."
+                    ) from exc
+                raise
+            finally:
+                if progress is not None:
+                    progress.stop()
+                with self._lock:
+                    self._inflight = max(0, self._inflight - 1)
+                    # Long meetings transcribe for far more than the idle
+                    # timeout — re-arm at the END too, so the cooldown counts
+                    # from when we actually went quiet.
+                    self._reset_idle_timer()
 
         result = self._parse_result(raw, language)
         self._record_rtf(duration, time.monotonic() - started)
@@ -279,18 +309,65 @@ class WhisperEngine:
 
     def shutdown(self) -> None:
         """Cancel the idle timer, drop the warm flag, release model memory."""
+        # The release stays INSIDE the lock. Previously we read _inflight,
+        # dropped the lock, then cleared mlx's ModelHolder — so a transcription
+        # starting in that window could get a half-cleared holder back from
+        # ModelHolder.get_model() and fail deep inside decoding.
         with self._lock:
             self._warm = False
             if self._idle_timer is not None:
                 self._idle_timer.cancel()
                 self._idle_timer = None
-            release = self._inflight == 0
-        if release:
-            _release_mlx_model_cache()
+            if self._inflight == 0:
+                _release_mlx_model_cache()
 
     # -------------------------------------------------------------------
     # Internals
     # -------------------------------------------------------------------
+    def _registry(self) -> Any | None:
+        if not self._report_health:
+            return None
+        if self._health is not None:
+            return self._health
+        from src.health import get_health
+
+        return get_health()
+
+    def _report_stream_health(
+        self, label: str | None, *, silent: bool, rms: float | None = None,
+    ) -> None:
+        """Turn the silence pre-check into a user-visible health state.
+
+        A silent *system* stream means the far side of every meeting is being
+        lost — that is a hard failure with a known fix. A silent *mic* usually
+        just means nobody spoke on this side, so it is only a warning.
+        """
+        registry = self._registry()
+        if registry is None or label not in ("mic", "system"):
+            return
+        from src.health import MICROPHONE, SYSTEM_AUDIO, HealthState
+
+        if label == "system":
+            key, name = SYSTEM_AUDIO, "System audio"
+            bad_state, bad_detail = (
+                HealthState.FAIL,
+                "captured silence — the other side of the call was not recorded",
+            )
+            hint = (
+                "Set your Mac's output device to the Otis Multi-Output device "
+                "(System Settings → Sound → Output)."
+            )
+        else:
+            key, name = MICROPHONE, "Microphone"
+            bad_state, bad_detail = (HealthState.WARN, "captured silence")
+            hint = "Check your input device and macOS microphone permission."
+
+        if silent:
+            registry.report(key, label=name, state=bad_state, detail=bad_detail, hint=hint)
+        else:
+            detail = f"signal ok (rms {rms:.3f})" if rms is not None else "signal ok"
+            registry.report(key, label=name, state=HealthState.OK, detail=detail)
+
     def _call_transcribe(self, path: Path, language: str | None) -> dict[str, Any]:
         # Tuning notes:
         # * ``condition_on_previous_text=False`` is critical. With the default
@@ -368,7 +445,9 @@ class WhisperEngine:
                 return
             self._warm = False
             self._idle_timer = None
-        _release_mlx_model_cache()
+            # Held under the lock so a transcription cannot start between the
+            # _inflight check above and the cache clear below. See shutdown().
+            _release_mlx_model_cache()
         logger.info(
             "WhisperEngine cooled down after %.0fs of inactivity — "
             "model memory released.",
@@ -456,6 +535,20 @@ class _ProgressEstimator:
                 break
 
 
+def _infer_stream_label(path: Path) -> str | None:
+    """``…_mic.wav`` → ``"mic"``, ``…_system.flac`` → ``"system"``, else None.
+
+    The processor passes ``stream=`` explicitly, but retranscribe.py and the
+    orphan-recovery path don't — and the filename already carries the answer.
+    """
+    stem = path.stem.lower()
+    if stem.endswith("_mic"):
+        return "mic"
+    if stem.endswith("_system"):
+        return "system"
+    return None
+
+
 def _release_mlx_model_cache() -> None:
     """Drop mlx-whisper's module-level model cache and flush Metal buffers.
 
@@ -468,22 +561,40 @@ def _release_mlx_model_cache() -> None:
     own reference to the model (safe), but the next run would reload it.
     """
     try:
-        # NB: ``from mlx_whisper import transcribe`` yields the FUNCTION
-        # (the package __init__ shadows the submodule); import_module gets
-        # the actual module that owns ModelHolder.
-        import importlib
-
-        mlx_transcribe_mod = importlib.import_module("mlx_whisper.transcribe")
-        mlx_transcribe_mod.ModelHolder.model = None
-        mlx_transcribe_mod.ModelHolder.model_path = None
+        holder = _import_model_holder()
     except Exception:
-        return
+        # A bare `except: return` used to hide this completely — if mlx-whisper
+        # renamed ModelHolder, memory release silently became a no-op AND the
+        # buffer flush below was skipped, leaking 1.4 GB per model with no
+        # signal at all. Log it, then still flush what we can.
+        logger.warning(
+            "Could not reach mlx-whisper's ModelHolder — model memory will not "
+            "be released. mlx-whisper internals may have changed.",
+            exc_info=True,
+        )
+    else:
+        holder.model = None
+        holder.model_path = None
+
     try:
         import mlx.core as mx
 
         mx.clear_cache()
-    except Exception:  # pragma: no cover (older mlx)
+    except Exception:  # pragma: no cover (older mlx / mlx absent)
         logger.debug("mx.clear_cache unavailable", exc_info=True)
+
+
+def _import_model_holder() -> Any:
+    """Return mlx-whisper's ``ModelHolder`` class.
+
+    NB: ``from mlx_whisper import transcribe`` yields the FUNCTION (the package
+    ``__init__`` shadows the submodule); ``import_module`` gets the actual
+    module that owns ``ModelHolder``. Split out so tests can simulate the
+    upstream rename this used to swallow.
+    """
+    import importlib
+
+    return importlib.import_module("mlx_whisper.transcribe").ModelHolder
 
 
 # ---------------------------------------------------------------------------

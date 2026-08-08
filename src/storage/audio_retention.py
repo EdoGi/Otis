@@ -23,7 +23,7 @@ import re
 import threading
 import time
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -33,11 +33,19 @@ DAILY_INTERVAL_SECONDS = 24 * 60 * 60
 DEFAULT_RETENTION_DAYS = 30
 
 
+#: Protected audio can't be kept forever or one crashed session pins gigabytes
+#: indefinitely. After ``retention_days * this`` it is deleted anyway.
+DEFAULT_PROTECTED_GRACE_MULTIPLIER = 3.0
+
+
 @dataclass
 class CleanupReport:
     deleted_files: list[Path]
     deleted_session_ids: list[str]
     transcripts_marked: list[str]
+    #: Sessions past the horizon whose audio we deliberately kept because no
+    #: successful transcript exists — deleting it would destroy the only copy.
+    protected_session_ids: list[str] = field(default_factory=list)
 
 
 class AudioRetentionManager:
@@ -66,12 +74,14 @@ class AudioRetentionManager:
         retention_days: int = DEFAULT_RETENTION_DAYS,
         clock: Callable[[], float] = time.time,
         interval_seconds: float = DAILY_INTERVAL_SECONDS,
+        protected_grace_multiplier: float = DEFAULT_PROTECTED_GRACE_MULTIPLIER,
     ) -> None:
         self._audio_dir = Path(audio_dir).expanduser()
         self._store = transcript_store
         self._retention_days = int(retention_days)
         self._clock = clock
         self._interval = float(interval_seconds)
+        self._grace_multiplier = max(1.0, float(protected_grace_multiplier))
 
         self._timer: threading.Timer | None = None
         self._lock = threading.RLock()
@@ -116,11 +126,41 @@ class AudioRetentionManager:
             )
             return CleanupReport([], [], [])
 
+        # Audio is only expendable once a *successful* transcript exists. Until
+        # then it is the sole copy of that meeting, and the failure placeholder
+        # explicitly tells the user to re-run retranscribe.py against it.
+        completed = self._completed_session_ids()
+        path_to_session = self._map_paths_to_sessions()
+        hard_cutoff = self._clock() - self._retention_days * self._grace_multiplier * 86400.0
+
+        deletable: list[Path] = []
+        protected: set[str] = set()
+        for path in old_files:
+            sid = path_to_session.get(path)
+            if completed is None:
+                deletable.append(path)  # no store wired — old behaviour
+                continue
+            if sid is not None and sid in completed:
+                deletable.append(path)
+                continue
+            # Unknown or un-transcribed. Keep it, unless it is so old that the
+            # backstop kicks in — protection can't be unbounded.
+            if _safe_mtime(path) < hard_cutoff:
+                logger.warning(
+                    "Deleting %s past the %.0f-day backstop even though session %s "
+                    "has no successful transcript.",
+                    path.name, self._retention_days * self._grace_multiplier, sid or "?",
+                )
+                deletable.append(path)
+                continue
+            if sid is not None:
+                protected.add(sid)
+
         # Determine the session ids touched, before we delete metadata.json.
-        session_ids = self._collect_session_ids(old_files)
+        session_ids = self._collect_session_ids(deletable)
 
         deleted: list[Path] = []
-        for path in old_files:
+        for path in deletable:
             try:
                 path.unlink()
                 deleted.append(path)
@@ -128,6 +168,13 @@ class AudioRetentionManager:
                 pass
             except Exception as exc:
                 logger.warning("Could not delete %s: %s", path, exc)
+
+        if protected:
+            logger.info(
+                "Audio retention: kept %d session(s) past the horizon with no "
+                "successful transcript (%s).",
+                len(protected), ", ".join(sorted(protected)),
+            )
 
         transcripts_marked: list[str] = []
         if self._store is not None and session_ids:
@@ -153,6 +200,7 @@ class AudioRetentionManager:
             deleted_files=deleted,
             deleted_session_ids=list(session_ids),
             transcripts_marked=transcripts_marked,
+            protected_session_ids=sorted(protected),
         )
 
     def delete_audio(self, session_id: str) -> CleanupReport:
@@ -210,6 +258,61 @@ class AudioRetentionManager:
             return
         for pattern in ("*.wav", "*_metadata.json"):
             yield from self._audio_dir.rglob(pattern)
+
+    def _completed_session_ids(self) -> set[str] | None:
+        """Sessions with a real (non-``status: failed``) transcript.
+
+        ``None`` means "we can't tell" — no store wired — in which case the
+        caller keeps the pre-existing mtime-only behaviour rather than
+        protecting everything forever.
+        """
+        if self._store is None:
+            return None
+        try:
+            return set(self._store.completed_session_ids())
+        except Exception:
+            logger.exception(
+                "Could not index completed transcripts; keeping audio this sweep."
+            )
+            return set()  # empty = nothing is provably safe to delete
+
+    def _map_paths_to_sessions(self) -> dict[Path, str]:
+        """Map every audio file to its session id.
+
+        Successful sessions are renamed to ``YYYY-MM-DD_HHMM_*.wav``, so the
+        UUID is gone from the filename and only the sibling metadata JSON knows
+        the id. We read every metadata file (not just expired ones) and claim
+        its siblings by stem, then fall back to UUID-style filenames.
+        """
+        mapping: dict[Path, str] = {}
+        for meta_path in self._audio_dir.rglob("*_metadata.json"):
+            try:
+                import json
+
+                data = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not isinstance(data, dict):
+                continue
+            sid = data.get("session_id")
+            if not sid:
+                continue
+            sid = str(sid)
+            mapping[meta_path] = sid
+            stem = meta_path.name[: -len("_metadata.json")]
+            for suffix in ("mic", "system"):
+                for ext in (".wav", ".flac"):
+                    sibling = meta_path.with_name(f"{stem}_{suffix}{ext}")
+                    if sibling.exists():
+                        mapping[sibling] = sid
+
+        for path in self._iter_audio_files():
+            if path in mapping:
+                continue
+            guess = _session_id_from_filename(path)
+            if guess:
+                mapping[path] = guess
+        return mapping
 
     def _collect_session_ids(self, paths: Iterable[Path]) -> list[str]:
         """Inspect metadata.json files (where session_id is authoritative)."""

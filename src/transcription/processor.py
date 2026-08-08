@@ -35,7 +35,7 @@ import re
 import shutil
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -218,6 +218,7 @@ class TranscriptProcessor:
         mic_result = self._engine.transcribe(
             session.mic_wav,
             language=language,
+            stream="mic",
             on_progress=lambda p, base=0.0, span=45.0: progress(base + (p / 100.0) * span),
         )
         progress(45.0)
@@ -228,6 +229,7 @@ class TranscriptProcessor:
             sys_result = self._engine.transcribe(
                 session.system_wav,
                 language=language,
+                stream="system",
                 on_progress=lambda p, base=45.0, span=45.0: progress(base + (p / 100.0) * span),
             )
         progress(90.0)
@@ -245,8 +247,24 @@ class TranscriptProcessor:
         else:
             deduped_sys, dropped = sys_segments, 0
 
-        labelled_mic = [_LabelledSegment(s, "Me") for s in mic_result.segments]
-        labelled_sys = [_LabelledSegment(s, "Participant") for s in deduped_sys]
+        # Re-stamp both streams onto the wall clock. Pause drops frames rather
+        # than writing silence, so up to this point every timestamp is an
+        # offset into a file that is shorter than the meeting was. Dedup and
+        # alignment above both compare stream-to-stream, so they run first on
+        # the raw audio timeline; the shift is the last thing that touches
+        # timestamps before they are rendered.
+        pause_timeline = PauseTimeline(merged_meta.get("pauses"))
+        if pause_timeline:
+            logger.info(
+                "Session %s paused for %.0fs total; shifting transcript timestamps.",
+                session.session_id, pause_timeline.total_pause_seconds,
+            )
+        labelled_mic = [
+            _LabelledSegment(s, "Me") for s in pause_timeline.shift_segments(mic_result.segments)
+        ]
+        labelled_sys = [
+            _LabelledSegment(s, "Participant") for s in pause_timeline.shift_segments(deduped_sys)
+        ]
         merged = interleave_with_overlaps(labelled_mic + labelled_sys)
 
         # Phase 5 — frontmatter + body.
@@ -282,6 +300,7 @@ class TranscriptProcessor:
             language=detected_language or language,
             audio_relative_paths=relocated_relative,
             suggested_title=suggested_title,
+            system_audio=_system_audio_state(sys_result),
         )
 
         body = render_markdown_body(
@@ -360,6 +379,7 @@ class TranscriptProcessor:
         language: str | None,
         audio_relative_paths: dict[str, str | None],
         suggested_title: str | None = None,
+        system_audio: str = "ok",
     ) -> dict[str, Any]:
         title = (meeting.title or "").strip() or suggested_title or "Ad-hoc Recording"
         return {
@@ -378,6 +398,11 @@ class TranscriptProcessor:
                 "system": audio_relative_paths.get("system"),
             },
             "audio_available": True,
+            # "ok" | "silent" | "missing". A meeting recorded with a silent
+            # system stream is only half a transcript; saying so in the file
+            # means the loss is visible where the transcript is read, not only
+            # in a log line nobody opens.
+            "system_audio": system_audio,
             "model": self._model_name,
         }
 
@@ -635,6 +660,86 @@ def _parse_wall_clock(raw: Any) -> datetime | None:
         return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
     except Exception:
         return None
+
+
+class PauseTimeline:
+    """Maps audio-file time onto wall-clock time across recording pauses.
+
+    ``DualStreamRecorder.pause()`` *drops* frames instead of writing silence,
+    so a 25-minute pause makes the WAV 25 minutes shorter than the meeting. The
+    recorder has always written a ``pauses`` list into the session metadata —
+    nothing read it, so every transcript with a pause carried timestamps that
+    drifted by the pause length and an ``end_time`` that was simply wrong.
+
+    ``paused_at`` / ``resumed_at`` are elapsed *wall* seconds since the start of
+    the recording, so the audio position at which pause *i* begins is its
+    ``paused_at`` minus every earlier pause's duration.
+    """
+
+    def __init__(self, pauses: "list[Any] | None") -> None:
+        self._gaps: list[tuple[float, float]] = []  # (audio_position, duration)
+        cumulative = 0.0
+        for entry in _clean_pauses(pauses):
+            paused_at, resumed_at = entry
+            duration = resumed_at - paused_at
+            audio_position = paused_at - cumulative
+            self._gaps.append((audio_position, duration))
+            cumulative += duration
+        self._total = cumulative
+
+    @property
+    def total_pause_seconds(self) -> float:
+        return self._total
+
+    def __bool__(self) -> bool:
+        return bool(self._gaps)
+
+    def to_wall(self, audio_seconds: float) -> float:
+        """Convert a timestamp in the audio file to elapsed wall-clock time."""
+        wall = float(audio_seconds)
+        for audio_position, duration in self._gaps:
+            if audio_seconds >= audio_position:
+                wall += duration
+        return wall
+
+    def shift_segments(self, segments: "list[Segment]") -> "list[Segment]":
+        """Return segments with start/end re-stamped onto the wall clock."""
+        if not self._gaps:
+            return list(segments)
+        return [
+            replace(s, start=self.to_wall(s.start), end=self.to_wall(s.end))
+            for s in segments
+        ]
+
+
+def _clean_pauses(pauses: "list[Any] | None") -> list[tuple[float, float]]:
+    """Extract usable ``(paused_at, resumed_at)`` pairs, sorted, junk dropped.
+
+    A crash mid-pause leaves an entry with no ``resumed_at``; a malformed file
+    can contain anything at all. Neither may take down a transcription.
+    """
+    out: list[tuple[float, float]] = []
+    for entry in pauses or []:
+        if not isinstance(entry, dict):
+            continue
+        start = entry.get("paused_at")
+        end = entry.get("resumed_at")
+        if not isinstance(start, (int, float)) or not isinstance(end, (int, float)):
+            continue
+        if end <= start:
+            continue
+        out.append((float(start), float(end)))
+    out.sort()
+    return out
+
+
+def _system_audio_state(sys_result: "TranscriptionResult | None") -> str:
+    """Classify the system stream for the transcript frontmatter."""
+    if sys_result is None:
+        return "missing"
+    if sys_result.was_silent:
+        return "silent"
+    return "ok"
 
 
 def _format_participant(p: dict[str, Any]) -> str:
