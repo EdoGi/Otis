@@ -40,6 +40,18 @@ from src.detection.process_monitor import ProcessMonitor
 
 logger = logging.getLogger(__name__)
 
+#: How long past a calendar event's end we keep waiting in APPROACHING before
+#: concluding the meeting simply never happened.
+APPROACHING_GRACE_SECONDS = 15 * 60
+
+#: Ceiling for APPROACHING when the event carried no end time at all.
+APPROACHING_MAX_SECONDS = 2 * 60 * 60
+
+#: Ceiling for ENDED. Must comfortably exceed pipeline.DEFER_MAX_SECONDS
+#: (7200), because the daemon defers *before* calling transcription_started()
+#: and therefore sits in ENDED for the whole wait.
+ENDED_MAX_SECONDS = 3 * 60 * 60
+
 
 class MeetingState(str, Enum):
     IDLE = "idle"
@@ -128,6 +140,8 @@ class MeetingDetector:
 
         self._lock = threading.RLock()
         self._context = MeetingContext()
+        # When we entered the current state — the watchdogs' clock.
+        self._state_entered_at = self._now()
         # Calendar events seen as "approaching" but not yet matched to a process.
         # Keyed by ``CalendarEvent.canonical_key`` (iCalUID when available, else
         # the per-calendar event id) so cross-invited meetings — visible from
@@ -204,6 +218,7 @@ class MeetingDetector:
 
     def get_current_meeting(self) -> MeetingContext | None:
         with self._lock:
+            self._run_watchdogs()
             if self._context.state == MeetingState.IDLE:
                 return None
             # Return a copy-via-dict to keep callers from mutating internal state.
@@ -265,6 +280,7 @@ class MeetingDetector:
     # =====================================================================
     def _handle_calendar_upcoming(self, event: CalendarEvent) -> None:
         with self._lock:
+            self._run_watchdogs()
             key = event.canonical_key
             already_alerted = key in self._alerted_uids
             self._pending_approaching[key] = event
@@ -312,6 +328,7 @@ class MeetingDetector:
 
     def _handle_calendar_ended(self, event: CalendarEvent) -> None:
         with self._lock:
+            self._run_watchdogs()
             key = event.canonical_key
             self._pending_approaching.pop(key, None)
             self._alerted_uids.discard(key)
@@ -328,6 +345,7 @@ class MeetingDetector:
 
     def _handle_process_detected(self, app_name: str) -> None:
         with self._lock:
+            self._run_watchdogs()
             # If a recording is already in progress, the process signal is
             # advisory only — never overwrite RECORDING/PROCESSING state, even
             # if a freshly-arrived calendar event would otherwise correlate.
@@ -453,7 +471,59 @@ class MeetingDetector:
     def _transition(self, new_state: MeetingState) -> None:
         old = self._context.state
         self._context.state = new_state
+        self._state_entered_at = self._now()
         logger.info("State: %s -> %s", old.value, new_state.value)
+
+    # ------------------------------------------------------------- watchdogs
+    def _run_watchdogs(self) -> None:
+        """Force a stuck state back to IDLE. Caller must hold ``self._lock``.
+
+        APPROACHING and ENDED are both absorbing states in practice, because
+        the signal that should leave them can simply never arrive:
+
+        * APPROACHING's exit is a calendar "ended" event, which is lost on day
+          rollover (``reset_alerts()`` runs before the fetch), when the Mac
+          sleeps through the meeting's end, when the event is deleted in Google
+          Calendar, and during off-hours when the poller is stopped. The result
+          was "Meeting in 2 min" pinned in the menu bar indefinitely and a
+          permanently stale ``get_current_meeting()``.
+        * ENDED's only exit is ``transcription_started()``, which the daemon
+          skips entirely when there is no pipeline or no metadata. From ENDED,
+          every future "Meeting in 2 min" alert is silently dropped.
+
+        Both are cheap to bound, so we do — evaluated on every incoming signal
+        rather than on a timer, which keeps this free when nothing is happening.
+        """
+        state = self._context.state
+        now = self._now()
+
+        if state == MeetingState.APPROACHING:
+            end = self._context.end_time
+            deadline = (
+                end + timedelta(seconds=APPROACHING_GRACE_SECONDS)
+                if end is not None
+                else self._state_entered_at + timedelta(seconds=APPROACHING_MAX_SECONDS)
+            )
+            if now > deadline:
+                logger.info(
+                    "APPROACHING watchdog: %r never started (deadline %s); → IDLE.",
+                    self._context.title or "(untitled)", deadline.isoformat(),
+                )
+                self._transition(MeetingState.IDLE)
+                self._context = MeetingContext()
+                self._state_entered_at = now
+            return
+
+        if state == MeetingState.ENDED:
+            if now - self._state_entered_at > timedelta(seconds=ENDED_MAX_SECONDS):
+                logger.warning(
+                    "ENDED watchdog: no transcription started within %ds; → IDLE "
+                    "so future meetings are still detected.",
+                    ENDED_MAX_SECONDS,
+                )
+                self._transition(MeetingState.IDLE)
+                self._context = MeetingContext()
+                self._state_entered_at = now
 
 
 # ============================================================================
