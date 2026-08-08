@@ -9,19 +9,36 @@ def _talk(*sentences: str, repeat: int = 1) -> str:
     return " ".join(" ".join(sentences) for _ in range(repeat))
 
 
-def test_topic_and_detected_name_compose_title() -> None:
+def test_topic_and_known_participant_compose_title() -> None:
+    """Names come from the calendar now, never from a capitalised token.
+
+    The old version mined "Acme" out of the transcript itself, which is the
+    same mechanism that produced "Little with Italy" and "Basically with
+    August" on real recordings.
+    """
+    text = _talk(
+        "So let's walk through the onboarding flow together.",
+        "The onboarding starts with the import screen, as requested.",
+        "I showed the onboarding checklist and the import settings.",
+        "For this the onboarding should skip the import of legacy data.",
+        "Then onboarding emails go out and the import finishes overnight.",
+        repeat=2,
+    )
+    title = suggest_title(text, participants=[{"name": "Acme Corp"}])
+    assert title == "Onboarding with Acme"
+
+
+def test_a_name_in_the_transcript_is_not_a_participant() -> None:
     text = _talk(
         "So let's walk through the onboarding flow together.",
         "The onboarding starts with the import screen, as Acme requested.",
         "I showed Acme the onboarding checklist and the import settings.",
         "For Acme the onboarding should skip the import of legacy data.",
         "Then onboarding emails go out and the import finishes overnight.",
+        repeat=2,
     )
     title = suggest_title(text)
-    assert title is not None
-    assert "Onboarding" in title
-    assert "Acme" in title
-    assert title == "Onboarding with Acme"
+    assert title is None or " with " not in title
 
 
 def test_topics_only_when_no_proper_nouns() -> None:
@@ -31,6 +48,7 @@ def test_topics_only_when_no_proper_nouns() -> None:
         "the roadmap depends on the budget approval anyway",
         "once the budget clears we publish the roadmap update",
         "any budget overrun pushes the roadmap by a quarter",
+        repeat=2,
     )
     title = suggest_title(text)
     assert title is not None
@@ -91,6 +109,7 @@ def test_sentence_initial_capitals_are_not_names() -> None:
         "The roadmap and the pricing both ship next quarter regardless.",
         "The pricing review happens after the roadmap freeze deadline.",
         "The roadmap freeze lands monday and pricing follows shortly.",
+        repeat=2,
     )
     title = suggest_title(text)
     assert title is not None

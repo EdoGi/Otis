@@ -451,12 +451,22 @@ _ONBOARDING_SEGMENTS = [
     (8.0, 12.0, "I showed Acme the onboarding checklist and the import settings."),
     (12.0, 16.0, "For Acme the onboarding should skip the import of legacy data."),
     (16.0, 20.0, "Then onboarding emails go out and the import finishes overnight."),
+    # A topic must now recur past a confidence floor before it names the
+    # meeting — five mentions used to be enough, which is how a single filler
+    # word became the title on real recordings.
+    (20.0, 24.0, "The onboarding import runs nightly once onboarding is live."),
+    (24.0, 28.0, "We review the onboarding import log after each onboarding batch."),
 ]
 
 
 def test_adhoc_recording_gets_suggested_title_and_filename(tmp_path: Path) -> None:
     """No calendar title → transcript-derived title; filename keeps the
-    date+time prefix and uses the suggested slug."""
+    date+time prefix and uses the suggested slug.
+
+    The participant comes from the calendar snapshot rather than being mined
+    out of the transcript: guessing people from capitalised tokens is what
+    produced "Little with Italy" on real recordings.
+    """
     session = _make_recording_session(tmp_path)
     engine = _engine_returning(mic_segments=_ONBOARDING_SEGMENTS, system_segments=[])
     store = TranscriptStore(tmp_path / "transcripts")
@@ -464,7 +474,10 @@ def test_adhoc_recording_gets_suggested_title_and_filename(tmp_path: Path) -> No
         engine=engine, store=store, audio_dir=session.audio_dir
     )
 
-    result = processor.process(session, meeting=MeetingSnapshot(title=None))
+    result = processor.process(
+        session,
+        meeting=MeetingSnapshot(title=None, participants=[{"name": "Acme Corp"}]),
+    )
 
     assert result.metadata["title"] == "Onboarding with Acme"
     local_start = session.start_wall_clock.astimezone()
