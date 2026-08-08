@@ -74,6 +74,10 @@ class MeetingContext:
     participants: list[dict[str, str]] = field(default_factory=list)
     meeting_link: str | None = None
     calendar_event_id: str | None = None
+    #: iCalUID when the API supplied one, else the per-calendar id. The same
+    #: meeting invited on two accounts has two different ``calendar_event_id``
+    #: values but one ``calendar_key``, so this is what identity compares on.
+    calendar_key: str | None = None
     is_tentative: bool = False
 
     def to_dict(self) -> dict[str, Any]:
@@ -86,6 +90,7 @@ class MeetingContext:
             "participants": list(self.participants),
             "meeting_link": self.meeting_link,
             "calendar_event_id": self.calendar_event_id,
+            "calendar_key": self.calendar_key,
             "is_tentative": self.is_tentative,
         }
 
@@ -308,8 +313,8 @@ class MeetingDetector:
                 # tracking — that's just the calendar alert for our current
                 # call, not a new one.
                 same_meeting = (
-                    self._context.calendar_event_id is not None
-                    and self._context.calendar_event_id == event.id
+                    self._context.calendar_key is not None
+                    and self._context.calendar_key == event.canonical_key
                 )
                 if same_meeting:
                     ctx = None
@@ -337,7 +342,7 @@ class MeetingDetector:
             # we're still APPROACHING (no process arrived).
             if (
                 self._context.state == MeetingState.APPROACHING
-                and self._context.calendar_event_id == event.id
+                and self._context.calendar_key == event.canonical_key
             ):
                 self._transition(MeetingState.IDLE)
                 self._context = MeetingContext()
@@ -463,7 +468,7 @@ class MeetingDetector:
             and ctx.start_time is not None
             and abs(when - ctx.start_time) <= self._correlation
         ):
-            ctx_event = self._pending_approaching.get(ctx.calendar_event_id or "")
+            ctx_event = self._pending_approaching.get(ctx.calendar_key or "")
             if ctx_event is not None and (best is None or abs(when - ctx_event.start) < (best_delta or self._correlation + timedelta(seconds=1))):
                 best = ctx_event
         return best
@@ -542,6 +547,7 @@ def _context_from_event(event: CalendarEvent, state: MeetingState) -> MeetingCon
         participants=list(event.attendees),
         meeting_link=event.meeting_link,
         calendar_event_id=event.id,
+        calendar_key=event.canonical_key,
         is_tentative=event.is_tentative,
     )
 
@@ -556,6 +562,7 @@ def _copy_context(ctx: MeetingContext) -> MeetingContext:
         participants=list(ctx.participants),
         meeting_link=ctx.meeting_link,
         calendar_event_id=ctx.calendar_event_id,
+        calendar_key=ctx.calendar_key,
         is_tentative=ctx.is_tentative,
     )
 
