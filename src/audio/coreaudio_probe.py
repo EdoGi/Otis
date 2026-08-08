@@ -46,7 +46,13 @@ _kAudioObjectSystemObject = 1
 _kAudioObjectPropertyScopeGlobal = _fourcc("glob")
 _kAudioObjectPropertyElementMain = 0  # alias for kAudioObjectPropertyElementMaster
 _kAudioHardwarePropertyDefaultInputDevice = _fourcc("dIn ")
+_kAudioHardwarePropertyDefaultOutputDevice = _fourcc("dOut")
 _kAudioHardwarePropertyDevices = _fourcc("dev#")
+_kAudioDevicePropertyDeviceUID = _fourcc("uid ")
+# Returns the AudioObjectIDs currently active inside an aggregate / multi-output
+# device. Verified against a real Multi-Output on macOS 15: aggregate "Otis"
+# reports [86 built-in speakers, 98 BlackHole 2ch].
+_kAudioAggregateDevicePropertyActiveSubDeviceList = _fourcc("agrp")
 _kAudioDevicePropertyDeviceIsRunningSomewhere = _fourcc("gone")
 _kAudioDevicePropertyTransportType = _fourcc("tran")
 _kAudioObjectPropertyName = _fourcc("lnam")
@@ -284,6 +290,71 @@ def is_aggregate_device(device_id: int) -> bool:
         return get_transport_type(device_id) == _kAudioDeviceTransportTypeAggregate
     except CoreAudioProbeError:
         return False
+
+
+def get_default_output_device_id() -> int:
+    """Return the CoreAudio device id of the system default *output*.
+
+    This is the property the old BlackHole check never looked at — and the
+    reason two months of meetings recorded silence. System audio only reaches
+    BlackHole if the default output routes through it.
+    """
+    out = _get_property(
+        _kAudioObjectSystemObject,
+        _kAudioHardwarePropertyDefaultOutputDevice,
+        ctypes.c_uint32,
+    )
+    return int(out.value)
+
+
+def get_device_uid(device_id: int) -> str:
+    """Return the stable UID string of a device (``'BlackHole2ch_UID'``, …).
+
+    UIDs survive renames, so they're a better identity check than the display
+    name — but we fall back to the name when a driver reports nothing useful.
+    """
+    lib = _load_coreaudio()
+    addr = _AudioObjectPropertyAddress(
+        _kAudioDevicePropertyDeviceUID,
+        _kAudioObjectPropertyScopeGlobal,
+        _kAudioObjectPropertyElementMain,
+    )
+    cf_ref = ctypes.c_void_p()
+    size = ctypes.c_uint32(ctypes.sizeof(cf_ref))
+    err = lib.AudioObjectGetPropertyData(
+        device_id, ctypes.byref(addr), 0, None, ctypes.byref(size), ctypes.byref(cf_ref)
+    )
+    if err != 0:
+        return ""
+    try:
+        return _cfstring_to_str(cf_ref.value or 0)
+    finally:
+        if cf_ref.value:
+            _load_corefoundation().CFRelease(cf_ref.value)
+
+
+def get_aggregate_member_ids(device_id: int) -> list[int]:
+    """Return the device ids inside an aggregate, or ``[]`` for a plain device."""
+    lib = _load_coreaudio()
+    addr = _AudioObjectPropertyAddress(
+        _kAudioAggregateDevicePropertyActiveSubDeviceList,
+        _kAudioObjectPropertyScopeGlobal,
+        _kAudioObjectPropertyElementMain,
+    )
+    size = ctypes.c_uint32(0)
+    err = lib.AudioObjectGetPropertyDataSize(
+        device_id, ctypes.byref(addr), 0, None, ctypes.byref(size)
+    )
+    if err != 0 or size.value == 0:
+        return []
+    n = size.value // ctypes.sizeof(ctypes.c_uint32)
+    buf = (ctypes.c_uint32 * n)()
+    err = lib.AudioObjectGetPropertyData(
+        device_id, ctypes.byref(addr), 0, None, ctypes.byref(size), buf
+    )
+    if err != 0:
+        return []
+    return [int(v) for v in buf]
 
 
 def list_aggregate_devices() -> list[tuple[int, str]]:

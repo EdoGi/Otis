@@ -11,7 +11,9 @@ aggregate output exists alongside an installed BlackHole.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from enum import Enum
 
 from src.audio.devices import DeviceManager
 
@@ -90,6 +92,195 @@ def verify_blackhole_setup(device_manager: DeviceManager | None = None) -> Black
             status.multi_output_device_name,
         )
     return status
+
+
+# ===========================================================================
+# Output routing — is system audio ACTUALLY reaching BlackHole right now?
+# ===========================================================================
+# verify_blackhole_setup() above is a *structural* check: it asks whether the
+# pieces exist. That is not the same question as whether they are wired up, and
+# the difference cost two months of half-recorded meetings: BlackHole was
+# installed, a Multi-Output device called "Otis" existed, the check returned
+# ok=True — and the Mac's output was pointed at the built-in speakers the whole
+# time, so BlackHole received pure digital silence.
+#
+# This check asks the real question: does the *current default output device*
+# carry audio into BlackHole?
+
+
+class RoutingState(str, Enum):
+    OK = "ok"
+    #: Audio reaches BlackHole, but nothing audible — the user hears nothing.
+    INAUDIBLE = "inaudible"
+    #: Audio does not reach BlackHole at all. System capture will be silent.
+    NOT_ROUTED = "not_routed"
+    #: CoreAudio wouldn't answer. Never claim health we couldn't verify.
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class RoutingProbe:
+    """The CoreAudio calls the routing check needs, injected so it's testable.
+
+    Defaults are bound lazily in :func:`default_routing_probe` so importing
+    this module on a non-macOS box (CI) stays safe.
+    """
+
+    default_output_id: Callable[[], int]
+    device_name: Callable[[int], str]
+    device_uid: Callable[[int], str]
+    aggregate_members: Callable[[int], list[int]]
+    list_devices: Callable[[], list[int]] = tuple  # type: ignore[assignment]
+
+
+@dataclass(frozen=True)
+class RoutingStatus:
+    state: RoutingState
+    default_output_id: int | None = None
+    default_output_name: str = ""
+    includes_blackhole: bool = False
+    is_aggregate: bool = False
+    member_names: list[str] = field(default_factory=list)
+    #: Name of an aggregate that *does* contain BlackHole, when we found one.
+    suggested_device: str | None = None
+    error: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        """True only when system audio is both captured *and* audible."""
+        return self.state is RoutingState.OK
+
+    def message(self) -> str:
+        if self.state is RoutingState.OK:
+            members = " + ".join(self.member_names) or self.default_output_name
+            return f"System audio routed through {self.default_output_name!r} ({members})."
+        if self.state is RoutingState.INAUDIBLE:
+            return (
+                f"Output {self.default_output_name!r} feeds BlackHole but has no "
+                "speakers — Otis will record the call, but you won't hear it. "
+                "Add your speakers or headphones to that device in Audio MIDI Setup."
+            )
+        if self.state is RoutingState.NOT_ROUTED:
+            fix = (
+                f"Set your Mac's output device to {self.suggested_device!r}."
+                if self.suggested_device
+                else "Create a Multi-Output device combining your speakers with "
+                     "BlackHole 2ch, then select it as your output device."
+            )
+            return (
+                f"Your Mac is playing to {self.default_output_name!r}, which does not "
+                f"pass audio to BlackHole — system audio will record as silence. {fix}"
+            )
+        return f"Could not determine audio routing: {self.error or 'unknown error'}"
+
+
+def _looks_like_blackhole(name: str, uid: str) -> bool:
+    return "blackhole" in name.lower() or "blackhole" in uid.lower()
+
+
+def default_routing_probe() -> RoutingProbe:
+    """Bind the real CoreAudio probes (import is deferred for non-macOS)."""
+    from src.audio import coreaudio_probe as cap
+
+    return RoutingProbe(
+        default_output_id=cap.get_default_output_device_id,
+        device_name=cap.get_device_name,
+        device_uid=cap.get_device_uid,
+        aggregate_members=cap.get_aggregate_member_ids,
+        list_devices=cap.list_audio_device_ids,
+    )
+
+
+def check_output_routing(probe: RoutingProbe | None = None) -> RoutingStatus:
+    """Report whether the current default output actually feeds BlackHole."""
+    if probe is None:
+        try:
+            probe = default_routing_probe()
+        except Exception as exc:  # pragma: no cover (non-macOS import failure)
+            return RoutingStatus(state=RoutingState.UNKNOWN, error=str(exc))
+
+    try:
+        out_id = probe.default_output_id()
+        out_name = probe.device_name(out_id)
+        members = list(probe.aggregate_members(out_id))
+    except Exception as exc:
+        logger.warning("Audio routing probe failed: %s", exc)
+        return RoutingStatus(state=RoutingState.UNKNOWN, error=str(exc))
+
+    is_aggregate = bool(members)
+    # A plain device is its own only "member" for the purposes of this check.
+    candidates = members or [out_id]
+
+    member_names: list[str] = []
+    includes_blackhole = False
+    has_audible_member = False
+    for did in candidates:
+        try:
+            name = probe.device_name(did)
+            uid = probe.device_uid(did)
+        except Exception:  # pragma: no cover (defensive)
+            continue
+        member_names.append(name)
+        if _looks_like_blackhole(name, uid):
+            includes_blackhole = True
+        else:
+            has_audible_member = True
+
+    suggestion = None if includes_blackhole else _suggest_aggregate(probe)
+
+    if includes_blackhole and has_audible_member:
+        state = RoutingState.OK
+    elif includes_blackhole:
+        state = RoutingState.INAUDIBLE
+    else:
+        state = RoutingState.NOT_ROUTED
+
+    status = RoutingStatus(
+        state=state,
+        default_output_id=out_id,
+        default_output_name=out_name,
+        includes_blackhole=includes_blackhole,
+        is_aggregate=is_aggregate,
+        member_names=member_names,
+        suggested_device=suggestion,
+    )
+    if state is RoutingState.OK:
+        logger.info("Audio routing OK: %s", status.message())
+    else:
+        logger.warning("Audio routing degraded: %s", status.message())
+    return status
+
+
+def _suggest_aggregate(probe: RoutingProbe) -> str | None:
+    """Find an aggregate that contains BlackHole *and* something audible."""
+    try:
+        device_ids = list(probe.list_devices())
+    except Exception:  # pragma: no cover (defensive)
+        return None
+
+    fallback: str | None = None
+    for did in device_ids:
+        try:
+            members = list(probe.aggregate_members(did))
+        except Exception:  # pragma: no cover (defensive)
+            continue
+        if not members:
+            continue
+        has_bh = False
+        has_audible = False
+        for mid in members:
+            try:
+                if _looks_like_blackhole(probe.device_name(mid), probe.device_uid(mid)):
+                    has_bh = True
+                else:
+                    has_audible = True
+            except Exception:  # pragma: no cover (defensive)
+                continue
+        if has_bh and has_audible:
+            return probe.device_name(did)
+        if has_bh and fallback is None:
+            fallback = probe.device_name(did)
+    return fallback
 
 
 def format_setup_instructions(status: BlackHoleStatus) -> str:

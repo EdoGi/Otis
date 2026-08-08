@@ -140,6 +140,11 @@ class GoogleCalendarPoller:
         self._alerted_ended: set[str] = set()
         self._last_poll_date: Any = None  # datetime.date of the last poll cycle
         self._service: Any = None  # googleapiclient resource, lazy-built
+        # Auth failure is announced once per failure streak, not once per poll.
+        # Before this flag existed the poller logged the same warning twice a
+        # minute for three months — 2 309 lines, 45% of the log file, and not
+        # one of them reached the user.
+        self._auth_failure_announced = False
 
     # =====================================================================
     # Public API
@@ -232,11 +237,24 @@ class GoogleCalendarPoller:
                 self._save_token(creds)
                 return creds
             except Exception as exc:
-                logger.warning("Token refresh failed (%s); deleting saved token.", exc)
-                try:
-                    self._token_path.unlink(missing_ok=True)
-                except Exception:  # pragma: no cover
-                    pass
+                # Only an explicit verdict from Google's OAuth server means the
+                # token is dead. Everything else — offline wake, captive portal,
+                # DNS blip, 503 — is transient, and deleting a working refresh
+                # token because the Wi-Fi dropped is exactly how this app lost
+                # calendar detection for three months.
+                if _token_is_permanently_dead(exc):
+                    logger.warning(
+                        "Token was revoked by the OAuth server (%s); deleting it.", exc
+                    )
+                    try:
+                        self._token_path.unlink(missing_ok=True)
+                    except Exception:  # pragma: no cover
+                        pass
+                else:
+                    logger.warning(
+                        "Token refresh failed transiently (%s); keeping the token "
+                        "and retrying on the next poll.", exc,
+                    )
 
         # No usable credentials. The poller calls us with headless=True so we
         # surface a re-auth request instead of blocking the thread on a browser.
@@ -271,6 +289,49 @@ class GoogleCalendarPoller:
         creds = self.authenticate(headless=True)
         return build("calendar", "v3", credentials=creds, cache_discovery=False)
 
+    # ------------------------------------------------------- auth announcements
+    def _announce_auth_failure(self, message: str) -> None:
+        """Report broken auth once per failure streak — to the user, not the log.
+
+        The poll loop runs every 60 s per account. Announcing on every cycle is
+        what produced 2 880 warning lines a day and trained everyone to ignore
+        the log entirely, so the transition is the event, not the state.
+        """
+        from src.health import CALENDAR, HealthState, get_health
+
+        with self._lock:
+            already = self._auth_failure_announced
+            self._auth_failure_announced = True
+
+        get_health().report(
+            CALENDAR,
+            label="Calendar",
+            state=HealthState.FAIL,
+            detail="disconnected — reconnect to get meeting titles",
+            hint="Run scripts/setup_google_cal.sh to reconnect this account.",
+        )
+        if already:
+            logger.debug("Calendar auth still needs attention: %s", message)
+            return
+        logger.warning("Calendar auth needs attention: %s", message)
+        _safe_call_each(self._on_reauth, message)
+
+    def notify_auth_recovered(self) -> None:
+        """Clear the failure streak so a future break is announced again."""
+        from src.health import CALENDAR, HealthState, get_health
+
+        with self._lock:
+            was_broken = self._auth_failure_announced
+            self._auth_failure_announced = False
+        get_health().report(
+            CALENDAR,
+            label="Calendar",
+            state=HealthState.OK,
+            detail=f"{len(self._calendar_ids)} calendar(s)",
+        )
+        if was_broken:
+            logger.info("Calendar auth recovered.")
+
     # --------------------------------------------------------------- fetching
     def fetch_today_events(self) -> list[CalendarEvent]:
         """Pull today's events from every configured calendar.
@@ -285,9 +346,9 @@ class GoogleCalendarPoller:
         try:
             if self._service is None:
                 self._service = self._build_service()
+                self.notify_auth_recovered()
         except CalendarAuthError as exc:
-            logger.warning("Calendar auth needs attention: %s", exc)
-            _safe_call_each(self._on_reauth, str(exc))
+            self._announce_auth_failure(str(exc))
             self._service = None
             return []
         except Exception as exc:
@@ -505,6 +566,32 @@ def _extract_meeting_link(raw: dict[str, Any]) -> str | None:
 # ============================================================================
 # Helpers
 # ============================================================================
+#: Substrings in an OAuth ``RefreshError`` that mean the token itself is dead
+#: and no amount of retrying will help. Anything else is transport trouble.
+_DEAD_TOKEN_MARKERS = (
+    "invalid_grant",
+    "invalid_client",
+    "unauthorized_client",
+    "invalid_scope",
+)
+
+
+def _token_is_permanently_dead(exc: BaseException) -> bool:
+    """True only when Google's OAuth server has explicitly rejected the token.
+
+    A ``RefreshError`` is *also* raised for connection resets, so the exception
+    type alone is not enough — we require an OAuth error code in the message.
+    """
+    try:
+        from google.auth.exceptions import RefreshError
+    except Exception:  # pragma: no cover (google libs absent)
+        return False
+    if not isinstance(exc, RefreshError):
+        return False
+    text = str(exc).lower()
+    return any(marker in text for marker in _DEAD_TOKEN_MARKERS)
+
+
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
