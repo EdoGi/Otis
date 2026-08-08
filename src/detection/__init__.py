@@ -11,9 +11,9 @@ from src.detection.detector import MeetingContext, MeetingDetector, MeetingState
 from src.detection.process_monitor import DEFAULT_BROWSER_APPS, ProcessMonitor
 
 __all__ = [
+    "DEFAULT_BROWSER_APPS",
     "CalendarAuthError",
     "CalendarEvent",
-    "DEFAULT_BROWSER_APPS",
     "GoogleCalendarPoller",
     "MeetingContext",
     "MeetingDetector",

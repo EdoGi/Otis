@@ -24,7 +24,6 @@ import logging
 import os
 import re
 import threading
-import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -93,6 +92,19 @@ class CalendarEvent:
 UpcomingCallback = Callable[[CalendarEvent], None]
 EndedCallback = Callable[[CalendarEvent], None]
 ReauthCallback = Callable[[str], None]
+
+
+#: Transport timeout for every Calendar API call. httplib2 defaults to None
+#: (block forever), which is how one bad socket wedged the poller permanently.
+HTTP_TIMEOUT_SECONDS = 10.0
+
+#: Client-library retries for a single request — rides out 5xx and rate limits
+#: instead of failing the whole poll cycle.
+API_RETRIES = 3
+
+#: Safety valve on nextPageToken following, so a pathological calendar can't
+#: spin the poll thread indefinitely. 250 events/page.
+MAX_EVENT_PAGES = 8
 
 
 class CalendarAuthError(RuntimeError):
@@ -287,7 +299,27 @@ class GoogleCalendarPoller:
         from googleapiclient.discovery import build
 
         creds = self.authenticate(headless=True)
-        return build("calendar", "v3", credentials=creds, cache_discovery=False)
+        # An explicit transport timeout is the difference between a bad network
+        # and a permanently wedged poller. httplib2's default is None, so a
+        # half-open socket (captive portal, VPN flap, sleep mid-request) blocks
+        # the poll thread forever — stop() then joins for 2 s, gives up, and the
+        # next off-hours cycle starts *another* thread on top of it.
+        return build(
+            "calendar",
+            "v3",
+            credentials=creds,
+            cache_discovery=False,
+            http=self._authorized_http(creds),
+        )
+
+    def _authorized_http(self, creds: Any) -> Any:
+        """An httplib2 transport with a timeout, authorised with ``creds``."""
+        import google_auth_httplib2
+        import httplib2
+
+        return google_auth_httplib2.AuthorizedHttp(
+            creds, http=httplib2.Http(timeout=HTTP_TIMEOUT_SECONDS)
+        )
 
     # ------------------------------------------------------- auth announcements
     def _announce_auth_failure(self, message: str) -> None:
@@ -356,33 +388,19 @@ class GoogleCalendarPoller:
             self._service = None
             return []
 
-        now = self._now()
-        start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        end_of_day = start_of_day + timedelta(days=1)
+        start_of_day, end_of_day = local_day_bounds(self._now())
 
         seen_ids: set[str] = set()
         events: list[CalendarEvent] = []
         failed_calendars = 0
         for cal_id in self._calendar_ids:
             try:
-                response = (
-                    self._service.events()
-                    .list(
-                        calendarId=cal_id,
-                        timeMin=start_of_day.isoformat(),
-                        timeMax=end_of_day.isoformat(),
-                        singleEvents=True,
-                        orderBy="startTime",
-                        maxResults=100,
-                    )
-                    .execute()
-                )
+                items = self._list_events_paged(cal_id, start_of_day, end_of_day)
             except Exception as exc:
                 logger.warning("Calendar %r fetch failed: %s", cal_id, exc)
                 failed_calendars += 1
                 continue
 
-            items = response.get("items", []) if isinstance(response, dict) else []
             for raw in items:
                 ev = parse_event(raw)
                 if ev is None or ev.id in seen_ids:
@@ -404,6 +422,46 @@ class GoogleCalendarPoller:
 
         events.sort(key=lambda e: e.start)
         return events
+
+    def _list_events_paged(
+        self, cal_id: str, start: datetime, end: datetime,
+    ) -> list[dict[str, Any]]:
+        """Fetch every event in the window, following ``nextPageToken``.
+
+        The old call passed ``maxResults=100`` and ignored the page token, so a
+        day with more than 100 events silently lost the tail — and the events
+        most likely to be dropped are the later ones, i.e. the meetings still
+        to come. ``num_retries`` lets the client library ride out a 5xx or a
+        rate-limit instead of failing the whole cycle.
+        """
+        items: list[dict[str, Any]] = []
+        page_token: str | None = None
+        for _ in range(MAX_EVENT_PAGES):
+            response = (
+                self._service.events()
+                .list(
+                    calendarId=cal_id,
+                    timeMin=start.isoformat(),
+                    timeMax=end.isoformat(),
+                    singleEvents=True,
+                    orderBy="startTime",
+                    maxResults=250,
+                    pageToken=page_token,
+                )
+                .execute(num_retries=API_RETRIES)
+            )
+            if not isinstance(response, dict):
+                break
+            items.extend(response.get("items", []) or [])
+            page_token = response.get("nextPageToken")
+            if not page_token:
+                break
+        else:
+            logger.warning(
+                "Calendar %r has more than %d pages of events; truncating.",
+                cal_id, MAX_EVENT_PAGES,
+            )
+        return items
 
     # ----------------------------------------------------------------- state
     def upcoming_within(self, minutes: float) -> list[CalendarEvent]:
@@ -574,6 +632,20 @@ _DEAD_TOKEN_MARKERS = (
     "unauthorized_client",
     "invalid_scope",
 )
+
+
+def local_day_bounds(now: datetime) -> tuple[datetime, datetime]:
+    """Return the start and end of ``now``'s *local* day, as aware datetimes.
+
+    The window used to be built from a UTC ``now`` with ``hour=0``, which makes
+    "today" run 02:00→02:00 local in Europe/Paris. Two consequences: meetings
+    between local midnight and 02:00 were invisible, and ``reset_alerts()``
+    fired at 02:00 local — 17:00 local for a US user, i.e. in the middle of the
+    workday, wiping the bookkeeping that lets a meeting's end signal fire.
+    """
+    local_now = now.astimezone()
+    start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return start, start + timedelta(days=1)
 
 
 def _token_is_permanently_dead(exc: BaseException) -> bool:

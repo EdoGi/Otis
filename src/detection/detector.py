@@ -340,6 +340,33 @@ class MeetingDetector:
                 return
             now = self._now()
             matched = self._match_calendar_event(now)
+
+            # ProcessMonitor re-fires on_detected every debounce window (30 s)
+            # for a still-running app, so a Zoom left open can start the *next*
+            # meeting once we're back in IDLE. While we are already DETECTED for
+            # that same app, though, it is a heartbeat and not news — treating
+            # it as an edge rebuilt the context and re-fired callbacks every
+            # 30 s, which with Slack in the default whitelist meant 2 880 log
+            # lines and UI state changes a day.
+            #
+            # The one exception: a process can appear before its calendar event
+            # does. If the correlation has only just arrived, that genuinely is
+            # new information, so we upgrade the context and fire once more.
+            if (
+                self._context.state == MeetingState.DETECTED
+                and self._context.app == app_name
+            ):
+                already_correlated = self._context.calendar_event_id is not None
+                if matched is None or already_correlated:
+                    logger.debug(
+                        "Process heartbeat for %s while already DETECTED; ignoring.",
+                        app_name,
+                    )
+                    return
+                logger.info(
+                    "Calendar caught up with running process %s → %s.",
+                    app_name, matched.title,
+                )
             if matched is not None:
                 self._context = _context_from_event(matched, MeetingState.DETECTED)
                 self._context.app = app_name

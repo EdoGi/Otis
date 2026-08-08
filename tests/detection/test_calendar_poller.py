@@ -155,7 +155,7 @@ class _FakeService:
             self.calendars_queried.append(cal)
         return self
 
-    def execute(self) -> dict[str, Any]:
+    def execute(self, **_kw: Any) -> dict[str, Any]:
         cal = (self.last_kwargs or {}).get("calendarId")
         if cal in self._items_by_calendar:
             return {"items": list(self._items_by_calendar[cal])}
@@ -257,7 +257,7 @@ def test_fetch_swallows_api_errors() -> None:
         def list(self, **kwargs: Any):
             return self
 
-        def execute(self) -> dict[str, Any]:
+        def execute(self, **_kw: Any) -> dict[str, Any]:
             raise RuntimeError("HTTP 500")
 
     now = datetime(2026, 5, 9, 8, 0, tzinfo=timezone.utc)
@@ -279,7 +279,7 @@ def test_fetch_drops_cached_service_when_all_calendars_fail() -> None:
         def list(self, **kwargs: Any):
             return self
 
-        def execute(self) -> dict[str, Any]:
+        def execute(self, **_kw: Any) -> dict[str, Any]:
             raise RuntimeError("invalid_grant")
 
     now = datetime(2026, 5, 9, 8, 0, tzinfo=timezone.utc)
@@ -296,7 +296,7 @@ def test_fetch_keeps_service_when_only_one_calendar_fails() -> None:
     now = datetime(2026, 5, 9, 8, 0, tzinfo=timezone.utc)
 
     class _PartialService(_FakeService):
-        def execute(self) -> dict[str, Any]:
+        def execute(self, **_kw: Any) -> dict[str, Any]:
             cal = (self.last_kwargs or {}).get("calendarId")
             if cal == "broken@x.com":
                 raise RuntimeError("HTTP 404")
@@ -407,7 +407,7 @@ def test_fetch_continues_when_one_calendar_fails() -> None:
             self.last = kwargs
             return self
 
-        def execute(self):
+        def execute(self, **_kw):
             cal = self.last.get("calendarId")
             if cal == "broken":
                 raise RuntimeError("HTTP 403 forbidden")
