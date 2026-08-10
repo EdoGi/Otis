@@ -7,11 +7,9 @@ exercise the matching, debouncing, and event logic.
 
 from __future__ import annotations
 
-import threading
 import time
 from typing import Any, Iterable
 
-import pytest
 
 from src.detection.process_monitor import ProcessMonitor
 
@@ -21,12 +19,17 @@ def _procs(*names_with_pid: tuple[str, int]) -> Iterable[dict[str, Any]]:
 
 
 # ----------------------------------------------------------------- whitelist
+# NOTE: the browser-via-mic tests that used to live here were removed with
+# the heuristic itself (audit A3). Detection is calendar-first; a browser
+# being open is no longer evidence of a meeting. See test_process_matching.py
+# for the exact phantom process names that used to trigger it.
+
+
 def test_detects_zoom_when_running() -> None:
     detected: list[str] = []
     pm = ProcessMonitor(
         whitelisted_apps=["zoom.us", "Microsoft Teams"],
         process_iter=lambda: _procs(("zoom.us", 123)),
-        mic_probe=lambda: False,
     )
     pm.on_meeting_detected(detected.append)
     pm.poll_once()
@@ -40,7 +43,6 @@ def test_detects_each_whitelisted_app() -> None:
         pm = ProcessMonitor(
             whitelisted_apps=apps,
             process_iter=lambda app=app: _procs((app, 1)),
-            mic_probe=lambda: False,
         )
         pm.on_meeting_detected(detected.append)
         pm.poll_once()
@@ -52,7 +54,6 @@ def test_whitelist_is_case_insensitive() -> None:
     pm = ProcessMonitor(
         whitelisted_apps=["Zoom.us"],
         process_iter=lambda: _procs(("ZOOM.US", 1)),
-        mic_probe=lambda: False,
     )
     pm.on_meeting_detected(detected.append)
     pm.poll_once()
@@ -66,7 +67,6 @@ def test_blacklist_blocks_match() -> None:
         whitelisted_apps=["whisper"],
         blacklisted_apps=["SuperWhisper"],
         process_iter=lambda: _procs(("SuperWhisper", 1)),
-        mic_probe=lambda: False,
     )
     pm.on_meeting_detected(detected.append)
     pm.poll_once()
@@ -74,100 +74,11 @@ def test_blacklist_blocks_match() -> None:
 
 
 # ------------------------------------------------------------------ browsers
-def test_browser_only_counts_when_mic_active() -> None:
-    detected: list[str] = []
-    pm = ProcessMonitor(
-        whitelisted_apps=[],  # browser detection alone
-        process_iter=lambda: _procs(("Google Chrome", 99)),
-        browser_apps=["Google Chrome"],
-        mic_probe=lambda: True,
-    )
-    pm.on_meeting_detected(detected.append)
-    pm.poll_once()
-    assert detected == ["google chrome"]
-
-
-def test_browser_alone_with_mic_idle_is_ignored() -> None:
-    detected: list[str] = []
-    pm = ProcessMonitor(
-        whitelisted_apps=[],
-        process_iter=lambda: _procs(("Google Chrome", 99)),
-        browser_apps=["Google Chrome"],
-        mic_probe=lambda: False,
-    )
-    pm.on_meeting_detected(detected.append)
-    pm.poll_once()
-    assert detected == []
-
-
-def test_mic_activation_disabled_skips_browser_detection() -> None:
-    """When mic_activation_enabled=False, browsers must never fire — even if
-    the mic probe says active. Use case: a dictation tool (e.g. SuperWhisper)
-    holds the mic open continuously, making the mic-active heuristic useless.
-    """
-    detected: list[str] = []
-    probe_calls: list[bool] = []
-
-    def probe() -> bool:
-        probe_calls.append(True)
-        return True
-
-    pm = ProcessMonitor(
-        whitelisted_apps=[],
-        process_iter=lambda: _procs(("Safari", 1), ("Arc", 2)),
-        browser_apps=["Safari", "Arc"],
-        mic_probe=probe,
-        mic_activation_enabled=False,
-    )
-    pm.on_meeting_detected(detected.append)
-    pm.poll_once()
-    assert detected == []
-    # And we shouldn't even bother probing the mic when the feature is off.
-    assert probe_calls == []
-
-
-def test_mic_activation_disabled_still_fires_whitelisted_apps() -> None:
-    """Disabling mic activation must NOT disable detection of real meeting
-    apps like Zoom — only the mic-based browser fallback is affected.
-    """
-    detected: list[str] = []
-    pm = ProcessMonitor(
-        whitelisted_apps=["zoom.us"],
-        process_iter=lambda: _procs(("zoom.us", 11), ("Safari", 22)),
-        browser_apps=["Safari"],
-        mic_probe=lambda: True,
-        mic_activation_enabled=False,
-    )
-    pm.on_meeting_detected(detected.append)
-    pm.poll_once()
-    assert detected == ["zoom.us"]
-
-
-def test_browser_mic_probe_failure_treated_as_inactive() -> None:
-    """Mic probe raising must not prevent the monitor from running."""
-    detected: list[str] = []
-
-    def boom() -> bool:
-        raise RuntimeError("CoreAudio offline")
-
-    pm = ProcessMonitor(
-        whitelisted_apps=[],
-        process_iter=lambda: _procs(("Safari", 7)),
-        browser_apps=["Safari"],
-        mic_probe=boom,
-    )
-    pm.on_meeting_detected(detected.append)
-    pm.poll_once()
-    assert detected == []
-
-
-# ------------------------------------------------------------------ debounce
 def test_debounce_suppresses_redetect_within_window() -> None:
     detected: list[str] = []
     pm = ProcessMonitor(
         whitelisted_apps=["zoom.us"],
         process_iter=lambda: _procs(("zoom.us", 1)),
-        mic_probe=lambda: False,
         debounce_seconds=30.0,
     )
     pm.on_meeting_detected(detected.append)
@@ -183,7 +94,6 @@ def test_debounce_lets_redetect_after_window() -> None:
     pm = ProcessMonitor(
         whitelisted_apps=["zoom.us"],
         process_iter=lambda: _procs(("zoom.us", 1)),
-        mic_probe=lambda: False,
         debounce_seconds=0.0,
     )
     pm.on_meeting_detected(detected.append)
@@ -199,7 +109,6 @@ def test_debounce_does_not_collapse_different_apps() -> None:
     pm = ProcessMonitor(
         whitelisted_apps=["zoom.us", "slack"],
         process_iter=lambda: _procs(("zoom.us", 1), ("Slack", 2)),
-        mic_probe=lambda: False,
         debounce_seconds=30.0,
     )
     pm.on_meeting_detected(detected.append)
@@ -222,7 +131,6 @@ def test_meeting_ended_fires_when_app_disappears() -> None:
     pm = ProcessMonitor(
         whitelisted_apps=["zoom.us"],
         process_iter=proc_iter,
-        mic_probe=lambda: False,
     )
     pm.on_meeting_detected(detected.append)
     pm.on_meeting_ended(ended.append)
@@ -238,7 +146,6 @@ def test_active_meetings_snapshot() -> None:
     pm = ProcessMonitor(
         whitelisted_apps=["zoom.us", "slack"],
         process_iter=lambda: _procs(("zoom.us", 1), ("Slack", 2)),
-        mic_probe=lambda: False,
     )
     pm.poll_once()
     assert set(pm.active_meetings()) == {"zoom.us", "slack"}
@@ -251,7 +158,6 @@ def test_start_stop_lifecycle() -> None:
         whitelisted_apps=["zoom.us"],
         poll_interval_seconds=0.01,
         process_iter=lambda: _procs(("zoom.us", 1)),
-        mic_probe=lambda: False,
     )
     detected: list[str] = []
     pm.on_meeting_detected(detected.append)
@@ -275,7 +181,6 @@ def test_callback_exception_does_not_break_loop() -> None:
     pm = ProcessMonitor(
         whitelisted_apps=["zoom.us"],
         process_iter=lambda: _procs(("zoom.us", 1)),
-        mic_probe=lambda: False,
     )
     pm.on_meeting_detected(bad)
     pm.on_meeting_detected(fine_calls.append)

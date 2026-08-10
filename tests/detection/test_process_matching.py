@@ -109,7 +109,6 @@ def test_apple_daemons_do_not_trigger_detection() -> None:
             "SafariWidgetExtension",
             "com.apple.SafariPlatformSupport.Helper",
         )),
-        mic_probe=lambda: True,  # dictation tool holding the mic
     )
     mon.on_meeting_detected(lambda name, _pids=None: detected.append(name))
 
@@ -121,7 +120,6 @@ def test_a_real_meeting_app_still_detects() -> None:
     detected: list[str] = []
     mon = make_monitor(
         process_iter=lambda: iter(procs("zoom.us", "searchpartyd")),
-        mic_probe=lambda: False,
     )
     mon.on_meeting_detected(lambda name, _pids=None: detected.append(name))
 
@@ -132,6 +130,5 @@ def test_a_real_meeting_app_still_detects() -> None:
 def test_blacklist_still_wins() -> None:
     mon = make_monitor(
         process_iter=lambda: iter(procs("SuperWhisper", "zoom.us")),
-        mic_probe=lambda: False,
     )
     assert mon.poll_once() == {"zoom.us"}

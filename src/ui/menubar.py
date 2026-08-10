@@ -550,23 +550,10 @@ class MenuBarApp:
             wl_root.add(it)
         self._mi["settings_whitelist_root"] = wl_root
 
-        # Mic-activated browser detection — turn off if a dictation tool
-        # (e.g. SuperWhisper) keeps the mic permanently open and every
-        # running browser would otherwise look like a meeting.
-        mic_item = rumps.MenuItem(
-            "Detect browser meetings (via mic)",
-            callback=self._on_mic_activation_toggled,
-        )
-        mic_item.state = bool(self._config.get(
-            "detection", "mic_activation", "enabled", default=True
-        ))
-        self._mi["settings_mic_activation"] = mic_item
-
         root.add(model_root)
         root.add(days_root)
         root.add(hours_root)
         root.add(wl_root)
-        root.add(mic_item)
 
     # =====================================================================
     # Detector callback wiring (background-thread side)
@@ -821,18 +808,6 @@ class MenuBarApp:
             NotificationType.ERROR,
             "Whitelist saved",
             "Restart Otis for whitelist changes to take effect.",
-            force=True,
-        )
-
-    def _on_mic_activation_toggled(self, sender: Any) -> None:
-        sender.state = not sender.state
-        self._persist_setting(
-            {"detection": {"mic_activation": {"enabled": bool(sender.state)}}}
-        )
-        self._notifications.notify(
-            NotificationType.ERROR,
-            "Setting saved",
-            "Restart Otis for the mic-activation change to take effect.",
             force=True,
         )
 

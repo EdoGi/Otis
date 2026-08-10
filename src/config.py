@@ -64,9 +64,6 @@ DEFAULTS: dict[str, Any] = {
                 }
             ],
         },
-        "mic_activation": {
-            "enabled": True,
-        },
     },
     "transcription": {
         "model": "small",

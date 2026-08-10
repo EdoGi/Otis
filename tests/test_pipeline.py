@@ -186,11 +186,96 @@ def test_wait_aborts_on_shutdown_signal() -> None:
     assert waited == 60.0
 
 
-def test_call_probe_disabled_when_mic_signal_invalid(tmp_path: Path) -> None:
-    """mic_activation disabled (dictation app holds the mic) ⇒ never defer
-    on the mic signal."""
-    from src.pipeline import make_call_probe
+# ---------------------------------------------------------------------------
+# make_call_probe — "is a call happening right now?"
+#
+# This used to be gated on detection.mic_activation, which coupled the
+# transcription deferral to browser *detection*: turning detection off
+# silently disabled deferral too. The corroborating signal is now a running
+# meeting app, which is what "a call is happening" actually means.
+# ---------------------------------------------------------------------------
+def _probe_cfg(**extra) -> Config:
+    detection = {
+        "process_monitor": {
+            "whitelisted_apps": ["zoom.us", "Microsoft Teams"],
+            "blacklisted_apps": ["SuperWhisper"],
+        }
+    }
+    detection.update(extra)
+    return Config({"detection": detection})
 
-    cfg = Config({"detection": {"mic_activation": {"enabled": False}}})
-    probe = make_call_probe(cfg)
-    assert probe() is False
+
+def test_call_probe_needs_both_mic_and_a_meeting_app(monkeypatch) -> None:
+    import src.pipeline as pipeline
+
+    monkeypatch.setattr(
+        "src.audio.coreaudio_probe.is_default_input_running", lambda: True
+    )
+    monkeypatch.setattr(pipeline, "meeting_app_running", lambda w, b=None: True)
+    assert pipeline.make_call_probe(_probe_cfg())() is True
+
+
+def test_mic_in_use_without_a_meeting_app_is_not_a_call(monkeypatch) -> None:
+    """A dictation tool holds the mic open indefinitely; that must not defer
+    every transcription to the two-hour cap."""
+    import src.pipeline as pipeline
+
+    monkeypatch.setattr(
+        "src.audio.coreaudio_probe.is_default_input_running", lambda: True
+    )
+    monkeypatch.setattr(pipeline, "meeting_app_running", lambda w, b=None: False)
+    assert pipeline.make_call_probe(_probe_cfg())() is False
+
+
+def test_no_mic_means_no_call_regardless_of_apps(monkeypatch) -> None:
+    import src.pipeline as pipeline
+
+    monkeypatch.setattr(
+        "src.audio.coreaudio_probe.is_default_input_running", lambda: False
+    )
+    monkeypatch.setattr(pipeline, "meeting_app_running", lambda w, b=None: True)
+    assert pipeline.make_call_probe(_probe_cfg())() is False
+
+
+def test_empty_whitelist_falls_back_to_the_raw_mic_signal(monkeypatch) -> None:
+    """Nothing to corroborate against — better to defer than never defer."""
+    import src.pipeline as pipeline
+
+    monkeypatch.setattr(
+        "src.audio.coreaudio_probe.is_default_input_running", lambda: True
+    )
+    cfg = Config({"detection": {"process_monitor": {"whitelisted_apps": []}}})
+    assert pipeline.make_call_probe(cfg)() is True
+
+
+def test_deferral_survives_removal_of_mic_activation(monkeypatch) -> None:
+    """Regression: a leftover mic_activation key in ~/.otis/config.yaml must
+    no longer switch the deferral off."""
+    import src.pipeline as pipeline
+
+    monkeypatch.setattr(
+        "src.audio.coreaudio_probe.is_default_input_running", lambda: True
+    )
+    monkeypatch.setattr(pipeline, "meeting_app_running", lambda w, b=None: True)
+    cfg = _probe_cfg(mic_activation={"enabled": False})
+    assert pipeline.make_call_probe(cfg)() is True
+
+
+def test_meeting_app_running_matches_and_respects_the_blacklist(monkeypatch) -> None:
+    import src.pipeline as pipeline
+
+    class FakeProc:
+        def __init__(self, name):
+            self.info = {"name": name}
+
+    def fake_iter(_attrs):
+        return [FakeProc("SuperWhisper"), FakeProc("searchpartyd")]
+
+    import psutil
+
+    monkeypatch.setattr(psutil, "process_iter", fake_iter)
+    # SuperWhisper is blacklisted and searchpartyd is a phantom 'arc' match.
+    assert pipeline.meeting_app_running(["zoom.us", "arc"], ["SuperWhisper"]) is False
+
+    monkeypatch.setattr(psutil, "process_iter", lambda _a: [FakeProc("zoom.us")])
+    assert pipeline.meeting_app_running(["zoom.us"], ["SuperWhisper"]) is True

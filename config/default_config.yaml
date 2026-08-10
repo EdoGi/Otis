@@ -48,14 +48,12 @@ detection:
         token_path: "~/.otis/google_token_work.json"
         calendar_ids:
           - "primary"
-  # Treat any running browser as a meeting whenever the default mic is in use.
-  # OFF by default: detection is calendar-first. This heuristic produced 398
-  # phantom "Meeting detected" alerts against 8 real recordings — every browser
-  # counted the moment a dictation tool touched the mic, and Otis's own
-  # recorder holding the mic could re-trigger a recording in `otis run`.
-  # Browser calls (Meet, Whereby) are started with Start Recording instead.
-  mic_activation:
-    enabled: false
+  # NOTE: `detection.mic_activation` was removed. It promoted any running
+  # browser to "in a meeting" whenever the default mic was in use, which
+  # produced 398 phantom alerts against 8 real recordings. Detection is now
+  # calendar-first; browser calls (Meet, Whereby) are started with Start
+  # Recording. A leftover mic_activation block in ~/.otis/config.yaml is
+  # simply ignored.
 
 transcription:
   model: "small"  # tiny, base, small, medium, large-v3

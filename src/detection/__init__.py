@@ -8,10 +8,9 @@ from src.detection.calendar_poller import (
     parse_event,
 )
 from src.detection.detector import MeetingContext, MeetingDetector, MeetingState
-from src.detection.process_monitor import DEFAULT_BROWSER_APPS, ProcessMonitor
+from src.detection.process_monitor import ProcessMonitor
 
 __all__ = [
-    "DEFAULT_BROWSER_APPS",
     "CalendarAuthError",
     "CalendarEvent",
     "GoogleCalendarPoller",

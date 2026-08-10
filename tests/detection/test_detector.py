@@ -651,7 +651,6 @@ def test_real_process_monitor_can_attach() -> None:
     real_pm = ProcessMonitor(
         whitelisted_apps=["zoom.us"],
         process_iter=lambda: iter([]),
-        mic_probe=lambda: False,
     )
     detector = MeetingDetector(
         process_monitor=real_pm,

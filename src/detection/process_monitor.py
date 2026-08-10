@@ -1,10 +1,14 @@
 """Process-based meeting detection.
 
 Polls running processes against a configurable whitelist (Zoom, Teams, …) and a
-blacklist (e.g. SuperWhisper) on a background thread. For browser-based
-meetings (Google Meet, Teams web, etc.) we additionally consult CoreAudio: a
-whitelisted browser only counts as "in a meeting" while the default microphone
-is in use.
+blacklist (e.g. SuperWhisper) on a background thread.
+
+Detection is deliberately calendar-first. An earlier version also promoted any
+running *browser* to "in a meeting" whenever the default microphone was in use,
+which produced 398 phantom detections against 8 real recordings: Apple's
+always-running daemons matched the browser names by substring, and any mic use
+at all — dictation, a call, or Otis's own recorder — armed the heuristic. That
+path is gone. Browser calls (Meet, Whereby) are started with Start Recording.
 
 Events:
     on_meeting_detected(callback)   -- fired with the matched app name
@@ -55,23 +59,9 @@ def app_name_matches(entry: str, process_name: str) -> bool:
         return True
     return _boundary_pattern(entry).search(name) is not None
 
-# Browser process names we recognise. The presence of one of these is not
-# enough on its own — we additionally require the default mic to be active.
-DEFAULT_BROWSER_APPS: tuple[str, ...] = (
-    "Google Chrome",
-    "Chromium",
-    "Safari",
-    "Firefox",
-    "Arc",
-    "Microsoft Edge",
-    "Brave Browser",
-    "Vivaldi",
-)
-
 # Type aliases for clarity.
 DetectedCallback = Callable[[str], None]
 EndedCallback = Callable[[str], None]
-MicProbe = Callable[[], bool]
 ProcessIter = Callable[[], Iterable[dict[str, Any]]]
 
 
@@ -103,14 +93,6 @@ class ProcessMonitor:
         Window during which a re-detection of the same app does *not* fire a
         new ``meeting_detected`` event (default 30 s). Prevents Zoom restarts
         from spamming listeners.
-    browser_apps:
-        Process names treated as browsers — only fire when their mic is also
-        active. Defaults to :data:`DEFAULT_BROWSER_APPS`.
-    mic_probe:
-        Callable returning ``True`` while some process is capturing from the
-        default input device. Defaults to a CoreAudio query via
-        :func:`src.audio.coreaudio_probe.is_default_input_running`.
-        Override in tests.
     process_iter:
         Callable returning an iterable of ``{"pid", "name"}`` dicts. Defaults
         to ``psutil.process_iter``. Override in tests.
@@ -123,25 +105,13 @@ class ProcessMonitor:
         blacklisted_apps: Iterable[str] = (),
         poll_interval_seconds: float = 5.0,
         debounce_seconds: float = 30.0,
-        browser_apps: Iterable[str] | None = None,
-        mic_probe: MicProbe | None = None,
         process_iter: ProcessIter | None = None,
-        mic_activation_enabled: bool = True,
     ) -> None:
         self._whitelist = [w.lower() for w in whitelisted_apps]
         self._blacklist = [b.lower() for b in blacklisted_apps]
         self._poll_interval = float(poll_interval_seconds)
         self._debounce = float(debounce_seconds)
-        self._browser_apps_lower = [
-            b.lower() for b in (browser_apps if browser_apps is not None else DEFAULT_BROWSER_APPS)
-        ]
-        self._mic_probe = mic_probe or _default_mic_probe
         self._process_iter = process_iter or _default_process_iter
-        # When False, browsers are NEVER promoted to "in a meeting" — useful
-        # when a dictation tool (e.g. SuperWhisper) keeps the default mic open
-        # continuously, which would otherwise make every running browser look
-        # like a meeting in progress.
-        self._mic_activation_enabled = bool(mic_activation_enabled)
 
         self._on_detected: list[DetectedCallback] = []
         self._on_ended: list[EndedCallback] = []
@@ -218,8 +188,6 @@ class ProcessMonitor:
 
         names_seen: set[str] = set()
         pids_by_name: dict[str, set[int]] = {}
-        browser_names_seen: set[str] = set()
-        browser_pids: dict[str, set[int]] = {}
 
         for proc in processes:
             try:
@@ -239,38 +207,6 @@ class ProcessMonitor:
                     if pid is not None:
                         pids_by_name[white].add(int(pid))
                     break
-            for bro in self._browser_apps_lower:
-                if app_name_matches(bro, lname):
-                    browser_names_seen.add(bro)
-                    browser_pids.setdefault(bro, set())
-                    if pid is not None:
-                        browser_pids[bro].add(int(pid))
-                    break
-
-        # Browsers only count if the default mic is currently in use — and
-        # only if mic-based activation is enabled. The user can disable it
-        # when a dictation tool (e.g. SuperWhisper) keeps the mic permanently
-        # open and would otherwise make every browser look like a meeting.
-        if browser_names_seen and not self._mic_activation_enabled:
-            logger.debug(
-                "Browser(s) running but mic_activation disabled; skipping: %s",
-                sorted(browser_names_seen),
-            )
-        elif browser_names_seen:
-            try:
-                mic_in_use = bool(self._mic_probe())
-            except Exception as exc:
-                logger.warning("Mic probe raised %s; treating mic as inactive.", exc)
-                mic_in_use = False
-            if mic_in_use:
-                for bname in browser_names_seen:
-                    names_seen.add(bname)
-                    pids_by_name.setdefault(bname, set()).update(browser_pids.get(bname, set()))
-            else:
-                logger.debug(
-                    "Browser(s) running but mic is idle; skipping: %s",
-                    sorted(browser_names_seen),
-                )
 
         self._reconcile(names_seen, pids_by_name)
         return names_seen
@@ -341,19 +277,6 @@ class ProcessMonitor:
 # Defaults — kept as module-level functions so tests can swap them via
 # constructor injection rather than monkey-patching.
 # ============================================================================
-def _default_mic_probe() -> bool:
-    try:
-        from src.audio.coreaudio_probe import is_default_input_running
-
-        return is_default_input_running()
-    except Exception as exc:  # pragma: no cover
-        logger.warning(
-            "Default mic probe unavailable (%s); browser-based meetings won't be detected.",
-            exc,
-        )
-        return False
-
-
 def _default_process_iter() -> Iterable[dict[str, Any]]:
     """Yield dicts with ``pid`` and ``name`` for every visible process."""
     import psutil
