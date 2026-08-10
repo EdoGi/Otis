@@ -25,6 +25,7 @@ Design notes
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import queue
@@ -62,6 +63,15 @@ logger = logging.getLogger(__name__)
 # capture latency is irrelevant — only power matters.
 CAPTURE_BLOCKSIZE_FRAMES = 4096
 CAPTURE_LATENCY = "high"
+
+#: Bytes in one capture block (mono int16). The unit the two streams drift by.
+CAPTURE_BLOCK_BYTES = CAPTURE_BLOCKSIZE_FRAMES * 2
+
+#: Seconds of audio the capture queue may buffer before dropping blocks.
+#: Unbounded before: a writer that was merely *slow* (Time Machine, Spotlight,
+#: a network volume) grew the queue at 32 KB/s per stream for the whole
+#: meeting. The drop-on-full handler already existed but could never fire.
+CAPTURE_QUEUE_SECONDS = 30.0
 
 
 class RecorderState(str, Enum):
@@ -101,6 +111,8 @@ class _StreamState:
     error: Exception | None = None
     #: Live signal level + sustained-silence detector. Set in _open_stream.
     meter: Any = None
+    #: Capture blocks discarded because the writer fell too far behind.
+    dropped_blocks: int = 0
 
 
 class DualStreamRecorder:
@@ -251,13 +263,40 @@ class DualStreamRecorder:
 
             try:
                 self._open_stream(self._mic_state)
-                if self._system_state is not None:
-                    self._open_stream(self._system_state)
             except Exception:
                 # Roll back any partially opened resources before re-raising.
                 self._teardown_streams()
                 self._state = RecorderState.ERROR
                 raise
+
+            # The system stream opens separately and is allowed to fail. It
+            # used to share the mic's try-block, so any PaError from BlackHole
+            # — device busy, sample-rate refusal, driver wedged after a sleep —
+            # tore down the mic recording too. That defeated the whole point of
+            # the graceful-degradation path below: mic-only is a usable
+            # recording, no recording is not.
+            if self._system_state is not None:
+                try:
+                    self._open_stream(self._system_state)
+                except Exception as exc:
+                    logger.warning(
+                        "System audio stream failed to open (%s); recording "
+                        "mic-only. System audio will be missing from this "
+                        "transcript.", exc,
+                    )
+                    self._system_state = None
+                    try:
+                        report_stream_health(
+                            "system", silent=True,
+                            detail=f"capture device would not open: {exc}",
+                        )
+                    except Exception:  # pragma: no cover (defensive)
+                        logger.exception("Could not report system-stream failure")
+                    if self._on_device_error is not None:
+                        try:
+                            self._on_device_error("system", exc)
+                        except Exception:  # pragma: no cover
+                            logger.exception("on_device_error callback raised")
 
             self._state = RecorderState.RECORDING
             if self._observe_sleep_wake:
@@ -404,6 +443,16 @@ class DualStreamRecorder:
             raise DeviceNotFoundError(f"Device index {spec} out of range.")
         return self._device_manager.require(spec, input_only=True)
 
+    def _queue_maxsize(self) -> int:
+        """Blocks of headroom before the callback starts dropping audio.
+
+        Sized in seconds so it doesn't silently change with the block size.
+        Dropping a block is bad; growing without bound until the machine
+        swaps, during a meeting, is worse.
+        """
+        blocks_per_second = self._sample_rate / CAPTURE_BLOCKSIZE_FRAMES
+        return max(8, int(CAPTURE_QUEUE_SECONDS * blocks_per_second))
+
     # ------------------------------------------------------------- metering
     def _make_meter(self, label: str) -> LevelMonitor:
         """Build the level monitor for one stream, wired to the health panel."""
@@ -458,7 +507,7 @@ class DualStreamRecorder:
         """Open a sounddevice InputStream and start the writer thread."""
         import sounddevice as sd
 
-        st.queue = queue.Queue()
+        st.queue = queue.Queue(maxsize=self._queue_maxsize())
         st.bytes_written = 0
         st.start_monotonic = None
         st.error = None
@@ -484,8 +533,18 @@ class DualStreamRecorder:
             try:
                 # ``indata`` is int16 because we requested dtype="int16".
                 st.queue.put_nowait(bytes(indata))
-            except queue.Full:  # pragma: no cover (queue is unbounded)
-                logger.error("[%s] queue full; dropping %d frames", st.label, frames)
+            except queue.Full:
+                # The queue is bounded now, so this path is live: the writer
+                # has fallen more than CAPTURE_QUEUE_SECONDS behind. Drop the
+                # block rather than growing memory for the rest of the meeting,
+                # and say so once instead of per block.
+                st.dropped_blocks += 1
+                if st.dropped_blocks == 1:
+                    logger.error(
+                        "[%s] capture queue full after %.0fs of buffering; "
+                        "dropping audio. The disk can't keep up.",
+                        st.label, CAPTURE_QUEUE_SECONDS,
+                    )
 
         try:
             st.stream = sd.InputStream(
@@ -528,22 +587,79 @@ class DualStreamRecorder:
                         st.start_monotonic = time.monotonic()
                     wf.writeframes(chunk)
                     st.bytes_written += len(chunk)
-        except Exception as exc:  # pragma: no cover (disk failures)
+        except Exception as exc:
             logger.exception("[%s] writer thread crashed: %s", st.label, exc)
             st.error = exc
+            # The recorder used to stay in RECORDING after this: the UI kept
+            # showing a live session, the callback silently dropped every
+            # subsequent frame, and stop() wrote metadata with bytes_written
+            # frozen at whatever got through. You could record a full meeting
+            # and find three minutes of audio. Mark the failure in the state
+            # machine so the truth is visible while it's still actionable.
+            self._note_writer_failure(st, exc)
             if self._on_device_error is not None:
                 try:
                     self._on_device_error(st.label, exc)
                 except Exception:
                     logger.exception("on_device_error callback raised")
 
+    def _note_writer_failure(self, st: _StreamState, exc: BaseException) -> None:
+        """Report a dead writer to the health panel; degrade state if total."""
+        detail = f"{st.label} write failed: {exc}"
+        if _looks_like_disk_full(exc):
+            detail = f"{st.label} stopped — the disk is full"
+        try:
+            report_stream_health(st.label, silent=True, detail=detail)
+        except Exception:  # pragma: no cover (defensive)
+            logger.exception("Could not report writer failure to health")
+
+        # If every stream's writer is dead there is nothing left to capture.
+        others = [
+            s for s in (self._mic_state, self._system_state)
+            if s is not None and s is not st
+        ]
+        if any(s.error is None for s in others):
+            return
+        with self._state_lock:
+            if self._state == RecorderState.RECORDING:
+                logger.error(
+                    "All capture writers have failed; leaving RECORDING so the "
+                    "UI stops claiming a recording is in progress."
+                )
+                self._state = RecorderState.ERROR
+
     def _teardown_streams(self) -> None:
-        for st in (self._mic_state, self._system_state):
-            if st is None:
-                continue
+        """Stop both streams together, then close, then drain.
+
+        This used to run stop()+close() fully for the mic before touching the
+        system stream — so the system stream kept capturing for the whole
+        duration of the mic's teardown, and the two files ended up different
+        lengths. Every real session on this machine showed the delta as an
+        exact multiple of one capture block, and three of four were desynced:
+
+            2026-07-17  +1 block      2026-07-20  +1 block
+            2026-08-07  +2 blocks     2026-07-22   0
+
+        Commit 973f440 raised the block size from ~9 ms to 256 ms for the CPU
+        win, which multiplied the error ~28x without adding a barrier. Stopping
+        both streams first collapses the window to the gap between two stop()
+        calls instead of a whole stop-and-close cycle.
+        """
+        streams = [st for st in (self._mic_state, self._system_state) if st is not None]
+
+        # Phase 1 — halt capture on every stream before doing slower work on
+        # any of them. This is the barrier that keeps the two files aligned.
+        for st in streams:
             try:
                 if st.stream is not None:
                     st.stream.stop()
+            except Exception as exc:  # pragma: no cover
+                logger.warning("[%s] error stopping stream: %s", st.label, exc)
+
+        # Phase 2 — now the slow part, with no capture still running.
+        for st in streams:
+            try:
+                if st.stream is not None:
                     st.stream.close()
             except Exception as exc:  # pragma: no cover
                 logger.warning("[%s] error closing stream: %s", st.label, exc)
@@ -551,12 +667,38 @@ class DualStreamRecorder:
                 st.stream = None
             # Signal writer to drain remaining queue and exit.
             st.queue.put_nowait(None)
-        for st in (self._mic_state, self._system_state):
-            if st is None or st.writer_thread is None:
+
+        for st in streams:
+            if st.writer_thread is None:
                 continue
             st.writer_thread.join(timeout=5.0)
             if st.writer_thread.is_alive():  # pragma: no cover
                 logger.error("[%s] writer thread did not exit", st.label)
+
+        self._warn_if_streams_desynced()
+
+    def _warn_if_streams_desynced(self) -> None:
+        """Surface a cross-stream length mismatch instead of shipping it.
+
+        The alignment step applies a single constant offset, so it cannot
+        correct a drift that appears at teardown. Nothing checked this before,
+        which is why the regression went unnoticed through a release.
+        """
+        mic, sys_st = self._mic_state, self._system_state
+        if mic is None or sys_st is None:
+            return
+        if not mic.bytes_written or not sys_st.bytes_written:
+            return
+        delta = abs(mic.bytes_written - sys_st.bytes_written)
+        if delta <= CAPTURE_BLOCK_BYTES:
+            return
+        blocks = delta / CAPTURE_BLOCK_BYTES
+        seconds = delta / (self._sample_rate * self.SAMPLE_WIDTH_BYTES)
+        logger.warning(
+            "Streams ended %d bytes apart (%.1f blocks, %.0f ms): mic=%d system=%d. "
+            "Transcript alignment may drift.",
+            delta, blocks, seconds * 1000, mic.bytes_written, sys_st.bytes_written,
+        )
 
     def _write_metadata(self) -> dict[str, Any]:
         assert self._mic_state is not None
@@ -628,6 +770,14 @@ class DualStreamRecorder:
 # ============================================================================
 # Sleep/wake observer (pyobjc-backed; degrades to no-op if unavailable)
 # ============================================================================
+def _looks_like_disk_full(exc: BaseException) -> bool:
+    """True for ENOSPC, however the OS phrased it."""
+    if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
+        return True
+    text = str(exc).lower()
+    return "no space left" in text or "enospc" in text
+
+
 class _SleepWakeObserver:
     """Listens for ``NSWorkspaceWillSleepNotification`` / ``DidWakeNotification``.
 
