@@ -41,7 +41,7 @@ def _clean_health():
 
 
 @pytest.fixture()
-def recorder(tmp_path: Path, fake_sounddevice) -> DualStreamRecorder:  # noqa: ARG001
+def recorder(tmp_path: Path, fake_sounddevice) -> DualStreamRecorder:
     return DualStreamRecorder(audio_dir=tmp_path / "audio", observe_sleep_wake=False)
 
 
@@ -189,7 +189,7 @@ def test_disk_full_detection(exc: BaseException, expected: bool) -> None:
 # ---------------------------------------------------------------------------
 # B7 — BlackHole failure must not kill the mic
 # ---------------------------------------------------------------------------
-def test_system_stream_failure_degrades_to_mic_only(tmp_path, fake_sounddevice) -> None:  # noqa: ARG001
+def test_system_stream_failure_degrades_to_mic_only(tmp_path, fake_sounddevice) -> None:
     rec = DualStreamRecorder(audio_dir=tmp_path / "audio", observe_sleep_wake=False)
     real_open = rec._open_stream
 
@@ -210,7 +210,7 @@ def test_system_stream_failure_degrades_to_mic_only(tmp_path, fake_sounddevice) 
     assert Path(metadata["mic_wav"]).name.endswith("_mic.wav")
 
 
-def test_system_stream_failure_notifies(tmp_path, fake_sounddevice) -> None:  # noqa: ARG001
+def test_system_stream_failure_notifies(tmp_path, fake_sounddevice) -> None:
     errors: list[tuple[str, Exception]] = []
     rec = DualStreamRecorder(
         audio_dir=tmp_path / "audio",
@@ -231,7 +231,7 @@ def test_system_stream_failure_notifies(tmp_path, fake_sounddevice) -> None:  # 
     assert errors and errors[0][0] == "system"
 
 
-def test_mic_failure_still_aborts_the_session(tmp_path, fake_sounddevice) -> None:  # noqa: ARG001
+def test_mic_failure_still_aborts_the_session(tmp_path, fake_sounddevice) -> None:
     """Mic-only is a usable recording; system-only is not what was asked for."""
     rec = DualStreamRecorder(audio_dir=tmp_path / "audio", observe_sleep_wake=False)
 

@@ -481,7 +481,7 @@ class DualStreamRecorder:
 
     @property
     def levels(self) -> dict[str, float]:
-        """Current smoothed input level per stream, 0.0–1.0 (for the menu)."""
+        """Current smoothed input level per stream, 0.0-1.0 (for the menu)."""
         out: dict[str, float] = {}
         for st in (self._mic_state, self._system_state):
             if st is not None and st.meter is not None:
