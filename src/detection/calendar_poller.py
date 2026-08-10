@@ -102,6 +102,9 @@ HTTP_TIMEOUT_SECONDS = 10.0
 #: instead of failing the whole poll cycle.
 API_RETRIES = 3
 
+#: Ceiling for the poll-loop backoff when the calendar is unreachable.
+MAX_BACKOFF_SECONDS = 600.0
+
 #: Safety valve on nextPageToken following, so a pathological calendar can't
 #: spin the poll thread indefinitely. 250 events/page.
 MAX_EVENT_PAGES = 8
@@ -157,6 +160,11 @@ class GoogleCalendarPoller:
         # minute for three months — 2 309 lines, 45% of the log file, and not
         # one of them reached the user.
         self._auth_failure_announced = False
+        # Set by fetch_today_events so the poll loop can actually back off.
+        self._last_cycle_failed = False
+        # Threads that outlived their stop() join. Tracked so a wedged
+        # poller can't be silently duplicated on the next start().
+        self._lingering: list[threading.Thread] = []
 
     # =====================================================================
     # Public API
@@ -173,6 +181,19 @@ class GoogleCalendarPoller:
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
+            return
+        # A thread that outlived its stop() join used to be forgotten (stop()
+        # set _thread = None regardless), so every off-hours cycle could stack
+        # another poller — each holding its own socket — on top of a wedged
+        # one. With an HTTP timeout in place a stuck thread now exits within
+        # seconds, so refusing to double up is safe and self-healing.
+        self._prune_lingering()
+        if self._lingering:
+            logger.warning(
+                "Not starting a second calendar poller: %d previous thread(s) "
+                "still finishing. Will start on the next attempt.",
+                len(self._lingering),
+            )
             return
         # Fresh event per run: a previous thread that's still finishing a
         # blocking network call keeps its own (already-set) event and exits
@@ -208,7 +229,14 @@ class GoogleCalendarPoller:
                     "Calendar poller still finishing its last cycle; "
                     "it will exit on its own."
                 )
+                # Remember it, so start() knows not to stack another poller
+                # on top while this one is still holding a socket.
+                self._lingering.append(thread)
             self._thread = None
+        self._prune_lingering()
+
+    def _prune_lingering(self) -> None:
+        self._lingering = [t for t in self._lingering if t.is_alive()]
 
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
@@ -382,10 +410,12 @@ class GoogleCalendarPoller:
         except CalendarAuthError as exc:
             self._announce_auth_failure(str(exc))
             self._service = None
+            self._last_cycle_failed = True
             return []
         except Exception as exc:
             logger.warning("Calendar service build failed: %s", exc)
             self._service = None
+            self._last_cycle_failed = True
             return []
 
         start_of_day, end_of_day = local_day_bounds(self._now())
@@ -420,6 +450,7 @@ class GoogleCalendarPoller:
             )
             self._service = None
 
+        self._last_cycle_failed = bool(failed_calendars)
         events.sort(key=lambda e: e.start)
         return events
 
@@ -485,10 +516,20 @@ class GoogleCalendarPoller:
         while not stop_event.is_set():
             try:
                 self._poll_cycle()
-                backoff = self._poll_interval
+                # The backoff used to grow only when _poll_cycle *raised* — but
+                # fetch_today_events swallows every exception, so it never did,
+                # and an offline laptop retried at full rate: 8 hours away from
+                # the network cost ~960 doomed requests per account and twice
+                # that in warning lines. Failures are now reported rather than
+                # inferred from an exception that never arrives.
+                if self._last_cycle_failed:
+                    backoff = min(max(backoff * 2, self._poll_interval), MAX_BACKOFF_SECONDS)
+                    logger.debug("Calendar fetch failed; backing off to %.0fs.", backoff)
+                else:
+                    backoff = self._poll_interval
             except Exception:  # pragma: no cover (defensive)
                 logger.exception("Calendar poll cycle crashed; backing off.")
-                backoff = min(backoff * 2, 600.0)
+                backoff = min(max(backoff * 2, self._poll_interval), MAX_BACKOFF_SECONDS)
             stop_event.wait(backoff)
         logger.info("GoogleCalendarPoller stopped.")
 
