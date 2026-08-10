@@ -193,15 +193,22 @@ class ProcessMonitor:
             try:
                 name = proc.get("name") if isinstance(proc, dict) else None
                 pid = proc.get("pid") if isinstance(proc, dict) else None
+                bundle_id = proc.get("bundle_id") if isinstance(proc, dict) else None
             except Exception:  # pragma: no cover
                 continue
             if not name:
                 continue
-            lname = name.lower()
-            if any(app_name_matches(b, lname) for b in self._blacklist):
+            # NSWorkspace reports *localized* names ("Aperçu", "Accessibilité"),
+            # so a whitelist entry is matched against the bundle id as well.
+            # That lets "us.zoom.xos" work on any language of macOS.
+            identifiers = [name.lower()]
+            if bundle_id:
+                identifiers.append(str(bundle_id).lower())
+
+            if any(app_name_matches(b, i) for b in self._blacklist for i in identifiers):
                 continue
             for white in self._whitelist:
-                if app_name_matches(white, lname):
+                if any(app_name_matches(white, i) for i in identifiers):
                     names_seen.add(white)
                     pids_by_name.setdefault(white, set())
                     if pid is not None:
@@ -278,7 +285,56 @@ class ProcessMonitor:
 # constructor injection rather than monkey-patching.
 # ============================================================================
 def _default_process_iter() -> Iterable[dict[str, Any]]:
-    """Yield dicts with ``pid`` and ``name`` for every visible process."""
+    """Applications currently running, as ``{"pid", "name", "bundle_id"}`` dicts.
+
+    Prefers ``NSWorkspace.runningApplications()`` over ``psutil``. Measured on
+    this Mac: **0.58 ms for 93 apps versus 24.8 ms for 571 processes** — a 43x
+    saving on a call made every 5 s, all day.
+
+    The reason psutil was so expensive is subtle: ``Process.name()`` falls back
+    to ``cmdline()`` whenever the name is 15+ characters, and that is a second
+    sysctl copying the target's whole argv and environment. 261 of 571
+    processes here qualified, so each poll paid ~830 syscalls.
+
+    NSWorkspace is also *more correct* for this job. It reports applications,
+    not every process, so the Apple daemons that produced the phantom
+    detections — searchpartyd, TrialArchivingService, SafariWidgetExtension —
+    do not appear at all.
+    """
+    apps = _nsworkspace_apps()
+    if apps is not None:
+        return apps
+    return _psutil_processes()
+
+
+def _nsworkspace_apps() -> list[dict[str, Any]] | None:
+    """Running applications via AppKit, or ``None`` if unavailable."""
+    try:
+        from AppKit import NSWorkspace
+    except Exception:  # pragma: no cover (non-macOS / pyobjc missing)
+        return None
+    try:
+        out: list[dict[str, Any]] = []
+        for app in NSWorkspace.sharedWorkspace().runningApplications():
+            name = app.localizedName()
+            if not name:
+                continue
+            out.append({
+                "pid": int(app.processIdentifier()),
+                "name": str(name),
+                # Names are localized ("Aperçu", "Accessibilité"), so a bundle
+                # id is the locale-proof way to whitelist an app.
+                "bundle_id": str(app.bundleIdentifier() or ""),
+            })
+        return out
+    except Exception:  # pragma: no cover (AppKit hiccup)
+        logger.warning("NSWorkspace enumeration failed; falling back to psutil.",
+                       exc_info=True)
+        return None
+
+
+def _psutil_processes() -> Iterable[dict[str, Any]]:
+    """Fallback source: every visible process. Slower, but always available."""
     import psutil
 
     for proc in psutil.process_iter(attrs=["pid", "name"]):
