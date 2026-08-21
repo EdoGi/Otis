@@ -92,6 +92,17 @@ class RecorderState(str, Enum):
     ERROR = "error"
 
 
+class DeviceOpenError(RuntimeError):
+    """A capture device refused to open, for a reason that isn't permissions.
+
+    Previously any PaError whose text happened to contain "denied" was reported
+    as a microphone-permission problem, sending the user to System Settings to
+    fix something that wasn't broken. Everything else propagated as a bare
+    PaError with no mention of which device, rate or channel count was
+    involved.
+    """
+
+
 class PermissionDeniedError(RuntimeError):
     """Raised when macOS denies microphone access."""
 
@@ -549,7 +560,7 @@ class DualStreamRecorder:
 
         block_seconds = CAPTURE_BLOCKSIZE_FRAMES / float(self._sample_rate)
 
-        def callback(indata: "np.ndarray", frames: int, time_info: Any, status: Any) -> None:  # noqa: ARG001
+        def callback(indata: np.ndarray, frames: int, time_info: Any, status: Any) -> None:
             if status:
                 # Non-fatal warnings (input_overflow etc.) — log but keep going.
                 logger.warning("[%s] sounddevice status: %s", st.label, status)
@@ -694,7 +705,7 @@ class DualStreamRecorder:
     def _start_input_stream(self, st: _StreamState, sd: Any = None) -> None:
         """Create and start the InputStream for ``st``. Raises on failure."""
         if sd is None:
-            import sounddevice as sd  # noqa: PLC0415
+            import sounddevice as sd
         try:
             st.stream = sd.InputStream(
                 samplerate=self._sample_rate,
@@ -707,10 +718,12 @@ class DualStreamRecorder:
             )
             st.stream.start()
         except Exception as exc:  # pragma: no cover (depends on host)
-            msg = str(exc).lower()
-            if "permission" in msg or "denied" in msg or "not permitted" in msg:
+            if _is_permission_error(exc):
                 raise PermissionDeniedError(str(exc)) from exc
-            raise
+            raise DeviceOpenError(
+                f"Could not open {st.device.name!r} at "
+                f"{self._sample_rate} Hz / {self._channels}ch: {exc}"
+            ) from exc
 
     def _revive_stream(self, st: _StreamState) -> bool:
         """Rebuild a dead input stream in place. Returns True on success.
@@ -936,6 +949,52 @@ class DualStreamRecorder:
 # ============================================================================
 # Sleep/wake observer (pyobjc-backed; degrades to no-op if unavailable)
 # ============================================================================
+#: PortAudio error text that genuinely means "macOS denied microphone access".
+#: Matching on the bare word "denied" also caught unrelated failures and
+#: reported them as a permissions problem, sending the user to System Settings
+#: to fix something that wasn't broken.
+_PERMISSION_MARKERS = (
+    "permission denied",
+    "not permitted",
+    "microphone access",
+    "access denied",
+)
+
+
+def _is_permission_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return any(marker in text for marker in _PERMISSION_MARKERS)
+
+
+def _warn_if_device_cannot_do(device: Any, sample_rate: int, channels: int) -> None:
+    """Log when a device's declared capabilities don't match what we request.
+
+    CoreAudio usually resamples 48 kHz down to 16 kHz transparently, and this
+    is deliberately a warning rather than a refusal — the capability table is
+    advisory and being wrong about it should never stop a recording. But when
+    an open *does* fail, having said this first turns an opaque PaError into
+    something diagnosable.
+
+    Channel count is the one that quietly costs data: BlackHole 2ch reports two
+    input channels and we open it as mono, and whether CoreAudio downmixes or
+    just takes channel 0 is host-dependent. If it takes channel 0, a source
+    panned right is lost with no error anywhere.
+    """
+    max_channels = getattr(device, "max_input_channels", None)
+    if isinstance(max_channels, int) and max_channels and channels > max_channels:
+        logger.warning(
+            "%r reports %d input channel(s) but %d were requested; "
+            "the open will probably fail.",
+            device.name, max_channels, channels,
+        )
+    declared = getattr(device, "default_sample_rate", None)
+    if isinstance(declared, (int, float)) and declared and abs(declared - sample_rate) > 1:
+        logger.debug(
+            "%r runs natively at %.0f Hz; requesting %d Hz (CoreAudio resamples).",
+            device.name, declared, sample_rate,
+        )
+
+
 def _capture_timestamp(time_info: Any) -> float:
     """When the first sample of this block was actually captured, in seconds.
 
@@ -1010,7 +1069,9 @@ class _SleepWakeObserver:
 
     def start(self) -> bool:
         try:
-            # Imported here so non-macOS environments don't blow up at import time.
+            # Imported here so non-macOS environments don't blow up at import
+            # time. These are availability probes — the real imports happen on
+            # the observer thread — so they are deliberately unused.
             import objc  # noqa: F401
             from AppKit import NSWorkspace  # noqa: F401
             from Foundation import NSObject  # noqa: F401
@@ -1039,13 +1100,13 @@ class _SleepWakeObserver:
         on_wake = self._on_wake
 
         class _Bridge(NSObject):
-            def workspaceWillSleep_(self, _notification):  # noqa: N802
+            def workspaceWillSleep_(self, _notification):
                 try:
                     on_sleep()
                 except Exception:
                     logger.exception("on_sleep handler raised")
 
-            def workspaceDidWake_(self, _notification):  # noqa: N802
+            def workspaceDidWake_(self, _notification):
                 try:
                     on_wake()
                 except Exception:
