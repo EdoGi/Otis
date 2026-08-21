@@ -279,3 +279,64 @@ def test_daemon_retries_when_detection_declined_to_start() -> None:
     daemon._apply_schedule()
     assert daemon._detector_started is True, "the next tick must retry"
     assert det.attempts == 2
+
+
+# ---------------------------------------------------------------------------
+# Transcripts must not advertise audio that isn't there
+# ---------------------------------------------------------------------------
+def test_reconciliation_corrects_a_transcript_whose_audio_is_gone(tmp_path: Path) -> None:
+    """audio_available is written at transcription time and flipped when
+    retention deletes. Any gap between those leaves the transcript lying —
+    nine real transcripts on this machine claimed audio swept months earlier,
+    and both the web UI and the MCP server trust that flag."""
+    audio = tmp_path / "audio"; audio.mkdir()
+    store = TranscriptStore(tmp_path / "t")
+    fm = _fm("ghost")
+    fm["audio_files"] = {"mic": "2026/05/gone_mic.wav", "system": None}
+    store.save(fm, "# gone\n\nbody")
+
+    corrected = AudioRetentionManager(
+        audio_dir=audio, transcript_store=store, retention_days=30
+    ).reconcile_audio_availability()
+
+    assert corrected == ["ghost"]
+    reread = store.list_transcripts(limit=10)[0]
+    assert reread["audio_available"] is False
+
+
+def test_reconciliation_leaves_present_audio_alone(tmp_path: Path) -> None:
+    audio = tmp_path / "audio"; audio.mkdir()
+    store = TranscriptStore(tmp_path / "t")
+    _wav(audio / "2026" / "05" / "here_mic.wav")
+    fm = _fm("present")
+    fm["audio_files"] = {"mic": "2026/05/here_mic.wav", "system": None}
+    store.save(fm, "# here\n\nbody")
+
+    mgr = AudioRetentionManager(
+        audio_dir=audio, transcript_store=store, retention_days=30
+    )
+    assert mgr.reconcile_audio_availability() == []
+    assert store.list_transcripts(limit=10)[0]["audio_available"] is True
+
+
+def test_reconciliation_is_idempotent(tmp_path: Path) -> None:
+    audio = tmp_path / "audio"; audio.mkdir()
+    store = TranscriptStore(tmp_path / "t")
+    fm = _fm("ghost2")
+    fm["audio_files"] = {"mic": "2026/05/gone_mic.wav", "system": None}
+    store.save(fm, "# gone\n\nbody")
+    mgr = AudioRetentionManager(
+        audio_dir=audio, transcript_store=store, retention_days=30
+    )
+    assert mgr.reconcile_audio_availability() == ["ghost2"]
+    assert mgr.reconcile_audio_availability() == [], "must not rewrite every sweep"
+
+
+def test_a_transcript_with_no_recorded_paths_is_left_alone(tmp_path: Path) -> None:
+    """No paths means we cannot prove anything; guessing would be worse."""
+    audio = tmp_path / "audio"; audio.mkdir()
+    store = TranscriptStore(tmp_path / "t")
+    store.save(_fm("unknown"), "# x\n\nbody")   # audio_files are both None
+    assert AudioRetentionManager(
+        audio_dir=audio, transcript_store=store, retention_days=30
+    ).reconcile_audio_availability() == []

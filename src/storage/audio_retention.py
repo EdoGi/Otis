@@ -124,7 +124,7 @@ class AudioRetentionManager:
                 "Audio retention: nothing to delete in %s (retention=%d days).",
                 self._audio_dir, self._retention_days,
             )
-            return CleanupReport([], [], [])
+            return CleanupReport([], [], self.reconcile_audio_availability())
 
         # Audio is only expendable once a *successful* transcript exists. Until
         # then it is the sole copy of that meeting, and the failure placeholder
@@ -218,12 +218,63 @@ class AudioRetentionManager:
             "Audio retention: deleted %d file(s), updated %d transcript(s).",
             len(deleted), len(transcripts_marked),
         )
+        # Catch anything that slipped through earlier sweeps too.
+        for sid in self.reconcile_audio_availability():
+            if sid not in transcripts_marked:
+                transcripts_marked.append(sid)
+
         return CleanupReport(
             deleted_files=deleted,
             deleted_session_ids=list(session_ids),
             transcripts_marked=transcripts_marked,
             protected_session_ids=sorted(protected),
         )
+
+    def reconcile_audio_availability(self) -> list[str]:
+        """Fix transcripts that advertise audio which is no longer on disk.
+
+        ``audio_available`` is written at transcription time and flipped when
+        retention deletes the files — so any gap between those two events
+        leaves the transcript lying. On this machine nine transcripts claimed
+        audio that had been swept months earlier, and the web UI and MCP server
+        both believe that flag.
+
+        Cheap and idempotent: it only rewrites a transcript whose stored paths
+        genuinely resolve to nothing. Returns the session ids corrected.
+        """
+        if self._store is None:
+            return []
+        corrected: list[str] = []
+        try:
+            entries = self._store.list_transcripts(limit=10_000)
+        except Exception:
+            logger.exception("Could not list transcripts to reconcile audio state")
+            return []
+
+        for fm in entries:
+            if not fm.get("audio_available"):
+                continue
+            sid = fm.get("id")
+            if not sid:
+                continue
+            paths = [v for v in (fm.get("audio_files") or {}).values() if v]
+            # No paths recorded at all means we can't prove anything; leave it.
+            if not paths:
+                continue
+            if any((self._audio_dir / rel).exists() for rel in paths):
+                continue
+            try:
+                if self._store.mark_audio_unavailable(str(sid)) is not None:
+                    corrected.append(str(sid))
+            except Exception as exc:
+                logger.warning("Could not reconcile transcript %s: %s", sid, exc)
+
+        if corrected:
+            logger.info(
+                "Audio retention: corrected %d transcript(s) that still claimed "
+                "audio was available.", len(corrected),
+            )
+        return corrected
 
     def delete_audio(self, session_id: str) -> CleanupReport:
         """Manual delete: drop every audio artefact for ``session_id``."""
