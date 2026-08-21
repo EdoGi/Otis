@@ -10,10 +10,11 @@ Design notes
 * sounddevice ``InputStream`` callbacks must not block, so each callback only
   pushes raw bytes onto a ``queue.Queue``; a writer thread per stream drains
   the queue into the WAV file.
-* The first time the writer thread sees a non-empty buffer, it stamps
-  ``time.monotonic()`` into the session metadata. The ``mic_start`` and
-  ``system_start`` anchors will differ by a few hundred microseconds — that
-  delta is exactly what the merge step in Phase 4 needs.
+* The alignment anchor for each stream is stamped inside the audio callback,
+  from PortAudio's ``inputBufferAdcTime`` — the hardware capture time of the
+  block. The difference between the two anchors is what the merge step uses,
+  so it must not include Python scheduling: stamping it in the writer thread
+  put a queue hand-off and a GIL wake inside the measurement.
 * macOS sleep/wake is observed via ``NSWorkspace`` notifications running on a
   dedicated CFRunLoop thread. On sleep we pause; on wake we resume. The pause
   is logged in metadata. If pyobjc is unavailable (e.g. CI on Linux), the
@@ -523,6 +524,10 @@ class DualStreamRecorder:
                 return  # writer thread is dead; queueing would grow unbounded
             if not self._active.is_set():
                 return  # paused — drop frames
+            # Stamp the alignment anchor here, from the hardware capture time
+            # of this block's first sample. See _capture_timestamp.
+            if st.start_monotonic is None:
+                st.start_monotonic = _capture_timestamp(time_info)
             # Measure before queueing: this is the only place the samples are
             # seen live, and it's how a dead stream gets caught during the call
             # instead of after transcription two months later.
@@ -582,9 +587,6 @@ class DualStreamRecorder:
                     chunk = st.queue.get()
                     if chunk is None:
                         break
-                    if st.start_monotonic is None:
-                        # Stamp the first-real-audio anchor exactly here.
-                        st.start_monotonic = time.monotonic()
                     wf.writeframes(chunk)
                     st.bytes_written += len(chunk)
         except Exception as exc:
@@ -770,6 +772,51 @@ class DualStreamRecorder:
 # ============================================================================
 # Sleep/wake observer (pyobjc-backed; degrades to no-op if unavailable)
 # ============================================================================
+def _capture_timestamp(time_info: Any) -> float:
+    """When the first sample of this block was actually captured, in seconds.
+
+    The two streams are aligned by the difference between their anchors, so
+    what matters is that both are measured on the same clock at the same point
+    in the pipeline.
+
+    PortAudio hands the callback ``inputBufferAdcTime`` — the hardware capture
+    time of the buffer. Measured on this Mac it shares ``time.monotonic``'s
+    base (a constant ~0.28 s input-latency offset, and ``currentTime`` tracking
+    ``monotonic`` to 0.4 ms), so the two streams' values are directly
+    comparable. Falls back to ``time.monotonic()`` when a host doesn't supply
+    it; both streams degrade together, so the difference stays meaningful.
+
+    Measured notes, because the obvious story here is wrong
+    ------------------------------------------------------
+    The audit attributed the observed 5-99 ms mic-vs-system spread to stamping
+    this in the *writer* thread, behind a queue hand-off and the GIL. Measuring
+    all three sources side by side over six runs, that is not what dominates:
+
+        writer thread        skew spread 173.28 ms, stdev 59.09
+        callback monotonic   skew spread 173.21 ms, stdev 59.12
+        callback ADC         skew spread 173.05 ms, stdev 59.02
+
+    The hand-off contributes well under a millisecond. The spread is the two
+    devices genuinely starting at different times, which an accurate anchor is
+    supposed to record, not erase. So this change buys accuracy (~1 ms of
+    measurement error removed, and the input latency excluded properly), not
+    the order-of-magnitude the audit implied.
+
+    It also rules out the tempting fix. Starting both streams back to back —
+    the startup analogue of the teardown barrier — makes things *worse*,
+    because the two devices then contend during CoreAudio spin-up:
+
+        start() 50 ms apart     skew spread   6.89 ms
+        start() back to back    skew spread 504.97 ms
+
+    So the streams are still opened one at a time, deliberately.
+    """
+    adc = getattr(time_info, "inputBufferAdcTime", None)
+    if isinstance(adc, (int, float)) and adc > 0:
+        return float(adc)
+    return time.monotonic()
+
+
 def _looks_like_disk_full(exc: BaseException) -> bool:
     """True for ENOSPC, however the OS phrased it."""
     if isinstance(exc, OSError) and exc.errno == errno.ENOSPC:
