@@ -148,69 +148,49 @@ DEFER_POLL_SECONDS = 30.0
 DEFER_MAX_SECONDS = 2 * 60 * 60  # safety valve: never wait forever
 
 
-def make_call_probe(cfg: Config) -> Callable[[], bool]:
-    """Build a "is the user probably on a call right now?" check.
+def make_call_probe(cfg: Config, *, detector: Any | None = None) -> Callable[[], bool]:
+    """Build a "is the user on a call right now?" check for deferral.
 
-    Mic-in-use alone is not a call. A dictation tool (SuperWhisper) holds the
-    default input open indefinitely, and Otis's own recorder holds it too — so
-    the raw signal would defer every transcription to the two-hour cap.
+    Two earlier attempts got this wrong in opposite directions.
 
-    This used to be guarded by ``detection.mic_activation``, which coupled the
-    deferral to browser *detection*: turning detection off silently disabled
-    deferral as well. The two are unrelated, so the corroboration now comes
-    from the thing that actually means "a call is happening" — a whitelisted
-    meeting app being present alongside the mic signal.
+    Gating on ``detection.mic_activation`` coupled the deferral to *browser
+    detection*: turning detection off silently disabled deferral too.
+
+    Replacing that with "the mic is in use AND a whitelisted meeting app is
+    running" looked like corroboration but wasn't. The shipped whitelist
+    contains Slack, which runs all day, so the extra condition was satisfied
+    whenever the Mac was on — leaving the original problem (a dictation tool
+    holding the mic defers every transcription to the two-hour cap) exactly
+    where it was.
+
+    The honest signal is the detector's own state. Deciding whether a meeting
+    is happening is the thing it exists to do, and it weighs calendar events
+    and real meeting apps rather than "is this app installed". Callers that
+    have no detector (retranscribe, scripts) fall back to the raw mic signal,
+    which is weak but bounded by ``DEFER_MAX_SECONDS``.
     """
-    whitelist = [
-        str(a) for a in
-        (cfg.get("detection", "process_monitor", "whitelisted_apps", default=[]) or [])
-    ]
-    blacklist = [
-        str(a) for a in
-        (cfg.get("detection", "process_monitor", "blacklisted_apps", default=[]) or [])
-    ]
+    if detector is not None:
+        def probe() -> bool:
+            try:
+                meeting = detector.get_current_meeting()
+            except Exception:
+                return False
+            if meeting is None:
+                return False
+            return getattr(meeting.state, "value", meeting.state) in (
+                "detected", "recording",
+            )
+        return probe
 
-    def probe() -> bool:
+    def mic_probe() -> bool:
         try:
             from src.audio.coreaudio_probe import is_default_input_running
 
-            if not is_default_input_running():
-                return False
+            return bool(is_default_input_running())
         except Exception:
             return False
-        if not whitelist:
-            # Nothing to corroborate against — fall back to the raw signal
-            # rather than never deferring at all.
-            return True
-        return meeting_app_running(whitelist, blacklist)
 
-    return probe
-
-
-def meeting_app_running(
-    whitelist: list[str], blacklist: list[str] | None = None,
-) -> bool:
-    """True if any whitelisted meeting app is currently running."""
-    from src.detection.process_monitor import app_name_matches
-
-    try:
-        import psutil
-    except Exception:  # pragma: no cover (psutil absent)
-        return True  # can't tell; don't block the deferral
-
-    blacklist = blacklist or []
-    try:
-        for proc in psutil.process_iter(["name"]):
-            name = (proc.info.get("name") or "")
-            if not name:
-                continue
-            if any(app_name_matches(b, name) for b in blacklist):
-                continue
-            if any(app_name_matches(w, name) for w in whitelist):
-                return True
-    except Exception:  # pragma: no cover (defensive)
-        return True
-    return False
+    return mic_probe
 
 
 def wait_for_call_to_end(

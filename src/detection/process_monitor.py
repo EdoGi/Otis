@@ -35,7 +35,38 @@ logger = logging.getLogger(__name__)
 
 @lru_cache(maxsize=256)
 def _boundary_pattern(entry: str) -> re.Pattern[str]:
-    return re.compile(rf"\b{re.escape(entry)}\b")
+    # Lookarounds, not \b, for two reasons.
+    #
+    # \b is a transition between a word and a non-word char, so an entry
+    # ending in a non-word char can never match: after the ")" of "Microsoft
+    # Teams (work or school)" — a real shipped app name — \b demands a
+    # following word character, which never comes before a space.
+    #
+    # And "." must count as part of a name, not a boundary. psutil reports
+    # reverse-DNS process names like "com.apple.WebKit.WebContent", where a
+    # bare \b would let "arc" match "com.apple.Arc.helper" and reopen the
+    # phantom-detection class exact matching was introduced to close.
+    return re.compile(rf"(?<![\w.]){re.escape(entry)}(?![\w.])")
+
+
+def bundle_id_matches(entry: str, bundle_id: str) -> bool:
+    """True if ``entry`` names the app owning reverse-DNS ``bundle_id``.
+
+    Bundle ids need their own rule. Word-boundary matching treats every "." as
+    a boundary, so ``app_name_matches("arc", "com.apple.Arc.helper")`` is True
+    — reopening exactly the phantom-detection class that exact matching closed.
+
+    A bundle id is a dot-separated hierarchy, so the honest test is identity or
+    ancestry: ``us.zoom.xos`` matches itself and ``us.zoom.xos.renderer``, and
+    nothing matches a bare word buried in the middle.
+    """
+    if not entry or not bundle_id:
+        return False
+    entry = entry.lower().strip(".")
+    bundle_id = bundle_id.lower()
+    if "." not in entry:
+        return False  # a bare word is an app name, not a bundle id
+    return bundle_id == entry or bundle_id.startswith(entry + ".")
 
 
 def app_name_matches(entry: str, process_name: str) -> bool:
@@ -201,14 +232,21 @@ class ProcessMonitor:
             # NSWorkspace reports *localized* names ("Aperçu", "Accessibilité"),
             # so a whitelist entry is matched against the bundle id as well.
             # That lets "us.zoom.xos" work on any language of macOS.
-            identifiers = [name.lower()]
-            if bundle_id:
-                identifiers.append(str(bundle_id).lower())
+            lname = name.lower()
+            bid = str(bundle_id).lower() if bundle_id else ""
 
-            if any(app_name_matches(b, i) for b in self._blacklist for i in identifiers):
+            def owns(entry: str, _lname: str = lname, _bid: str = bid) -> bool:
+                """Does ``entry`` name this app, by display name or bundle id?"""
+                return app_name_matches(entry, _lname) or bundle_id_matches(entry, _bid)
+
+            # A deny-list stays deliberately broad: missing something we meant
+            # to exclude is worse than excluding a little too much, so it keeps
+            # the old substring behaviour ("superwhisper" must still catch
+            # "superwhisperd").
+            if any(b in lname or (bid and b in bid) for b in self._blacklist):
                 continue
             for white in self._whitelist:
-                if any(app_name_matches(white, i) for i in identifiers):
+                if owns(white):
                     names_seen.add(white)
                     pids_by_name.setdefault(white, set())
                     if pid is not None:

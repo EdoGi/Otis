@@ -135,6 +135,7 @@ class AudioRetentionManager:
 
         deletable: list[Path] = []
         protected: set[str] = set()
+        unresolved: list[Path] = []
         for path in old_files:
             sid = path_to_session.get(path)
             if completed is None:
@@ -155,9 +156,23 @@ class AudioRetentionManager:
                 continue
             if sid is not None:
                 protected.add(sid)
+            else:
+                # No metadata and no UUID in the filename — we cannot tell which
+                # meeting this belongs to, so we keep it. Count it, because
+                # silently hoarding files until the backstop is how you end up
+                # wondering where the disk went.
+                unresolved.append(path)
 
         # Determine the session ids touched, before we delete metadata.json.
-        session_ids = self._collect_session_ids(deletable)
+        # `path_to_session` already resolved every file — including relocated,
+        # date-named ones whose filename no longer carries the UUID. Recomputing
+        # this from _collect_session_ids alone silently missed them, so their
+        # audio was deleted while the transcript went on advertising
+        # `audio_available: true` forever.
+        session_ids = sorted(
+            {sid for p in deletable if (sid := path_to_session.get(p))}
+            | set(self._collect_session_ids(deletable))
+        )
 
         deleted: list[Path] = []
         for path in deletable:
@@ -169,6 +184,13 @@ class AudioRetentionManager:
             except Exception as exc:
                 logger.warning("Could not delete %s: %s", path, exc)
 
+        if unresolved:
+            logger.warning(
+                "Audio retention: kept %d file(s) past the horizon that could not "
+                "be matched to any session (%s%s).",
+                len(unresolved), ", ".join(p.name for p in unresolved[:3]),
+                ", …" if len(unresolved) > 3 else "",
+            )
         if protected:
             logger.info(
                 "Audio retention: kept %d session(s) past the horizon with no "

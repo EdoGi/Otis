@@ -325,7 +325,7 @@ class OtisDaemon:
             return
         from src.pipeline import make_call_probe, wait_for_call_to_end
 
-        probe = make_call_probe(self._config)
+        probe = make_call_probe(self._config, detector=self._detector)
 
         def busy() -> bool:
             with self._lock:

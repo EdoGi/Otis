@@ -64,6 +64,10 @@ CANONICAL_ORDER: tuple[str, ...] = (
 class HealthState(str, Enum):
     """How a component is doing. Ordered by severity via :data:`_SEVERITY`."""
 
+    #: Never reported. Distinct from UNKNOWN, which is a component actively
+    #: saying "I could not determine my state". Conflating the two made a
+    #: perfectly healthy startup look like a recovery and fire toasts.
+    UNSET = "unset"
     OK = "ok"
     UNKNOWN = "unknown"
     WARN = "warn"
@@ -71,6 +75,7 @@ class HealthState(str, Enum):
 
 
 _SEVERITY: dict[HealthState, int] = {
+    HealthState.UNSET: 0,
     HealthState.OK: 0,
     HealthState.UNKNOWN: 1,
     HealthState.WARN: 2,
@@ -79,6 +84,7 @@ _SEVERITY: dict[HealthState, int] = {
 
 #: Glyphs used in the menu-bar panel. Deliberately monochrome-friendly.
 _GLYPH: dict[HealthState, str] = {
+    HealthState.UNSET: "·",
     HealthState.OK: "✓",
     HealthState.UNKNOWN: "·",
     HealthState.WARN: "!",
@@ -149,7 +155,11 @@ class HealthRegistry:
         with self._lock:
             previous = self._reports.get(key)
             self._reports[key] = rep
-            prev_state = previous.state if previous is not None else HealthState.UNKNOWN
+            prev_state = previous.state if previous is not None else HealthState.UNSET
+            # Callbacks fire on a first report too — the menu panel is rendered
+            # from this same signal and must stay in sync. Subscribers tell the
+            # two cases apart by ``prev_state is UNSET``: render it, but don't
+            # announce a "recovery" from a state that was never broken.
             changed = prev_state is not state
             callbacks = list(self._callbacks) if changed else []
 

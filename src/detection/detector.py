@@ -372,24 +372,43 @@ class MeetingDetector:
             # 30 s, which with Slack in the default whitelist meant 2 880 log
             # lines and UI state changes a day.
             #
-            # The one exception: a process can appear before its calendar event
-            # does. If the correlation has only just arrived, that genuinely is
-            # new information, so we upgrade the context and fire once more.
+            # The exception: the meeting behind that app can *change*. A process
+            # often appears before its calendar event does, and two calendar'd
+            # calls can run back to back on one Zoom that never quits. Comparing
+            # the *presence* of a correlation rather than its identity meant the
+            # second meeting was swallowed and recorded under the first one's
+            # title, attendees and calendar_key.
             if (
                 self._context.state == MeetingState.DETECTED
                 and self._context.app == app_name
             ):
-                already_correlated = self._context.calendar_event_id is not None
-                if matched is None or already_correlated:
+                current_key = self._context.calendar_key
+                new_key = matched.canonical_key if matched is not None else None
+                if new_key == current_key:
                     logger.debug(
                         "Process heartbeat for %s while already DETECTED; ignoring.",
                         app_name,
                     )
                     return
-                logger.info(
-                    "Calendar caught up with running process %s → %s.",
-                    app_name, matched.title,
-                )
+                if current_key is None:
+                    logger.info(
+                        "Calendar caught up with running process %s → %s.",
+                        app_name, matched.title,
+                    )
+                elif new_key is None:
+                    # The correlated meeting ended but the app is still up. Keep
+                    # the existing context rather than demoting a named meeting
+                    # to an anonymous one on a routine heartbeat.
+                    logger.debug(
+                        "Process heartbeat for %s no longer correlates; keeping %r.",
+                        app_name, self._context.title,
+                    )
+                    return
+                else:
+                    logger.info(
+                        "New meeting on the same app %s: %r → %r.",
+                        app_name, self._context.title, matched.title,
+                    )
             if matched is not None:
                 self._context = _context_from_event(matched, MeetingState.DETECTED)
                 self._context.app = app_name

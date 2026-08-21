@@ -523,7 +523,7 @@ def test_daemon_transcription_defers_while_next_recording_active(tmp_path, monke
         detector, tmp_path, processor
     )
 
-    monkeypatch.setattr(pipeline_mod, "make_call_probe", lambda _cfg: lambda: False)
+    monkeypatch.setattr(pipeline_mod, "make_call_probe", lambda _cfg, **_kw: lambda: False)
 
     polls = {"n": 0}
 

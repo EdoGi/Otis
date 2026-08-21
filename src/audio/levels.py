@@ -49,6 +49,7 @@ class LevelMonitor:
         clock: Callable[[], float] = time.monotonic,
         on_silence: Callable[[str, float], None] | None = None,
         on_signal: Callable[[str], None] | None = None,
+        gap_tolerance_seconds: float = 2.0,
     ) -> None:
         self.label = label
         self._threshold = float(silence_threshold)
@@ -56,6 +57,9 @@ class LevelMonitor:
         self._clock = clock
         self._on_silence = on_silence
         self._on_signal = on_signal
+        # A gap between observations longer than this means capture stopped
+        # (pause, sleep) rather than the stream going quiet.
+        self._gap_tolerance = float(gap_tolerance_seconds)
 
         self._lock = threading.Lock()
         self._level = 0.0
@@ -63,6 +67,7 @@ class LevelMonitor:
         self._silent_since: float | None = None
         self._flagged = False
         self._observed_seconds = 0.0
+        self._last_observed_at: float | None = None
 
     # ------------------------------------------------------------------ input
     def observe(self, rms: float, duration_seconds: float) -> None:
@@ -77,6 +82,17 @@ class LevelMonitor:
         silent_for = 0.0
 
         with self._lock:
+            # Silence is measured in *observed* time, not wall-clock. The
+            # capture callback returns early while a recording is paused, so
+            # observe() simply stops being called — and a monotonic clock keeps
+            # running. Using wall-clock here meant the first quiet block after
+            # resuming reported the entire pause as dead air: a real 25.6-minute
+            # pause in a real session would have raised "no signal for 1560s".
+            gap = now - self._last_observed_at if self._last_observed_at is not None else 0.0
+            if gap > self._gap_tolerance and self._silent_since is not None:
+                # Time we did not watch cannot count against the stream.
+                self._silent_since += gap
+            self._last_observed_at = now
             self._observed_seconds += max(0.0, duration_seconds)
             self._level = (
                 _METER_SMOOTHING * rms + (1.0 - _METER_SMOOTHING) * self._level
@@ -148,6 +164,7 @@ class LevelMonitor:
             self._silent_since = None
             self._flagged = False
             self._observed_seconds = 0.0
+            self._last_observed_at = None
 
     def bar(self, width: int = 10) -> str:
         """A tiny text meter for the menu: ``▁▂▄█``-style blocks."""

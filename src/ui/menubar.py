@@ -724,7 +724,7 @@ class MenuBarApp:
                 except Exception:  # pragma: no cover
                     logger.exception("Could not set progress title")
         elif event_type == "health":
-            self._handle_health_change(payload)
+            self._handle_health_change(*payload)
         elif event_type == "refresh_recent":
             # The transcription worker just landed (or failed); reload the
             # Recent Transcripts submenu so the new item shows up.
@@ -1060,13 +1060,21 @@ class MenuBarApp:
         logger.info(
             "health change: %s %s → %s", report.key, previous.value, report.state.value
         )
-        self._events.put(("health", report))
+        self._events.put(("health", (report, previous)))
 
-    def _handle_health_change(self, report: HealthReport) -> None:
+    def _handle_health_change(
+        self, report: HealthReport, previous: HealthState
+    ) -> None:
         """Main-thread half: repaint the panel and raise one notification."""
         self._refresh_health_menu()
         self._refresh_menu_visibility()
         self._apply_health_badge()
+
+        # A first-ever report is not news. UNSET means "nothing was ever
+        # reported for this component", so announcing it would tell the user a
+        # perfectly healthy startup had just "recovered".
+        if previous is HealthState.UNSET and report.state is HealthState.OK:
+            return
 
         if report.state in (HealthState.WARN, HealthState.FAIL):
             body = report.detail or "needs attention"
@@ -1602,7 +1610,7 @@ class MenuBarApp:
             return
         from src.pipeline import make_call_probe, wait_for_call_to_end
 
-        probe = make_call_probe(self._config)
+        probe = make_call_probe(self._config, detector=self._detector)
 
         def busy() -> bool:
             with self._lock:

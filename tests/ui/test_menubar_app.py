@@ -134,7 +134,9 @@ def test_transcription_defers_until_call_ends(app, monkeypatch) -> None:
         return 0.0
 
     monkeypatch.setattr(pipeline_mod, "wait_for_call_to_end", fake_wait)
-    monkeypatch.setattr(pipeline_mod, "make_call_probe", lambda _cfg: lambda: False)
+    monkeypatch.setattr(
+        pipeline_mod, "make_call_probe", lambda _cfg, **_kw: lambda: False
+    )
 
     # The fixture disables deferral so other tests never touch the real
     # mic; this test exercises it with the wait fully faked.

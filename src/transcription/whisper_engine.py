@@ -247,7 +247,15 @@ class WhisperEngine:
                 was_silent=True,
                 measured_rms=rms,
             )
-        self._report_stream_health(label, silent=False, rms=rms)
+        if rms is None:
+            # The pre-check could not measure this file (24-bit, resampled,
+            # partly corrupt). Saying "signal ok" about audio we never read is
+            # the same failure the whole health surface exists to prevent, so
+            # leave the component untouched rather than turn the panel green.
+            logger.info("Signal level unmeasurable for %s; not reporting health.",
+                        path.name)
+        else:
+            self._report_stream_health(label, silent=False, rms=rms)
 
         duration = _safe_wav_duration_seconds(path)
         progress = (

@@ -5,10 +5,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from src.config import Config
 from src.pipeline import (
     TranscriptionPipeline,
     build_pipeline,
+    make_call_probe,
     make_recorder_factory,
     make_transcription_handler,
 )
@@ -187,95 +190,79 @@ def test_wait_aborts_on_shutdown_signal() -> None:
 
 
 # ---------------------------------------------------------------------------
-# make_call_probe — "is a call happening right now?"
+# make_call_probe — "is the user on a call right now?"
 #
-# This used to be gated on detection.mic_activation, which coupled the
-# transcription deferral to browser *detection*: turning detection off
-# silently disabled deferral too. The corroborating signal is now a running
-# meeting app, which is what "a call is happening" actually means.
+# This gate has now been wrong twice. It was first tied to
+# detection.mic_activation, so turning browser detection off silently disabled
+# deferral. It was then "mic in use AND a whitelisted meeting app is running",
+# which reads like corroboration but isn't: the shipped whitelist contains
+# Slack, which runs all day, so the second condition was always true.
+#
+# The detector is the component whose job is answering this question.
 # ---------------------------------------------------------------------------
-def _probe_cfg(**extra) -> Config:
-    detection = {
-        "process_monitor": {
-            "whitelisted_apps": ["zoom.us", "Microsoft Teams"],
-            "blacklisted_apps": ["SuperWhisper"],
-        }
-    }
-    detection.update(extra)
-    return Config({"detection": detection})
+class FakeMeeting:
+    def __init__(self, state: str) -> None:
+        self.state = state
 
 
-def test_call_probe_needs_both_mic_and_a_meeting_app(monkeypatch) -> None:
-    import src.pipeline as pipeline
+class FakeDetector:
+    def __init__(self, state: str | None) -> None:
+        self._state = state
 
+    def get_current_meeting(self):
+        return FakeMeeting(self._state) if self._state else None
+
+
+@pytest.mark.parametrize(
+    "state,expected",
+    [("recording", True), ("detected", True), ("approaching", False),
+     ("ended", False), ("processing", False), ("idle", False), (None, False)],
+)
+def test_call_probe_follows_detector_state(state, expected) -> None:
+    probe = make_call_probe(Config({}), detector=FakeDetector(state))
+    assert probe() is expected
+
+
+def test_a_dictation_tool_holding_the_mic_is_not_a_call() -> None:
+    """The original bug: SuperWhisper keeps the default input open, which used
+    to defer every transcription to the two-hour cap."""
+    probe = make_call_probe(Config({}), detector=FakeDetector(None))
+    assert probe() is False
+
+
+def test_slack_being_open_all_day_is_not_a_call() -> None:
+    """The regression that replaced it: the shipped whitelist contains Slack,
+    so 'a meeting app is running' was satisfied whenever the Mac was on."""
+    probe = make_call_probe(
+        Config({"detection": {"process_monitor": {
+            "whitelisted_apps": ["zoom.us", "Microsoft Teams", "Slack"]}}}),
+        detector=FakeDetector("idle"),
+    )
+    assert probe() is False
+
+
+def test_a_broken_detector_never_blocks_transcription() -> None:
+    class Boom:
+        def get_current_meeting(self):
+            raise RuntimeError("detector exploded")
+
+    assert make_call_probe(Config({}), detector=Boom())() is False
+
+
+def test_without_a_detector_it_falls_back_to_the_mic(monkeypatch) -> None:
+    """retranscribe.py and scripts have no detector; a weak signal bounded by
+    DEFER_MAX_SECONDS beats no signal at all."""
     monkeypatch.setattr(
         "src.audio.coreaudio_probe.is_default_input_running", lambda: True
     )
-    monkeypatch.setattr(pipeline, "meeting_app_running", lambda w, b=None: True)
-    assert pipeline.make_call_probe(_probe_cfg())() is True
-
-
-def test_mic_in_use_without_a_meeting_app_is_not_a_call(monkeypatch) -> None:
-    """A dictation tool holds the mic open indefinitely; that must not defer
-    every transcription to the two-hour cap."""
-    import src.pipeline as pipeline
-
-    monkeypatch.setattr(
-        "src.audio.coreaudio_probe.is_default_input_running", lambda: True
-    )
-    monkeypatch.setattr(pipeline, "meeting_app_running", lambda w, b=None: False)
-    assert pipeline.make_call_probe(_probe_cfg())() is False
-
-
-def test_no_mic_means_no_call_regardless_of_apps(monkeypatch) -> None:
-    import src.pipeline as pipeline
-
+    assert make_call_probe(Config({}))() is True
     monkeypatch.setattr(
         "src.audio.coreaudio_probe.is_default_input_running", lambda: False
     )
-    monkeypatch.setattr(pipeline, "meeting_app_running", lambda w, b=None: True)
-    assert pipeline.make_call_probe(_probe_cfg())() is False
+    assert make_call_probe(Config({}))() is False
 
 
-def test_empty_whitelist_falls_back_to_the_raw_mic_signal(monkeypatch) -> None:
-    """Nothing to corroborate against — better to defer than never defer."""
-    import src.pipeline as pipeline
-
-    monkeypatch.setattr(
-        "src.audio.coreaudio_probe.is_default_input_running", lambda: True
-    )
-    cfg = Config({"detection": {"process_monitor": {"whitelisted_apps": []}}})
-    assert pipeline.make_call_probe(cfg)() is True
-
-
-def test_deferral_survives_removal_of_mic_activation(monkeypatch) -> None:
-    """Regression: a leftover mic_activation key in ~/.otis/config.yaml must
-    no longer switch the deferral off."""
-    import src.pipeline as pipeline
-
-    monkeypatch.setattr(
-        "src.audio.coreaudio_probe.is_default_input_running", lambda: True
-    )
-    monkeypatch.setattr(pipeline, "meeting_app_running", lambda w, b=None: True)
-    cfg = _probe_cfg(mic_activation={"enabled": False})
-    assert pipeline.make_call_probe(cfg)() is True
-
-
-def test_meeting_app_running_matches_and_respects_the_blacklist(monkeypatch) -> None:
-    import src.pipeline as pipeline
-
-    class FakeProc:
-        def __init__(self, name):
-            self.info = {"name": name}
-
-    def fake_iter(_attrs):
-        return [FakeProc("SuperWhisper"), FakeProc("searchpartyd")]
-
-    import psutil
-
-    monkeypatch.setattr(psutil, "process_iter", fake_iter)
-    # SuperWhisper is blacklisted and searchpartyd is a phantom 'arc' match.
-    assert pipeline.meeting_app_running(["zoom.us", "arc"], ["SuperWhisper"]) is False
-
-    monkeypatch.setattr(psutil, "process_iter", lambda _a: [FakeProc("zoom.us")])
-    assert pipeline.meeting_app_running(["zoom.us"], ["SuperWhisper"]) is True
+def test_a_stale_mic_activation_key_no_longer_affects_deferral() -> None:
+    """Regression: the key is gone from config but may linger in ~/.otis."""
+    cfg = Config({"detection": {"mic_activation": {"enabled": False}}})
+    assert make_call_probe(cfg, detector=FakeDetector("recording"))() is True

@@ -112,7 +112,7 @@ def test_callback_fires_on_transition_only(registry) -> None:
     registry.report("calendar", label="Calendar", state=HealthState.FAIL, detail="no token")
     registry.report("calendar", label="Calendar", state=HealthState.FAIL, detail="no token")
 
-    assert seen == [("calendar", HealthState.UNKNOWN, HealthState.FAIL)]
+    assert seen == [("calendar", HealthState.UNSET, HealthState.FAIL)]
 
 
 def test_callback_fires_again_on_recovery(registry) -> None:

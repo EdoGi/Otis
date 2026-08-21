@@ -234,7 +234,18 @@ class TranscriptStore:
         return None
 
     def completed_session_ids(self) -> set[str]:
-        """ids of every transcript that is NOT a failure placeholder.
+        """ids of every transcript that captured the whole meeting.
+
+        "Complete" gates audio deletion, so it has to mean *this recording has
+        nothing left to give*, not merely *a file was written*. Two kinds of
+        transcript look finished but aren't:
+
+        * a ``status: failed`` placeholder, whose body tells the user to run
+          retranscribe.py against audio we would otherwise delete;
+        * a transcript whose ``system_audio`` is ``silent`` or ``missing`` —
+          only half the meeting was captured. That is exactly the audit's
+          headline case: two months of one-sided transcripts whose audio is
+          the only thing that could be re-transcribed once routing is fixed.
 
         One rglob scan — callers checking many ids (orphan discovery) use
         this instead of per-id :meth:`has_completed_transcript` lookups.
@@ -246,7 +257,7 @@ class TranscriptStore:
             except Exception:
                 continue
             sid = fm.get("id")
-            if sid and fm.get("status") != "failed":
+            if sid and transcript_is_complete(fm):
                 ids.add(str(sid))
         return ids
 
@@ -563,6 +574,26 @@ class TranscriptStore:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+#: Values of the ``system_audio`` frontmatter field that mean the far side of
+#: the meeting was not captured, so the audio still has something to give.
+INCOMPLETE_SYSTEM_AUDIO = ("silent", "missing")
+
+
+def transcript_is_complete(fm: dict[str, Any]) -> bool:
+    """True when a transcript captured everything its audio had to offer.
+
+    Used to decide whether the source audio is safe to delete. Deliberately
+    conservative: anything we are unsure about counts as incomplete, because
+    the cost of being wrong is destroying the only copy of a meeting.
+    """
+    if fm.get("status") == "failed":
+        return False
+    system_audio = fm.get("system_audio")
+    if isinstance(system_audio, str) and system_audio.lower() in INCOMPLETE_SYSTEM_AUDIO:
+        return False
+    return True
+
+
 def _has_participant(fm: dict[str, Any], needle: str) -> bool:
     needle_l = needle.lower()
     for entry in fm.get("participants") or []:
