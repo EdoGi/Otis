@@ -156,3 +156,118 @@ def test_unset_is_distinct_from_unknown() -> None:
     reg.report("a", label="A", state=HealthState.UNKNOWN)
     assert reg.overall() is HealthState.UNKNOWN
     assert reg.is_degraded() is False
+
+
+# ---------------------------------------------------------------------------
+# The fast app source is opt-in, because it needs a live main run loop
+# ---------------------------------------------------------------------------
+def test_the_default_process_source_is_the_one_that_always_works() -> None:
+    """Cocoa only refreshes NSWorkspace.runningApplications while the main run
+    loop runs. `otis run` is headless, so defaulting to it would have made the
+    daemon permanently blind to any app launched after startup — verified on
+    this machine by launching TextEdit from a background thread and never
+    seeing it appear."""
+    from src.detection.process_monitor import (
+        _default_process_iter,
+        _psutil_processes,
+        nsworkspace_process_iter,
+    )
+
+    assert _default_process_iter is not nsworkspace_process_iter
+    sample = list(_default_process_iter())
+    assert sample and all("name" in p for p in sample)
+    # It really is the psutil source: far more entries than there are apps.
+    assert len(sample) == len(list(_psutil_processes()))
+
+
+def test_the_menu_bar_opts_into_the_fast_source() -> None:
+    """rumps drives a real run loop, so the menu bar — where battery actually
+    matters — keeps the ~20x saving."""
+    import inspect
+
+    import src.main as main_mod
+
+    src = inspect.getsource(main_mod)
+    assert "process_iter=nsworkspace_process_iter" in src
+
+
+def test_the_daemon_does_not_opt_in() -> None:
+    import inspect
+
+    import src.daemon as daemon_mod
+
+    assert "nsworkspace_process_iter" not in inspect.getsource(daemon_mod)
+
+
+# ---------------------------------------------------------------------------
+# Detection must not be latched as started when it declined
+# ---------------------------------------------------------------------------
+def test_detector_start_reports_whether_everything_came_up() -> None:
+    from src.detection.detector import MeetingDetector
+
+    class Declining:
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def is_running(self):
+            return False
+
+        def on_upcoming_meeting(self, cb):
+            pass
+
+        def on_meeting_should_end(self, cb):
+            pass
+
+    class Fine(Declining):
+        def is_running(self):
+            return True
+
+    assert MeetingDetector(
+        process_monitor=None, calendar_pollers=[Fine()]
+    ).start() is True
+    assert MeetingDetector(
+        process_monitor=None, calendar_pollers=[Fine(), Declining()]
+    ).start() is False
+
+
+def test_daemon_retries_when_detection_declined_to_start() -> None:
+    """One wedged socket at 08:00 used to mean no calendar detection until the
+    working-hours window reopened the next morning."""
+    from datetime import datetime
+
+    from src.config import Config
+    from src.daemon import OtisDaemon
+
+    class FlakyDetector:
+        def __init__(self):
+            self.attempts = 0
+
+        def start(self):
+            self.attempts += 1
+            return self.attempts > 1        # declines the first time
+
+        def stop(self):
+            pass
+
+        def on_meeting_approaching(self, cb): pass
+        def on_meeting_detected(self, cb): pass
+        def on_meeting_ended(self, cb): pass
+        def on_process_disappeared(self, cb): pass
+
+    det = FlakyDetector()
+    daemon = OtisDaemon(
+        Config({"app": {"working_days": list(range(7)),
+                        "working_hours": {"start": "00:00", "end": "23:59"}}}),
+        notify=lambda _m: None,
+        detector=det,                       # type: ignore[arg-type]
+        clock=lambda: datetime(2026, 8, 8, 10, 0),
+    )
+
+    daemon._apply_schedule()
+    assert daemon._detector_started is False, "a declined start must not latch"
+    daemon._apply_schedule()
+    assert daemon._detector_started is True, "the next tick must retry"
+    assert det.attempts == 2

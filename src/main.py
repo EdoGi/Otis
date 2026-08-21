@@ -136,7 +136,10 @@ def _run_menubar(cfg: Config) -> int:
     """Build the menu-bar app from config and start its event loop."""
     from src.detection.calendar_poller import build_pollers_from_config
     from src.detection.detector import MeetingDetector
-    from src.detection.process_monitor import ProcessMonitor
+    from src.detection.process_monitor import (
+        ProcessMonitor,
+        nsworkspace_process_iter,
+    )
     from src.pipeline import (
         build_pipeline,
         make_recorder_factory,
@@ -154,6 +157,11 @@ def _run_menubar(cfg: Config) -> int:
             whitelisted_apps=list(pm_cfg.get("whitelisted_apps", [])),
             blacklisted_apps=list(pm_cfg.get("blacklisted_apps", [])),
             poll_interval_seconds=float(pm_cfg.get("poll_interval_seconds", 5)),
+            # rumps runs a real main run loop, which is what keeps
+            # NSWorkspace.runningApplications fresh — so the menu bar can use
+            # the ~20x cheaper application source. `otis run` cannot; see
+            # nsworkspace_process_iter().
+            process_iter=nsworkspace_process_iter,
         )
 
     cal_cfg = cfg.get("detection", "calendar", default={}) or {}

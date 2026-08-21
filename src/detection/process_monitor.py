@@ -323,26 +323,43 @@ class ProcessMonitor:
 # constructor injection rather than monkey-patching.
 # ============================================================================
 def _default_process_iter() -> Iterable[dict[str, Any]]:
-    """Applications currently running, as ``{"pid", "name", "bundle_id"}`` dicts.
+    """Default source: every visible process, via psutil.
 
-    Prefers ``NSWorkspace.runningApplications()`` over ``psutil``. Measured on
-    this Mac: **0.58 ms for 93 apps versus 24.8 ms for 571 processes** — a 43x
-    saving on a call made every 5 s, all day.
+    Slower than :func:`nsworkspace_process_iter` but correct everywhere, which
+    is why it is the default. See that function for when the faster source is
+    safe.
+    """
+    return _psutil_processes()
 
-    The reason psutil was so expensive is subtle: ``Process.name()`` falls back
-    to ``cmdline()`` whenever the name is 15+ characters, and that is a second
-    sysctl copying the target's whole argv and environment. 261 of 571
+
+def nsworkspace_process_iter() -> Iterable[dict[str, Any]]:
+    """Running *applications* via AppKit. Only valid with a live main run loop.
+
+    Measured on this Mac: **0.58 ms for 93 apps versus 24.8 ms for 571
+    processes**, and end-to-end ``poll_once`` drops from 24.8 ms to ~1 ms. The
+    reason psutil is so expensive is subtle — ``Process.name()`` falls back to
+    ``cmdline()`` whenever the name is 15+ characters, and that is a second
+    sysctl copying the target's whole argv and environment; 261 of 571
     processes here qualified, so each poll paid ~830 syscalls.
 
-    NSWorkspace is also *more correct* for this job. It reports applications,
-    not every process, so the Apple daemons that produced the phantom
-    detections — searchpartyd, TrialArchivingService, SafariWidgetExtension —
-    do not appear at all.
+    It is also *more correct* for this job: it reports applications, not every
+    process, so the Apple daemons behind the phantom detections
+    (searchpartyd, TrialArchivingService, SafariWidgetExtension) never appear.
+
+    **The catch, and why this is not the default.** Cocoa only refreshes
+    ``NSWorkspace.runningApplications`` while the main run loop runs. Verified
+    on this machine: from a background thread with no ``NSApplication``,
+    launching TextEdit never changed the array, and pumping
+    ``CFRunLoopRunInMode`` from that thread did not help either. ``otis run``
+    is headless and blocks on an Event, so it would have gone permanently
+    blind to any app started after launch — while the menu bar, which rumps
+    drives with a real run loop, is fine.
+
+    So the front end declares this: ``main.py`` opts in because it runs rumps;
+    the daemon keeps psutil. Falls back to psutil if AppKit is unavailable.
     """
     apps = _nsworkspace_apps()
-    if apps is not None:
-        return apps
-    return _psutil_processes()
+    return apps if apps is not None else _psutil_processes()
 
 
 def _nsworkspace_apps() -> list[dict[str, Any]] | None:

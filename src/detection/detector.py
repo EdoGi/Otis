@@ -199,16 +199,32 @@ class MeetingDetector:
         """
         self._on_process_gone.append(callback)
 
-    def start(self) -> None:
-        if self._process_monitor is not None:
-            self._process_monitor.start()
-        for poller in self._calendar_pollers:
-            poller.start()
+    def start(self) -> bool:
+        """Start every detection source. Returns True if they all came up.
+
+        A poller can decline to start — it refuses to stack a second thread on
+        top of one still finishing a wedged request. The caller must not treat
+        that as success: the daemon used to set `_detector_started = True`
+        unconditionally, so one wedged socket at 08:00 meant no calendar
+        detection until the window reopened the next morning.
+        """
+        started = True
+        for component in (self._process_monitor, *self._calendar_pollers):
+            if component is None:
+                continue
+            component.start()
+            # Only downgrade on an explicit "no". A component that doesn't
+            # report liveness (test fakes) is taken at its word.
+            is_running = getattr(component, "is_running", None)
+            if callable(is_running) and not is_running():
+                started = False
         logger.info(
-            "MeetingDetector started (process=%s, calendar_pollers=%d).",
+            "MeetingDetector started (process=%s, calendar_pollers=%d, complete=%s).",
             self._process_monitor is not None,
             len(self._calendar_pollers),
+            started,
         )
+        return started
 
     def stop(self) -> None:
         if self._process_monitor is not None:

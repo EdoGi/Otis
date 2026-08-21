@@ -390,9 +390,16 @@ class OtisDaemon:
             if self._recorder is not None:
                 return
             if in_window and not self._detector_started:
-                self._detector.start()
-                self._detector_started = True
-                self._notify("🌅  Inside working hours — detection active.")
+                # Only latch on a *complete* start. A poller that declined
+                # because a previous thread is still finishing must be retried
+                # on the next tick, not silently assumed to be running.
+                if self._detector.start():
+                    self._detector_started = True
+                    self._notify("🌅  Inside working hours — detection active.")
+                else:
+                    logger.warning(
+                        "Detection did not fully start; retrying next tick."
+                    )
             elif not in_window and self._detector_started:
                 self._detector_started = False
                 stop_needed = True
