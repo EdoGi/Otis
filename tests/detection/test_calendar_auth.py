@@ -144,8 +144,12 @@ def test_missing_credentials_file_is_a_clear_error(tmp_path: Path) -> None:
 # Reauth is announced once, not every 60 seconds
 # ---------------------------------------------------------------------------
 def test_reauth_callback_fires_once_per_failure_streak(paths, monkeypatch) -> None:
+    """A *genuine* auth failure. Being offline is a different thing entirely —
+    see test_being_offline_never_asks_the_user_to_reconnect."""
+    from google.auth.exceptions import RefreshError
+
     creds_path, token_path = paths
-    patch_creds(monkeypatch, FakeCreds(raises=ConnectionError("offline")))
+    patch_creds(monkeypatch, FakeCreds(raises=RefreshError("invalid_grant: revoked")))
     poller = make_poller(creds_path, token_path)
 
     calls: list[str] = []
@@ -158,8 +162,10 @@ def test_reauth_callback_fires_once_per_failure_streak(paths, monkeypatch) -> No
 
 
 def test_reauth_callback_rearms_after_a_success(paths, monkeypatch) -> None:
+    from google.auth.exceptions import RefreshError
+
     creds_path, token_path = paths
-    failing = FakeCreds(raises=ConnectionError("offline"))
+    failing = FakeCreds(raises=RefreshError("invalid_grant: revoked"))
     patch_creds(monkeypatch, failing)
     poller = make_poller(creds_path, token_path)
 
@@ -174,3 +180,58 @@ def test_reauth_callback_rearms_after_a_success(paths, monkeypatch) -> None:
     poller.notify_auth_recovered()
     poller.fetch_today_events()
     assert len(calls) == 2
+
+
+# ---------------------------------------------------------------------------
+# Offline is not "your calendar is disconnected"
+# ---------------------------------------------------------------------------
+def test_being_offline_never_asks_the_user_to_reconnect(paths, monkeypatch) -> None:
+    """A laptop that sleeps and roams hits a captive portal regularly. Telling
+    the user to reconnect their calendar because one request failed is worse
+    than saying nothing — the token is intact and the next poll will work."""
+    from src.health import HealthState, get_health, reset_health
+
+    creds_path, token_path = paths
+    patch_creds(monkeypatch, FakeCreds(raises=ConnectionError("Network unreachable")))
+    poller = make_poller(creds_path, token_path)
+
+    calls: list[str] = []
+    poller.on_needs_reauth(calls.append)
+    reset_health()
+    try:
+        for _ in range(5):
+            assert poller.fetch_today_events() == []
+
+        assert calls == [], "offline must not raise a reconnect prompt"
+        assert token_path.exists(), "and it must certainly not drop the token"
+        rep = get_health().get(poller._health_key())
+        assert rep is not None and rep.state is HealthState.UNKNOWN
+        assert "offline" in rep.detail
+    finally:
+        reset_health()
+
+
+def test_each_account_gets_its_own_health_row(tmp_path) -> None:
+    """Both accounts reporting to one shared key made a single broken account
+    flap the row against a healthy one — ~10 toasts per 5 minutes."""
+    personal = GoogleCalendarPoller(
+        credentials_path=tmp_path / "c.json", token_path=tmp_path / "p.json",
+        label="personal",
+    )
+    work = GoogleCalendarPoller(
+        credentials_path=tmp_path / "c.json", token_path=tmp_path / "w.json",
+        label="work",
+    )
+    assert personal._health_key() != work._health_key()
+    assert "personal" in personal._health_label()
+    assert "work" in work._health_label()
+
+
+def test_an_unlabelled_poller_keeps_the_plain_key(tmp_path) -> None:
+    from src.health import CALENDAR
+
+    solo = GoogleCalendarPoller(
+        credentials_path=tmp_path / "c.json", token_path=tmp_path / "t.json"
+    )
+    assert solo._health_key() == CALENDAR
+    assert solo._health_label() == "Calendar"

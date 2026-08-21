@@ -114,6 +114,15 @@ class CalendarAuthError(RuntimeError):
     """Raised when OAuth credentials cannot be loaded or refreshed."""
 
 
+class CalendarUnreachableError(CalendarAuthError):
+    """The saved token is fine; Google just wasn't reachable this cycle.
+
+    A subclass of :class:`CalendarAuthError` so existing handlers keep working,
+    but callers that care can tell "you need to reconnect" apart from "the
+    train went into a tunnel".
+    """
+
+
 class GoogleCalendarPoller:
     """Background poller that fires upcoming-meeting events from Google Calendar."""
 
@@ -127,7 +136,13 @@ class GoogleCalendarPoller:
         calendar_id: str = "primary",
         calendar_ids: Iterable[str] | None = None,
         clock: Callable[[], datetime] | None = None,
+        label: str | None = None,
     ) -> None:
+        # One health row per account. Reporting every poller to a single shared
+        # CALENDAR key made one broken account flap the row against a healthy
+        # one — ~10 toasts per 5 minutes, the exact spam the health surface was
+        # built to stop, moved one layer up.
+        self.label = label
         self._credentials_path = Path(os.path.expanduser(str(credentials_path)))
         self._token_path = (
             Path(os.path.expanduser(str(token_path)))
@@ -295,6 +310,12 @@ class GoogleCalendarPoller:
                         "Token refresh failed transiently (%s); keeping the token "
                         "and retrying on the next poll.", exc,
                     )
+                    # The token is intact — we simply could not reach Google.
+                    # Telling the user to "reconnect your calendar" because a
+                    # captive portal ate one request is worse than saying
+                    # nothing, so this raises a distinct error the caller
+                    # reports as UNKNOWN rather than as a broken account.
+                    raise CalendarUnreachableError(str(exc)) from exc
 
         # No usable credentials. The poller calls us with headless=True so we
         # surface a re-auth request instead of blocking the thread on a browser.
@@ -349,6 +370,14 @@ class GoogleCalendarPoller:
             creds, http=httplib2.Http(timeout=HTTP_TIMEOUT_SECONDS)
         )
 
+    def _health_key(self) -> str:
+        from src.health import CALENDAR
+
+        return f"{CALENDAR}:{self.label}" if self.label else CALENDAR
+
+    def _health_label(self) -> str:
+        return f"Calendar ({self.label})" if self.label else "Calendar"
+
     # ------------------------------------------------------- auth announcements
     def _announce_auth_failure(self, message: str) -> None:
         """Report broken auth once per failure streak — to the user, not the log.
@@ -357,15 +386,15 @@ class GoogleCalendarPoller:
         what produced 2 880 warning lines a day and trained everyone to ignore
         the log entirely, so the transition is the event, not the state.
         """
-        from src.health import CALENDAR, HealthState, get_health
+        from src.health import HealthState, get_health
 
         with self._lock:
             already = self._auth_failure_announced
             self._auth_failure_announced = True
 
         get_health().report(
-            CALENDAR,
-            label="Calendar",
+            self._health_key(),
+            label=self._health_label(),
             state=HealthState.FAIL,
             detail="disconnected — reconnect to get meeting titles",
             hint="Run scripts/setup_google_cal.sh to reconnect this account.",
@@ -376,16 +405,28 @@ class GoogleCalendarPoller:
         logger.warning("Calendar auth needs attention: %s", message)
         _safe_call_each(self._on_reauth, message)
 
+    def _announce_unreachable(self, message: str) -> None:
+        """Network trouble, not an auth problem. Never say "reconnect"."""
+        from src.health import HealthState, get_health
+
+        logger.info("Calendar unreachable this cycle: %s", message)
+        get_health().report(
+            self._health_key(),
+            label=self._health_label(),
+            state=HealthState.UNKNOWN,
+            detail="offline — will retry",
+        )
+
     def notify_auth_recovered(self) -> None:
         """Clear the failure streak so a future break is announced again."""
-        from src.health import CALENDAR, HealthState, get_health
+        from src.health import HealthState, get_health
 
         with self._lock:
             was_broken = self._auth_failure_announced
             self._auth_failure_announced = False
         get_health().report(
-            CALENDAR,
-            label="Calendar",
+            self._health_key(),
+            label=self._health_label(),
             state=HealthState.OK,
             detail=f"{len(self._calendar_ids)} calendar(s)",
         )
@@ -407,6 +448,11 @@ class GoogleCalendarPoller:
             if self._service is None:
                 self._service = self._build_service()
                 self.notify_auth_recovered()
+        except CalendarUnreachableError as exc:
+            self._announce_unreachable(str(exc))
+            self._service = None
+            self._last_cycle_failed = True
+            return []
         except CalendarAuthError as exc:
             self._announce_auth_failure(str(exc))
             self._service = None
@@ -752,6 +798,7 @@ def build_pollers_from_config(calendar_cfg: Any) -> list[GoogleCalendarPoller]:
                     poll_interval_seconds=poll_interval,
                     pre_meeting_alert_minutes=pre_alert,
                     calendar_ids=list(ids),
+                    label=label,
                 )
             )
         return pollers
