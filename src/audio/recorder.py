@@ -74,6 +74,15 @@ CAPTURE_BLOCK_BYTES = CAPTURE_BLOCKSIZE_FRAMES * 2
 #: meeting. The drop-on-full handler already existed but could never fire.
 CAPTURE_QUEUE_SECONDS = 30.0
 
+#: How often the watchdog checks that audio is still flowing.
+WATCHDOG_INTERVAL_SECONDS = 5.0
+
+#: No new bytes for this long while RECORDING means the capture stream is dead,
+#: not quiet. A silent room still delivers blocks of zeros; a disconnected or
+#: sleep-stale device delivers nothing at all. That distinction is the whole
+#: point — the level monitor deliberately ignores gaps, so it cannot see this.
+STREAM_STALL_SECONDS = 15.0
+
 
 class RecorderState(str, Enum):
     IDLE = "idle"
@@ -114,6 +123,14 @@ class _StreamState:
     meter: Any = None
     #: Capture blocks discarded because the writer fell too far behind.
     dropped_blocks: int = 0
+    #: Watchdog bookkeeping: bytes at the last check, and when they last moved.
+    last_bytes_seen: int = 0
+    last_progress_monotonic: float = 0.0
+    #: True once the watchdog has reported this stream as stalled, so it
+    #: reports once rather than every tick.
+    stalled: bool = False
+    #: Rebuilds the capture callback when the input stream has to be recreated.
+    make_callback: Any = None
 
 
 class DualStreamRecorder:
@@ -192,6 +209,9 @@ class DualStreamRecorder:
 
         # Sleep/wake observer (pyobjc-based). Lazily started.
         self._sleep_wake_observer: _SleepWakeObserver | None = None
+        # Capture watchdog: notices a stream that stops delivering audio.
+        self._watchdog_thread: threading.Thread | None = None
+        self._watchdog_stop: threading.Event | None = None
 
     # =====================================================================
     # Public API
@@ -300,6 +320,7 @@ class DualStreamRecorder:
                             logger.exception("on_device_error callback raised")
 
             self._state = RecorderState.RECORDING
+            self._start_watchdog()
             if self._observe_sleep_wake:
                 self._start_sleep_wake_observer()
 
@@ -346,7 +367,18 @@ class DualStreamRecorder:
             self._pause_source = None
             self._active.set()
             self._state = RecorderState.RECORDING
+            # Don't let the watchdog count the sleep as a stall.
+            for st in (self._mic_state, self._system_state):
+                if st is not None:
+                    st.last_progress_monotonic = time.monotonic()
             logger.info("Recording resumed at %.3fs (source=%s)", now, source)
+
+        if source == "wake":
+            # CoreAudio routinely re-enumerates across sleep — Bluetooth always
+            # does. resume() used to only set a flag, so a stream whose device
+            # went away came back dead: no error, no bytes, and the rest of the
+            # meeting silently lost.
+            self._revive_dead_streams()
 
     def stop(self) -> dict[str, Any]:
         """Stop recording, flush WAV files, write metadata. Returns metadata dict.
@@ -374,6 +406,7 @@ class DualStreamRecorder:
                 self._current_pause_started = None
 
             self._active.set()  # release writer threads if still waiting
+            self._stop_watchdog()
             self._teardown_streams()
             metadata = self._write_metadata()
             self._stop_sleep_wake_observer()
@@ -551,13 +584,124 @@ class DualStreamRecorder:
                         st.label, CAPTURE_QUEUE_SECONDS,
                     )
 
+        # Kept so the watchdog can rebuild the input stream after a device
+        # disconnect or a sleep that re-enumerated CoreAudio, without
+        # disturbing the queue, the writer thread or the open WAV file.
+        st.make_callback = lambda: callback
+        self._start_input_stream(st, sd)
+
+        st.last_bytes_seen = 0
+        st.last_progress_monotonic = time.monotonic()
+        st.stalled = False
+
+        st.writer_thread = threading.Thread(
+            target=self._writer_loop,
+            args=(st,),
+            name=f"otis-writer-{st.label}",
+            daemon=True,
+        )
+        st.writer_thread.start()
+
+    def _revive_dead_streams(self) -> None:
+        """Rebuild any stream whose device did not survive sleep."""
+        for st in (self._mic_state, self._system_state):
+            if st is None or st.stream is None:
+                continue
+            active = getattr(st.stream, "active", None)
+            if active is None:
+                continue  # host doesn't report it; the watchdog will catch it
+            if not active:
+                self._revive_stream(st)
+
+    # ------------------------------------------------------------ watchdog
+    def _start_watchdog(self) -> None:
+        self._watchdog_stop = threading.Event()
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog_loop,
+            args=(self._watchdog_stop,),
+            name="otis-capture-watchdog",
+            daemon=True,
+        )
+        self._watchdog_thread.start()
+
+    def _stop_watchdog(self) -> None:
+        if self._watchdog_stop is not None:
+            self._watchdog_stop.set()
+        thread = self._watchdog_thread
+        if thread is not None:
+            thread.join(timeout=2.0)
+        self._watchdog_thread = None
+
+    def _watchdog_loop(self, stop_event: threading.Event) -> None:
+        """Notice when a capture stream stops delivering audio.
+
+        Until now the only way a device failure reached the user was if the
+        *writer* raised — i.e. disk errors only. A device that was unplugged,
+        or that re-enumerated while the Mac slept, simply stopped calling the
+        callback: no exception, no error, ``stop()`` reporting success, and the
+        rest of the meeting written as nothing at all.
+
+        Silence is not the signal here — a quiet room still delivers blocks of
+        zeros. The signal is *no blocks*, which is why this watches bytes
+        rather than level.
+        """
+        while not stop_event.wait(WATCHDOG_INTERVAL_SECONDS):
+            try:
+                self._check_streams_alive()
+            except Exception:  # pragma: no cover (defensive)
+                logger.exception("Capture watchdog tick failed; continuing.")
+
+    def _check_streams_alive(self) -> None:
+        with self._state_lock:
+            if self._state is not RecorderState.RECORDING:
+                return  # paused or stopped: no data expected
+            streams = [s for s in (self._mic_state, self._system_state) if s is not None]
+
+        now = time.monotonic()
+        for st in streams:
+            if st.error is not None:
+                continue  # already reported by the writer
+            if st.bytes_written != st.last_bytes_seen:
+                st.last_bytes_seen = st.bytes_written
+                st.last_progress_monotonic = now
+                if st.stalled:
+                    st.stalled = False
+                    logger.info("[%s] capture recovered.", st.label)
+                    report_stream_health(st.label, silent=False, detail="signal ok")
+                continue
+            stalled_for = now - st.last_progress_monotonic
+            if stalled_for < STREAM_STALL_SECONDS or st.stalled:
+                continue
+            st.stalled = True
+            logger.error(
+                "[%s] no audio for %.0fs — the capture device has stopped "
+                "delivering.", st.label, stalled_for,
+            )
+            report_stream_health(
+                st.label, silent=True,
+                detail=f"capture stopped {int(stalled_for)}s ago",
+            )
+            if self._on_device_error is not None:
+                try:
+                    self._on_device_error(
+                        st.label,
+                        RuntimeError(f"no audio for {int(stalled_for)}s"),
+                    )
+                except Exception:  # pragma: no cover
+                    logger.exception("on_device_error callback raised")
+            self._revive_stream(st)
+
+    def _start_input_stream(self, st: _StreamState, sd: Any = None) -> None:
+        """Create and start the InputStream for ``st``. Raises on failure."""
+        if sd is None:
+            import sounddevice as sd  # noqa: PLC0415
         try:
             st.stream = sd.InputStream(
                 samplerate=self._sample_rate,
                 channels=self._channels,
                 dtype="int16",
                 device=st.device.index,
-                callback=callback,
+                callback=st.make_callback(),
                 blocksize=CAPTURE_BLOCKSIZE_FRAMES,
                 latency=CAPTURE_LATENCY,
             )
@@ -568,13 +712,33 @@ class DualStreamRecorder:
                 raise PermissionDeniedError(str(exc)) from exc
             raise
 
-        st.writer_thread = threading.Thread(
-            target=self._writer_loop,
-            args=(st,),
-            name=f"otis-writer-{st.label}",
-            daemon=True,
-        )
-        st.writer_thread.start()
+    def _revive_stream(self, st: _StreamState) -> bool:
+        """Rebuild a dead input stream in place. Returns True on success.
+
+        The WAV file, the queue and the writer thread are untouched, so the
+        recording continues into the same file — the gap is simply missing
+        audio, which is a far better outcome than the rest of the meeting
+        being silently lost.
+        """
+        logger.warning("[%s] capture stream looks dead; rebuilding it.", st.label)
+        try:
+            if st.stream is not None:
+                try:
+                    st.stream.stop()
+                except Exception:  # pragma: no cover (already dead)
+                    pass
+                try:
+                    st.stream.close()
+                except Exception:  # pragma: no cover (already dead)
+                    pass
+            st.stream = None
+            self._start_input_stream(st)
+        except Exception as exc:
+            logger.error("[%s] could not rebuild the capture stream: %s", st.label, exc)
+            return False
+        st.last_progress_monotonic = time.monotonic()
+        logger.info("[%s] capture stream rebuilt.", st.label)
+        return True
 
     def _writer_loop(self, st: _StreamState) -> None:
         """Drain the queue into a WAV file. Sentinel ``None`` ends the loop."""
