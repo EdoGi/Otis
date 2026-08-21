@@ -353,10 +353,14 @@ class GoogleCalendarPoller:
         # half-open socket (captive portal, VPN flap, sleep mid-request) blocks
         # the poll thread forever — stop() then joins for 2 s, gives up, and the
         # next off-hours cycle starts *another* thread on top of it.
+        # NB: `http` and `credentials` are mutually exclusive — googleapiclient
+        # raises if both are given. The AuthorizedHttp already carries the
+        # credentials, so passing it is what authorises the client. Passing both
+        # (as this did briefly) makes every service build fail, which silently
+        # disables calendar detection entirely.
         return build(
             "calendar",
             "v3",
-            credentials=creds,
             cache_discovery=False,
             http=self._authorized_http(creds),
         )

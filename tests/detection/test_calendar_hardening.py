@@ -183,3 +183,51 @@ def test_authorized_http_carries_a_timeout(poller) -> None:
 
 def test_timeout_is_a_sane_value() -> None:
     assert 1.0 <= HTTP_TIMEOUT_SECONDS <= 60.0
+
+
+# ---------------------------------------------------------------------------
+# The transport must actually build a client
+# ---------------------------------------------------------------------------
+def test_build_service_produces_a_working_client(poller, monkeypatch) -> None:
+    """Regression: adding the HTTP timeout passed BOTH `http` and
+    `credentials` to googleapiclient.build(), which are mutually exclusive.
+    Every service build raised, so calendar detection was silently dead —
+    while the isolated test of _authorized_http kept passing, because it
+    asserted the shape of the transport rather than that a client could be
+    built from it.
+    """
+    pytest.importorskip("googleapiclient")
+    pytest.importorskip("google_auth_httplib2")
+
+    class Creds:
+        def before_request(self, *a, **k):
+            pass
+
+        @property
+        def valid(self):
+            return True
+
+    monkeypatch.setattr(poller, "authenticate", lambda **_kw: Creds())
+
+    captured: dict[str, Any] = {}
+
+    def fake_build(serviceName, version, **kwargs):
+        captured.update(kwargs)
+        captured["serviceName"] = serviceName
+        # Mirror googleapiclient's own guard so the test fails the same way.
+        if kwargs.get("http") is not None and kwargs.get("credentials") is not None:
+            raise TypeError("Arguments http and credentials are mutually exclusive")
+        return object()
+
+    import googleapiclient.discovery as disc
+
+    monkeypatch.setattr(disc, "build", fake_build)
+
+    service = poller._build_service()
+
+    assert service is not None
+    assert captured["serviceName"] == "calendar"
+    assert captured.get("http") is not None, "the timeout transport must be used"
+    assert captured.get("credentials") is None, (
+        "credentials travel inside the AuthorizedHttp; passing both raises"
+    )
