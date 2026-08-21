@@ -14,8 +14,10 @@ Pipeline
 4. **Align**: shift system segments by
    ``offset = system_start - mic_start`` so both tracks live on the mic
    timeline.
-5. **Echo dedup**: drop system segments that mirror a mic segment within
-   ±1 s and ≥80 % word-set overlap (mic picked up speaker audio).
+5. **Echo dedup**: drop *mic* segments that mirror a *system* segment within
+   ±1 s and >=80 % word-set overlap. BlackHole captures system output, which
+   cannot contain your microphone — so a match means the mic heard the
+   speakers, and the system copy is the direct capture worth keeping.
 6. **Interleave** chronologically and mark concurrent segments with
    ``[overlap]``.
 7. **Render** Markdown with a YAML frontmatter block.
@@ -160,7 +162,7 @@ class TranscriptProcessor:
         store: TranscriptStore,
         audio_dir: str | Path,
         model_name: str | None = None,
-        dedup_echoes: bool = False,
+        dedup_echoes: bool = True,
         suggest_titles: bool = True,
     ) -> None:
         self._engine = engine
@@ -171,12 +173,11 @@ class TranscriptProcessor:
         # descriptive one ("Onboarding with Acme") instead of saving every
         # ad-hoc session as "Ad-hoc Recording". Local heuristic only.
         self._suggest_titles = suggest_titles
-        # Echo dedup off by default. Real meetings often have both streams
-        # carrying the other person's voice (mic picks up speakers / earphone
-        # leak), and our heuristic was preferring the mic copy and dropping
-        # the system one — labeling the other speaker as "Me:". Keeping both
-        # tracks unfiltered is the safer default; ``[overlap]`` markers in
-        # the rendered Markdown still show when concurrent segments happen.
+        # Echo dedup, on by default now that it runs in the right direction.
+        # Without it, a call held on speakers transcribes every sentence twice
+        # — once from the far end via BlackHole and once from the mic hearing
+        # the speakers — which makes the transcript unreadable. Verified on a
+        # real recording: 25 of 66 lines were duplicated.
         self._dedup_echoes = dedup_echoes
 
     # ------------------------------------------------------------------ sync
@@ -242,10 +243,19 @@ class TranscriptProcessor:
         sys_segments = sys_result.segments if sys_result is not None else []
         offset = _compute_offset(mic_anchor, sys_anchor)
         sys_segments = apply_offset(sys_segments, offset)
+        # Which copy is the echo? BlackHole captures system *output*, which
+        # cannot contain your microphone — so when the same words appear in
+        # both streams, the mic picked them up off the speakers. The system
+        # copy is the direct digital capture and the one to keep.
+        #
+        # The original code deduped the other way and dropped the system copy,
+        # which labelled the other person as "Me:". That is why it shipped
+        # disabled rather than fixed.
+        mic_segments = mic_result.segments
+        dropped = 0
         if self._dedup_echoes:
-            deduped_sys, dropped = deduplicate_echo(sys_segments, mic_result.segments)
-        else:
-            deduped_sys, dropped = sys_segments, 0
+            mic_segments, dropped = deduplicate_echo(mic_segments, sys_segments)
+        deduped_sys = sys_segments
 
         # Re-stamp both streams onto the wall clock. Pause drops frames rather
         # than writing silence, so up to this point every timestamp is an
@@ -260,7 +270,7 @@ class TranscriptProcessor:
                 session.session_id, pause_timeline.total_pause_seconds,
             )
         labelled_mic = [
-            _LabelledSegment(s, "Me") for s in pause_timeline.shift_segments(mic_result.segments)
+            _LabelledSegment(s, "Me") for s in pause_timeline.shift_segments(mic_segments)
         ]
         labelled_sys = [
             _LabelledSegment(s, "Participant") for s in pause_timeline.shift_segments(deduped_sys)
@@ -543,34 +553,37 @@ def apply_offset(segments: list[Segment], offset: float) -> list[Segment]:
 
 
 def deduplicate_echo(
-    system_segments: list[Segment],
-    mic_segments: list[Segment],
+    candidate_segments: list[Segment],
+    reference_segments: list[Segment],
     *,
     time_window: float = ECHO_TIME_WINDOW_SECONDS,
     overlap_threshold: float = ECHO_WORD_OVERLAP_THRESHOLD,
 ) -> tuple[list[Segment], int]:
-    """Drop system segments that look like an echo of a mic segment.
+    """Drop candidate segments that look like an echo of a reference segment.
 
-    Returns ``(kept_system_segments, dropped_count)``.
+    Returns ``(kept_candidates, dropped_count)``.
 
-    Heuristic: same logical speech if there's a mic segment whose start time
-    is within ``time_window`` seconds AND whose word set overlaps the system
-    segment's by ≥``overlap_threshold`` (intersection / max-set-size).
+    Heuristic: same logical speech if there's a reference segment whose start
+    time is within ``time_window`` seconds AND whose word set overlaps the
+    candidate's by >= ``overlap_threshold`` (intersection / max-set-size).
+
+    Direction is the caller's choice and it matters — see the call site in
+    :meth:`TranscriptProcessor.process`.
     """
-    if not system_segments or not mic_segments:
-        return list(system_segments), 0
+    if not candidate_segments or not reference_segments:
+        return list(candidate_segments), 0
 
     kept: list[Segment] = []
     dropped = 0
-    mic_words_cache = [(s, _normalise_words(s.text)) for s in mic_segments]
+    ref_words_cache = [(s, _normalise_words(s.text)) for s in reference_segments]
 
-    for sys_seg in system_segments:
+    for sys_seg in candidate_segments:
         sys_words = _normalise_words(sys_seg.text)
         if not sys_words:
             kept.append(sys_seg)
             continue
         is_echo = False
-        for mic_seg, mic_words in mic_words_cache:
+        for mic_seg, mic_words in ref_words_cache:
             if abs(mic_seg.start - sys_seg.start) > time_window:
                 continue
             if not mic_words:

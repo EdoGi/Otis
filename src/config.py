@@ -69,6 +69,7 @@ DEFAULTS: dict[str, Any] = {
         "model": "small",
         "language": None,
         "suggest_titles": True,
+        "dedup_echoes": True,
         "defer_while_in_call": True,
     },
     "storage": {

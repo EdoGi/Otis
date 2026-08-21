@@ -273,10 +273,13 @@ def test_process_applies_monotonic_offset_to_system_segments(tmp_path: Path) -> 
 
 
 def test_process_dedupes_echo_when_opted_in(tmp_path: Path) -> None:
-    """When ``dedup_echoes=True``, identical text from both tracks → only mic stays.
+    """Identical text on both tracks -> only the SYSTEM copy survives.
 
-    Default (False) preserves both streams; this test asserts the optional
-    dedup path still works for callers that explicitly want it.
+    Direction matters. BlackHole records system *output*, which cannot contain
+    your microphone, so a duplicate always means the mic heard the speakers —
+    the system copy is the direct capture. Deduping the other way (the original
+    behaviour) labelled the other person as "Me:", which is why it shipped
+    disabled instead of fixed.
     """
     session = _make_recording_session(tmp_path)
     engine = _engine_returning(
@@ -291,12 +294,12 @@ def test_process_dedupes_echo_when_opted_in(tmp_path: Path) -> None:
 
     result = processor.process(session, meeting=MeetingSnapshot())
     assert result.echo_dropped == 1
-    assert "Participant: good morning everyone" not in result.body
-    assert "Me: good morning everyone" in result.body
+    assert "Me: good morning everyone" not in result.body
+    assert "Participant: good morning everyone" in result.body
 
 
-def test_process_keeps_both_streams_by_default(tmp_path: Path) -> None:
-    """Default behaviour: same content on both tracks → both kept (no dedup)."""
+def test_process_keeps_both_streams_when_dedup_is_disabled(tmp_path: Path) -> None:
+    """dedup_echoes=false keeps both tracks raw, for anyone who wants them."""
     session = _make_recording_session(tmp_path)
     engine = _engine_returning(
         mic_segments=[(0.0, 2.0, "good morning everyone")],
@@ -305,6 +308,7 @@ def test_process_keeps_both_streams_by_default(tmp_path: Path) -> None:
     store = TranscriptStore(tmp_path / "transcripts")
     processor = TranscriptProcessor(
         engine=engine, store=store, audio_dir=session.audio_dir,
+        dedup_echoes=False,
     )
 
     result = processor.process(session, meeting=MeetingSnapshot())

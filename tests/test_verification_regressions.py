@@ -176,8 +176,16 @@ def test_the_default_process_source_is_the_one_that_always_works() -> None:
     assert _default_process_iter is not nsworkspace_process_iter
     sample = list(_default_process_iter())
     assert sample and all("name" in p for p in sample)
-    # It really is the psutil source: far more entries than there are apps.
-    assert len(sample) == len(list(_psutil_processes()))
+    # It really is the psutil source: processes, not applications. The exact
+    # count drifts between two enumerations as processes come and go, so
+    # compare the magnitude rather than an exact figure.
+    from src.detection.process_monitor import _nsworkspace_apps
+
+    apps = _nsworkspace_apps()
+    if apps is not None:
+        assert len(sample) > len(apps) * 1.5, (
+            f"{len(sample)} entries looks like the application source, not psutil"
+        )
 
 
 def test_the_menu_bar_opts_into_the_fast_source() -> None:

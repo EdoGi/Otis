@@ -433,8 +433,18 @@ def t_silent_head_then_speech_is_not_skipped(tmp: Path) -> None:
     assert called["hit"], "Pre-check rejected a quiet-head WAV — silent-head bug regressed"
 
 
-def t_processor_keeps_both_streams_by_default(tmp: Path) -> None:
-    """Default behaviour: same content on both tracks → BOTH appear in body."""
+def t_processor_dedupes_speaker_bleed_by_default(tmp: Path) -> None:
+    """A call on speakers must not be transcribed twice.
+
+    This check used to assert the opposite, because dedup shipped disabled: it
+    ran in the wrong direction, dropping the *system* copy and labelling the
+    other person as "Me:". BlackHole records system output and can never
+    contain your microphone, so a duplicate always means the mic heard the
+    speakers — the system copy is the direct capture and the one to keep.
+
+    Verified on a real recording before this changed: 25 of 66 lines were
+    duplicated.
+    """
     audio_dir = tmp / "audio"
     audio_dir.mkdir()
     sid = "default-keep-both"
@@ -459,11 +469,16 @@ def t_processor_keeps_both_streams_by_default(tmp: Path) -> None:
         json.loads((audio_dir / f"{sid}_metadata.json").read_text()), audio_dir=audio_dir,
     )
     result = proc.process(session, meeting=MeetingSnapshot())
-    assert result.echo_dropped == 0
-    assert "Me: good morning everyone" in result.body
+    assert result.echo_dropped == 1, "speaker bleed should have been dropped"
     assert "Participant: good morning everyone" in result.body, (
-        "Default off-dedup should keep both streams — dedup-default regression"
+        "the direct system capture is the copy worth keeping"
     )
+    assert "Me: good morning everyone" not in result.body, (
+        "the mic echo must not be attributed to the user"
+    )
+
+    # (The dedup_echoes=false opt-out is covered by the unit suite; re-running
+    # process() here would find no audio, since the first run relocates it.)
 
 
 def t_orphan_finder_handles_mixed_layouts(tmp: Path) -> None:
@@ -712,7 +727,7 @@ TESTS = [
     ("transcripts in pre-existing YYYY/MM subdirs are found", t_store_handles_transcripts_in_subdirs),
     ("retention does not delete in-progress recordings", t_audio_retention_handles_concurrent_recording),
     ("silent-head WAV is NOT skipped (regression)", t_silent_head_then_speech_is_not_skipped),
-    ("default behaviour keeps both mic + system streams", t_processor_keeps_both_streams_by_default),
+    ("speaker bleed is deduped, keeping the system copy", t_processor_dedupes_speaker_bleed_by_default),
     ("orphan finder handles mixed layouts coherently", t_orphan_finder_handles_mixed_layouts),
     ("orphan finder excludes the active-recording session", t_orphan_finder_excludes_active_recording),
     ("save_failure writes a status:failed placeholder transcript", t_failure_placeholder_lands_on_disk),

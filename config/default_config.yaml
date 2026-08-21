@@ -66,6 +66,13 @@ transcription:
   # like "Onboarding with Acme" instead of "Ad-hoc Recording". The filename
   # keeps its date+time prefix. Local heuristic — nothing leaves the Mac.
   suggest_titles: true
+  # A call held on speakers is captured twice: once from the far end through
+  # BlackHole, and again by the mic hearing your own speakers. Without this,
+  # every sentence appears in the transcript twice. Since BlackHole records
+  # system *output*, it can never contain your voice — so a duplicate always
+  # means the mic echoed, and the system copy is the one kept.
+  # Set to false to keep both tracks raw.
+  dedup_echoes: true
 
 storage:
   transcript_dir: "~/Otis/transcripts"
