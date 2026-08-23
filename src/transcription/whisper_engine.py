@@ -165,6 +165,9 @@ class WhisperEngine:
             )
         self._model_name = model_name
         self._model_repo = _MODEL_REPO_MAP[model_name]
+        #: Local snapshot directory, resolved on first use. See
+        #: :func:`resolve_model_path` for why we do not just pass the repo id.
+        self._resolved_model_path: str | None = None
         self._idle_timeout = float(idle_timeout_seconds)
         self._transcribe_fn = transcribe_fn or _default_mlx_transcribe
         self._health = health
@@ -381,7 +384,7 @@ class WhisperEngine:
         #   guard).
         return self._transcribe_fn(
             str(path),
-            path_or_hf_repo=self._model_repo,
+            path_or_hf_repo=self.model_path,
             language=language,
             verbose=False,
             condition_on_previous_text=False,
@@ -407,6 +410,21 @@ class WhisperEngine:
             duration_seconds=float(raw["duration"]) if raw.get("duration") else None,
             raw=raw,
         )
+
+    @property
+    def model_path(self) -> str:
+        """Local directory for the model, resolved once and remembered.
+
+        Falls back to the repo id if it cannot be resolved, so a first run on
+        a machine with no cached model still downloads normally.
+        """
+        with self._lock:
+            if self._resolved_model_path is not None:
+                return self._resolved_model_path
+        resolved = resolve_model_path(self._model_repo)
+        with self._lock:
+            self._resolved_model_path = resolved
+        return resolved
 
     def _current_rtf(self) -> float:
         with self._lock:
@@ -625,6 +643,44 @@ CHUNK_SECONDS = 600.0
 #: (Whisper returning almost nothing for ten minutes of audio) can hit it; it
 #: exists so the loop always terminates.
 MIN_ADVANCE_SECONDS = 30.0
+
+
+def resolve_model_path(repo: str) -> str:
+    """Return a local directory holding ``repo``, contacting the network only
+    if the model is not on disk yet.
+
+    mlx-whisper passes whatever it is given straight to ``snapshot_download``,
+    which calls huggingface.co on *every* load even when all four files are
+    already cached — measured 265.9 ms against 0.1 ms for the same resolution
+    done locally. The engine drops the model after ``idle_timeout_seconds``,
+    so a normal day of meetings repeats that request once per meeting.
+
+    Two reasons to stop. The README promises "No telemetry. No analytics. No
+    phone-home", and this was the one thing contradicting it — the timing of
+    every meeting you transcribe, leaked to a third party. And a laptop with
+    no connection should still be able to transcribe what it just recorded.
+
+    Resolution is: cached copy, else download it once, else hand back the repo
+    id and let mlx-whisper raise the error that actually explains the problem.
+    """
+    try:
+        from huggingface_hub import snapshot_download  # type: ignore[import-not-found]
+    except Exception:  # pragma: no cover (hub always ships with mlx-whisper)
+        return repo
+
+    try:
+        return str(snapshot_download(repo_id=repo, local_files_only=True))
+    except Exception:
+        logger.info("Model %s is not cached yet; downloading once.", repo)
+
+    try:
+        return str(snapshot_download(repo_id=repo))
+    except Exception:
+        logger.warning(
+            "Could not resolve %s locally or fetch it; letting mlx-whisper try.",
+            repo, exc_info=True,
+        )
+        return repo
 
 
 def _default_mlx_transcribe(audio: str, **kwargs: Any) -> dict[str, Any]:
