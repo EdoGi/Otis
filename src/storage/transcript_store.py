@@ -24,9 +24,15 @@ Files are simple Markdown with a YAML frontmatter block:
     # Title
     <body>
 
-We deliberately avoid a database; ``rglob`` over a year-tree is plenty fast
-for years' worth of meetings, and the user can read / grep / version-control
-the files directly.
+We deliberately avoid a database. The files are the only source of truth, so
+the user can read / grep / version-control / edit them directly, and nothing
+we keep in memory can disagree with what is on disk.
+
+Scans are kept cheap by :class:`_FrontmatterCache` rather than by an index:
+parsing the YAML is 99% of a scan, and walking the tree is nearly free
+(measured at 1 000 transcripts: 773 ms parsing, 7.4 ms for rglob + one stat
+per file). So every call still walks the tree and stats every file, and only
+re-parses the ones whose bytes changed.
 """
 
 from __future__ import annotations
@@ -35,7 +41,8 @@ import logging
 import os
 import re
 import shutil
-from collections.abc import Iterable
+import threading
+from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -96,6 +103,60 @@ def render_with_frontmatter(frontmatter: dict[str, Any], body: str) -> str:
 # ---------------------------------------------------------------------------
 # TranscriptStore
 # ---------------------------------------------------------------------------
+class _FrontmatterCache:
+    """Parsed frontmatter keyed by path, revalidated against ``stat`` each use.
+
+    Every read path in the store used to walk the tree and re-parse every
+    file's YAML: ``list_transcripts`` 579 ms and ``completed_session_ids``
+    564 ms at 1 000 transcripts, both on the rumps main thread, and both run
+    after every transcription. A saved ``.md`` never changes unless something
+    writes to it, so the parse is what to avoid — not the walk.
+
+    Correctness comes first here, because these files are meant to be edited
+    by hand, replaced by ``git checkout``, and deleted in Finder. So this is a
+    cache, never an index: callers still walk the tree and stat every file,
+    and an entry is reused only while ``(st_mtime_ns, st_size)`` is unchanged.
+    There is no invalidation protocol to get wrong and no persisted state that
+    can drift from the directory.
+    """
+
+    def __init__(self) -> None:
+        self._entries: dict[Path, tuple[int, int, dict[str, Any]]] = {}
+        self._lock = threading.Lock()
+        #: Parses performed. Instrumentation only — tests assert that repeat
+        #: scans of an unchanged tree do not re-parse.
+        self.parses = 0
+
+    def get(
+        self,
+        path: Path,
+        st: os.stat_result,
+        parse: Callable[[Path], dict[str, Any]],
+    ) -> dict[str, Any]:
+        stamp = (st.st_mtime_ns, st.st_size)
+        with self._lock:
+            cached = self._entries.get(path)
+            if cached is not None and cached[:2] == stamp:
+                return cached[2]
+        # Parse outside the lock: two threads racing the same new file each do
+        # the work once, which is cheaper than serialising every reader on IO.
+        fm = parse(path)
+        with self._lock:
+            self._entries[path] = (*stamp, fm)
+            self.parses += 1
+        return fm
+
+    def retain(self, live: set[Path]) -> None:
+        """Forget files that are no longer on disk."""
+        with self._lock:
+            for gone in self._entries.keys() - live:
+                del self._entries[gone]
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+
+
 class TranscriptStore:
     """Filesystem-backed CRUD for transcript ``.md`` files.
 
@@ -108,6 +169,7 @@ class TranscriptStore:
     def __init__(self, transcript_dir: str | os.PathLike[str]) -> None:
         self._root = Path(transcript_dir).expanduser()
         self._root.mkdir(parents=True, exist_ok=True)
+        self._fm_cache = _FrontmatterCache()
 
     @property
     def root(self) -> Path:
@@ -224,11 +286,7 @@ class TranscriptStore:
 
     def path_for(self, transcript_id: str) -> Path | None:
         """Locate the .md file whose frontmatter ``id`` matches."""
-        for path in self._iter_transcripts():
-            try:
-                fm = self._read_frontmatter_fast(path)
-            except Exception:
-                continue
+        for path, fm in self._iter_frontmatter():
             if fm.get("id") == transcript_id:
                 return path
         return None
@@ -251,11 +309,7 @@ class TranscriptStore:
         this instead of per-id :meth:`has_completed_transcript` lookups.
         """
         ids: set[str] = set()
-        for path in self._iter_transcripts():
-            try:
-                fm = self._read_frontmatter_fast(path)
-            except Exception:
-                continue
+        for _path, fm in self._iter_frontmatter():
             sid = fm.get("id")
             if sid and transcript_is_complete(fm):
                 ids.add(str(sid))
@@ -269,11 +323,7 @@ class TranscriptStore:
         untranscribed so retry surfaces (the Generate Transcript menu) keep
         offering it.
         """
-        for path in self._iter_transcripts():
-            try:
-                fm = self._read_frontmatter_fast(path)
-            except Exception:
-                continue
+        for _path, fm in self._iter_frontmatter():
             if fm.get("id") == transcript_id and fm.get("status") != "failed":
                 return True
         return False
@@ -293,12 +343,7 @@ class TranscriptStore:
         results: list[tuple[str, dict[str, Any]]] = []
         needle = query.lower() if query else None
 
-        for path in self._iter_transcripts():
-            try:
-                fm = self._read_frontmatter_fast(path)
-            except Exception as exc:
-                logger.warning("Skipping %s: %s", path, exc)
-                continue
+        for path, fm in self._iter_frontmatter():
             # Empty / unparseable frontmatter ⇒ corrupt or in-progress write.
             # Don't surface these in listings.
             if not fm or not fm.get("id"):
@@ -401,12 +446,9 @@ class TranscriptStore:
 
     def _trash_stale_failures(self, transcript_id: str, *, keep: Path) -> None:
         """Trash failure placeholders for ``transcript_id`` other than ``keep``."""
-        for path in list(self._iter_transcripts()):
+        # Materialised: the loop trashes files out from under the walk.
+        for path, fm in list(self._iter_frontmatter()):
             if path == keep:
-                continue
-            try:
-                fm = self._read_frontmatter_fast(path)
-            except Exception:
                 continue
             if fm.get("id") == transcript_id and fm.get("status") == "failed":
                 try:
@@ -525,6 +567,28 @@ class TranscriptStore:
             if ".trash" in path.parts:
                 continue
             yield path
+
+    def _iter_frontmatter(self) -> Iterable[tuple[Path, dict[str, Any]]]:
+        """Yield ``(path, frontmatter)`` for every transcript on disk.
+
+        Walks and stats afresh every call — only the YAML parse is cached, so
+        an edit made outside Otis is picked up on the next call.
+        """
+        live: set[Path] = set()
+        for path in self._iter_transcripts():
+            try:
+                st = path.stat()
+            except OSError:
+                continue  # vanished between the walk and the stat
+            live.add(path)
+            try:
+                fm = self._fm_cache.get(path, st, self._read_frontmatter_fast)
+            except Exception as exc:
+                logger.warning("Skipping %s: %s", path, exc)
+                continue
+            yield path, fm
+        # Only reached on a full pass; an early `break` just defers eviction.
+        self._fm_cache.retain(live)
 
     @staticmethod
     def _read_frontmatter_fast(path: Path) -> dict[str, Any]:
