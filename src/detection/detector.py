@@ -170,6 +170,11 @@ class MeetingDetector:
             poller.on_meeting_should_end(self._handle_calendar_ended)
 
     @property
+    def process_monitor(self) -> ProcessMonitor | None:
+        """The app watcher, so the settings UI can retune it while running."""
+        return self._process_monitor
+
+    @property
     def calendar_pollers(self) -> tuple[GoogleCalendarPoller, ...]:
         """All calendar pollers attached to this detector (read-only)."""
         return tuple(self._calendar_pollers)

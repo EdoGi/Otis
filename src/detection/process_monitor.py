@@ -155,6 +155,23 @@ class ProcessMonitor:
     # =====================================================================
     # Public API
     # =====================================================================
+    @property
+    def whitelist(self) -> list[str]:
+        """The apps currently being watched for, lower-cased."""
+        with self._lock:
+            return list(self._whitelist)
+
+    def set_whitelist(self, apps: Iterable[str]) -> None:
+        """Replace the watched set while the monitor is running.
+
+        The menu-bar editor used to tell the user to restart. It does not need
+        to: the poll loop reads this on every tick, so an app ticked on is
+        watched from the next poll and one ticked off stops mattering at once.
+        """
+        with self._lock:
+            self._whitelist = [w.lower() for w in apps]
+        logger.info("Whitelist updated: %s", ", ".join(self._whitelist) or "(empty)")
+
     def on_meeting_detected(self, callback: DetectedCallback) -> None:
         """Register a callback for the ``meeting_detected`` event."""
         self._on_detected.append(callback)
@@ -219,6 +236,9 @@ class ProcessMonitor:
 
         names_seen: set[str] = set()
         pids_by_name: dict[str, set[int]] = {}
+        # Snapshot once: set_whitelist can land mid-poll now that the menu-bar
+        # editor applies live, and a scan should decide against one list.
+        whitelist = self.whitelist
 
         for proc in processes:
             try:
@@ -245,7 +265,7 @@ class ProcessMonitor:
             # "superwhisperd").
             if any(b in lname or (bid and b in bid) for b in self._blacklist):
                 continue
-            for white in self._whitelist:
+            for white in whitelist:
                 if owns(white):
                     names_seen.add(white)
                     pids_by_name.setdefault(white, set())

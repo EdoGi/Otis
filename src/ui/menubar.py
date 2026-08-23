@@ -42,7 +42,7 @@ import os
 import queue
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -229,6 +229,84 @@ class UiSnapshot:
         if self.state == UiState.DEFERRED:
             return "waiting"
         return ""
+
+
+#: Offered in the whitelist editor whether or not they are running, so a user
+#: who unticks one can ever tick it back on.
+KNOWN_MEETING_APPS: tuple[str, ...] = (
+    "zoom.us",
+    "Microsoft Teams",
+    "Webex",
+    "Slack",
+    "FaceTime",
+    "Discord",
+    "Google Meet",
+    "Whereby",
+)
+
+#: Cap on how many *running* apps get appended, so the submenu stays a menu.
+MAX_RUNNING_CANDIDATES = 20
+
+
+def running_app_names() -> list[str]:
+    """Names of applications running right now, best effort."""
+    try:
+        from src.detection.process_monitor import _nsworkspace_apps
+
+        apps = _nsworkspace_apps()
+    except Exception:  # pragma: no cover (non-macOS)
+        return []
+    if not apps:
+        return []
+    names: list[str] = []
+    for app in apps:
+        bundle = str(app.get("bundle_id") or "").lower()
+        # Apple's own apps are almost never what someone wants to whitelist,
+        # and they are most of the list. FaceTime is offered above regardless.
+        if bundle.startswith("com.apple."):
+            continue
+        name = str(app.get("name") or "").strip()
+        if name:
+            names.append(name)
+    return names
+
+
+def whitelist_candidates(
+    enabled: Iterable[str], *, running: Iterable[str] | None = None,
+) -> list[str]:
+    """Everything the whitelist editor should offer, in a stable order.
+
+    The old menu was built from the whitelist itself, with every entry ticked.
+    So unticking Slack removed it from the config, and after a restart it was
+    not in the list any more — unreachable except by hand-editing YAML. There
+    was no way to add an app either.
+
+    Offering enabled + known + running fixes both directions: what you turned
+    off stays visible to turn back on, and anything you are actually running
+    can be added without leaving the menu.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+
+    def add(name: str) -> None:
+        key = name.strip().lower()
+        if not key or key in seen:
+            return
+        seen.add(key)
+        out.append(name.strip())
+
+    for name in enabled:            # yours first — the ones you chose
+        add(str(name))
+    for name in KNOWN_MEETING_APPS:  # then what we ship
+        add(name)
+    extra = 0
+    for name in sorted(running or []):
+        if extra >= MAX_RUNNING_CANDIDATES:
+            break
+        before = len(out)
+        add(str(name))
+        extra += len(out) - before
+    return out
 
 
 # ============================================================================
@@ -593,13 +671,15 @@ class MenuBarApp:
         # App whitelist
         wl_root = rumps.MenuItem("App Whitelist")
         self._whitelist_items: dict[str, rumps.MenuItem] = {}
-        whitelist = self._config.get(
-            "detection", "process_monitor", "whitelisted_apps", default=[]
-        )
-        for app_name in whitelist:
+        enabled = [
+            str(a) for a in self._config.get(
+                "detection", "process_monitor", "whitelisted_apps", default=[]
+            ) or []
+        ]
+        for app_name in whitelist_candidates(enabled, running=running_app_names()):
             it = rumps.MenuItem(app_name, callback=self._on_whitelist_toggled)
             it._otis_app_name = app_name  # type: ignore[attr-defined]
-            it.state = True
+            it.state = app_name in enabled
             self._whitelist_items[app_name] = it
             wl_root.add(it)
         self._mi["settings_whitelist_root"] = wl_root
@@ -871,12 +951,27 @@ class MenuBarApp:
         self._persist_setting(
             {"detection": {"process_monitor": {"whitelisted_apps": active}}}
         )
+        applied = self._apply_whitelist_live(active)
         self._notifications.notify(
-            NotificationType.ERROR,
+            NotificationType.SETTING_SAVED,
             "Whitelist saved",
-            "Restart Otis for whitelist changes to take effect.",
-            force=True,
+            "Now watching: " + (", ".join(active) or "nothing")
+            if applied
+            else "Restart Otis for this to take effect.",
         )
+
+    def _apply_whitelist_live(self, active: list[str]) -> bool:
+        """Push the new whitelist into the running monitor. True if it landed."""
+        monitor = getattr(self._detector, "process_monitor", None)
+        setter = getattr(monitor, "set_whitelist", None)
+        if setter is None:
+            return False
+        try:
+            setter(active)
+            return True
+        except Exception:
+            logger.exception("Could not apply the whitelist live")
+            return False
 
     def _on_open_transcripts_web(self, _sender: Any) -> None:
         host = self._config.get("web", "host", default="127.0.0.1")

@@ -41,6 +41,9 @@ class NotificationType(str, Enum):
     RECORDING_PAUSED = "recording_paused"
     PROCESS_DISAPPEARED = "process_disappeared"
     TRANSCRIPTION_COMPLETE = "transcription_complete"
+    #: A setting was persisted. Its own type because these used to be sent as
+    #: ERROR — "Whitelist saved" arriving as a failure.
+    SETTING_SAVED = "setting_saved"
     ERROR = "error"
 
 
