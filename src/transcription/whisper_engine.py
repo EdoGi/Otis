@@ -62,6 +62,10 @@ DEFAULT_IDLE_TIMEOUT_SECONDS = 300.0
 # really pathological cases.
 SILENCE_RMS_THRESHOLD = 0.001
 
+#: Ceiling on an afconvert decode. A 2-hour FLAC decodes in a couple of
+#: seconds; anything near this means something is wrong.
+DECODE_TIMEOUT_SECONDS = 300.0
+
 
 # ---------------------------------------------------------------------------
 # Public types
@@ -615,48 +619,145 @@ def _default_mlx_transcribe(audio: str, **kwargs: Any) -> dict[str, Any]:
     except Exception as exc:  # pragma: no cover (no mlx-whisper in tests)
         raise _MlxImportFailure(str(exc)) from exc
 
-    samples = _wav_to_float32_mono16k(audio)
+    samples = decode_to_float32_mono16k(audio)
     return mlx_whisper.transcribe(samples, **kwargs)  # type: ignore[no-any-return]
 
 
-def _wav_to_float32_mono16k(path: str) -> "Any":
-    """Decode a WAV file to a 1-D float32 numpy array at 16 kHz mono.
+#: Formats we can decode without ffmpeg, via macOS's own AudioToolbox.
+#: `which ffmpeg` returns nothing on a stock Mac — and mlx-whisper's loader
+#: shells out to it for *any* input — so this is what makes non-WAV audio
+#: usable at all. afconvert ships with macOS; no new dependency.
+DECODABLE_SUFFIXES = (".wav", ".flac", ".caf", ".m4a", ".aiff", ".aif", ".mp3")
 
-    Whisper expects exactly that shape: 16 kHz, mono, normalised float in
-    ``[-1, 1]``. Our recorder always writes that format so the work here
-    is one frombuffer + a divide. If the file is at a different rate or
-    width we still bail to mlx-whisper's path-based ffmpeg loader as a
-    safety net (raises the same actionable error if ffmpeg is missing).
+TARGET_SAMPLE_RATE = 16000
+
+
+def decode_to_float32_mono16k(path: str | Path) -> "Any":
+    """Decode any supported audio file to 1-D float32 mono at 16 kHz.
+
+    Whisper wants exactly that shape. Our recorder writes it directly, so a
+    conforming WAV is one ``frombuffer`` and an in-place scale. Anything else —
+    FLAC, or a WAV at some other rate or width — is transcoded through
+    ``afconvert``, which is part of macOS.
+
+    This ordering matters for the FLAC migration: the decoder has to exist and
+    work before anything starts *writing* FLAC, or retranscribe and orphan
+    recovery break silently on a machine with no ffmpeg.
     """
-    import numpy as np
-
-    with wave.open(str(path), "rb") as wf:
-        rate = wf.getframerate()
-        channels = wf.getnchannels()
-        sampwidth = wf.getsampwidth()
-        if rate == 16000 and channels == 1 and sampwidth == 2:
-            raw = wf.readframes(wf.getnframes())
-            return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-
-    # Format we don't natively support — let mlx-whisper deal (will need ffmpeg).
-    logger.info(
-        "WAV at %s is %dHz/%dch/%d-bit; falling back to mlx-whisper's loader.",
-        path, rate, channels, sampwidth * 8,
-    )
+    path = Path(path)
+    arr = _read_conforming_wav(path)
+    if arr is not None:
+        return arr
+    arr = _afconvert_decode(path)
+    if arr is not None:
+        return arr
+    # Last resort: mlx-whisper's own loader. Needs ffmpeg, which is usually
+    # absent — but if the user has it, better to use it than to fail.
+    logger.info("Falling back to mlx-whisper's loader for %s", path.name)
     import mlx_whisper.audio  # type: ignore[import-not-found]
 
     return mlx_whisper.audio.load_audio(str(path))
 
 
-def _safe_wav_duration_seconds(path: Path) -> float:
-    """Read a WAV header to compute duration. Returns 0 on failure."""
+def _read_conforming_wav(path: Path) -> "Any | None":
+    """Fast path: a WAV already at 16 kHz / mono / 16-bit. ``None`` otherwise."""
+    import numpy as np
+
     try:
         with wave.open(str(path), "rb") as wf:
-            frames = wf.getnframes()
-            rate = wf.getframerate() or 1
-            return frames / rate
-    except Exception:  # pragma: no cover (corrupt files)
+            if (
+                wf.getframerate() != TARGET_SAMPLE_RATE
+                or wf.getnchannels() != 1
+                or wf.getsampwidth() != 2
+            ):
+                return None
+            raw = wf.readframes(wf.getnframes())
+    except Exception:
+        return None
+    # astype() then /= in place. Writing `.astype(...) / 32768.0` allocates a
+    # second full copy of the array — 372 MB for a 97-minute recording — for a
+    # scale by a constant.
+    arr = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+    arr /= 32768.0
+    return arr
+
+
+def _afconvert_decode(path: Path) -> "Any | None":
+    """Transcode via macOS ``afconvert`` into a temp WAV, then read it."""
+    import shutil
+    import subprocess
+    import tempfile
+
+    tool = shutil.which("afconvert")
+    if tool is None:  # pragma: no cover (afconvert ships with macOS)
+        return None
+
+    with tempfile.TemporaryDirectory(prefix="otis-decode-") as tmp:
+        out = Path(tmp) / "decoded.wav"
+        try:
+            subprocess.run(
+                [tool, "-f", "WAVE", "-d", f"LEI16@{TARGET_SAMPLE_RATE}",
+                 "-c", "1", str(path), str(out)],
+                check=True, capture_output=True, timeout=DECODE_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            logger.warning("afconvert could not decode %s: %s", path.name, exc)
+            return None
+        return _read_conforming_wav(out)
+
+
+def _safe_wav_duration_seconds(path: Path) -> float:
+    """Duration in seconds, for any format we can read. 0.0 on failure.
+
+    A WAV header answers this for free. For FLAC and friends we ask ``afinfo``
+    rather than decoding the whole file, so a 2-hour recording still costs
+    milliseconds.
+    """
+    try:
+        with wave.open(str(path), "rb") as wf:
+            return wf.getnframes() / (wf.getframerate() or 1)
+    except Exception:
+        pass
+    return _afinfo_duration_seconds(path)
+
+
+def _afinfo_duration_seconds(path: Path) -> float:
+    """Duration via macOS ``afinfo``. Returns 0.0 when it can't be determined."""
+    import re as _re
+    import shutil
+    import subprocess
+
+    tool = shutil.which("afinfo")
+    if tool is None:  # pragma: no cover (afinfo ships with macOS)
         return 0.0
+    try:
+        out = subprocess.run(
+            [tool, str(path)], check=True, capture_output=True,
+            text=True, timeout=30.0,
+        ).stdout
+    except Exception:  # pragma: no cover (corrupt / missing file)
+        return 0.0
+    match = _re.search(r"estimated duration:\s*([0-9.]+)", out)
+    return float(match.group(1)) if match else 0.0
+
+
+def _rms_from_decoded(path: Path, *, window_seconds: float = 5.0) -> float | None:
+    """Peak-window RMS for a format the ``wave`` module can't stream."""
+    try:
+        import numpy as np
+
+        samples = decode_to_float32_mono16k(path)
+        if samples is None or len(samples) == 0:
+            return None
+        win = max(1, int(window_seconds * TARGET_SAMPLE_RATE))
+        peak = 0.0
+        for start in range(0, len(samples), win):
+            chunk = samples[start:start + win]
+            if chunk.size:
+                peak = max(peak, float(np.sqrt(np.mean(chunk * chunk))))
+        return peak
+    except Exception:
+        return None
 
 
 def _wav_rms(path: Path, *, window_seconds: float = 5.0) -> float | None:
@@ -672,6 +773,11 @@ def _wav_rms(path: Path, *, window_seconds: float = 5.0) -> float | None:
     Returns ``None`` on any failure so the caller falls through to normal
     transcription instead of skipping a recording we couldn't measure.
     """
+    if path.suffix.lower() != ".wav":
+        # Not streamable with the `wave` module. Decoding is affordable because
+        # this only runs once per stream and the result is the same array the
+        # transcription would have produced anyway.
+        return _rms_from_decoded(path)
     try:
         with wave.open(str(path), "rb") as wf:
             sampwidth = wf.getsampwidth()
