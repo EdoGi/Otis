@@ -144,6 +144,11 @@ def make_transcription_handler(
             session, meeting=meeting, language=language, on_progress=on_progress,
         )
 
+    # The front ends need to reach the live engine — the Whisper model can be
+    # changed from the menu, and a picker that only writes config is the bug
+    # audit item 38 describes. Attached rather than closed over so it is
+    # visible to a reader of the handler.
+    transcription_handler.pipeline = pipeline  # type: ignore[attr-defined]
     return transcription_handler
 
 

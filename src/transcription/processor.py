@@ -172,7 +172,10 @@ class TranscriptProcessor:
         self._engine = engine
         self._store = store
         self._audio_dir = Path(audio_dir).expanduser()
-        self._model_name = model_name or engine.model_name
+        # None means "whatever the engine is running now" — the model can be
+        # changed from the menu mid-session, and frontmatter must record what
+        # actually produced the transcript.
+        self._model_name_override = model_name
         # When a recording has no calendar title, mine the transcript for a
         # descriptive one ("Onboarding with Acme") instead of saving every
         # ad-hoc session as "Ad-hoc Recording". Local heuristic only.
@@ -196,6 +199,11 @@ class TranscriptProcessor:
         self._archive_suffix = f".{fmt}"
 
     # ------------------------------------------------------------------ sync
+    @property
+    def _model_name(self) -> str:
+        """The model that will actually run, unless a caller pinned one."""
+        return self._model_name_override or self._engine.model_name
+
     def process(
         self,
         session: RecordingSession,

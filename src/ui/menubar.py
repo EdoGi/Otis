@@ -933,6 +933,49 @@ class MenuBarApp:
         self._persist_setting({"transcription": {"model": model}})
         self._mi["settings_model_root"].title = f"Whisper Model: {model}"
         self._update_model_menu(active=model)
+        # Applied on a worker: switching takes the engine's run lock, which is
+        # held for the whole of a transcription — minutes. The checkmark and
+        # the config are already correct; this makes the engine agree.
+        threading.Thread(
+            target=self._apply_model_live,
+            args=(model,),
+            name="otis-model-switch",
+            daemon=True,
+        ).start()
+
+    def _apply_model_live(self, model: str) -> None:
+        engine = self._engine()
+        if engine is None:
+            self._notifications.notify(
+                NotificationType.SETTING_SAVED,
+                f"Whisper model: {model}",
+                "Takes effect on restart.",
+            )
+            return
+        try:
+            changed = engine.set_model(model)
+        except Exception as exc:
+            logger.exception("Could not switch the Whisper model")
+            self._notifications.notify(
+                NotificationType.ERROR, "Could not switch model", str(exc), force=True
+            )
+            return
+        if changed:
+            self._notifications.notify(
+                NotificationType.SETTING_SAVED,
+                f"Whisper model: {model}",
+                "In effect from the next transcription.",
+            )
+
+    def _engine(self) -> Any | None:
+        """The live WhisperEngine, if this front end has one.
+
+        ``None`` in tests and in record-only setups, where "takes effect on
+        restart" is the honest thing to say.
+        """
+        pipeline = getattr(self._transcribe, "pipeline", None)
+        processor = getattr(pipeline, "processor", None)
+        return getattr(processor, "_engine", None)
 
     def _on_day_toggled(self, sender: Any) -> None:
         idx = getattr(sender, "_otis_day_index", None)

@@ -411,6 +411,40 @@ class WhisperEngine:
             raw=raw,
         )
 
+    def set_model(self, model_name: str) -> bool:
+        """Switch models. Blocks until any running transcription finishes.
+
+        The picker used to write config and stop there, so the checkmark said
+        `medium` while the engine kept running `small` — and the transcript's
+        frontmatter recorded `small` while a *failure* placeholder for the same
+        session read config directly and recorded `medium`. Two files
+        disagreeing about what produced them.
+
+        Never call this from the UI thread: ``_run_lock`` is held for the whole
+        of a transcription, which is minutes.
+        """
+        if model_name not in _MODEL_REPO_MAP:
+            raise ValueError(
+                f"Unknown model {model_name!r}; choose from {sorted(_MODEL_REPO_MAP)}"
+            )
+        with self._run_lock:
+            with self._lock:
+                if model_name == self._model_name:
+                    return False
+                previous = self._model_name
+                self._model_name = model_name
+                self._model_repo = _MODEL_REPO_MAP[model_name]
+                self._resolved_model_path = None
+                self._warm = False
+                if self._idle_timer is not None:
+                    self._idle_timer.cancel()
+                    self._idle_timer = None
+            # Outside the state lock, still inside _run_lock: nothing can be
+            # transcribing, so dropping mlx's held model is safe here.
+            _release_mlx_model_cache()
+            logger.info("Whisper model switched: %s -> %s", previous, model_name)
+            return True
+
     @property
     def model_path(self) -> str:
         """Local directory for the model, resolved once and remembered.
