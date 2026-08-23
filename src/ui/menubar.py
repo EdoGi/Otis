@@ -2089,9 +2089,44 @@ class MenuBarApp:
         except Exception:
             logger.exception("Could not save failure placeholder transcript")
 
-    @staticmethod
-    def _meeting_title_for(metadata: dict[str, Any]) -> str:
-        return metadata.get("title") or "Recording"
+    def _meeting_title_for(self, metadata: dict[str, Any]) -> str:
+        """The best name we have for what was just transcribed.
+
+        This read ``metadata["title"]``, which recorder metadata does not have
+        — verified against every metadata.json on disk — so the completion
+        toast said "Recording" every single time.
+
+        Order matters: the transcript's own title is the one the user will see
+        in Recent and the web UI, and it is the only place an auto-suggested
+        title exists. The calendar title is next. A timestamp is a poorer name
+        than either, but it is at least specific to this recording.
+        """
+        session_id = str(metadata.get("session_id") or "")
+        if session_id and self._store is not None:
+            try:
+                entry = self._store.get_transcript(session_id)
+            except Exception:
+                entry = None
+            if entry:
+                title = str((entry.get("metadata") or {}).get("title") or "").strip()
+                if title:
+                    return title
+
+        meeting = metadata.get("_meeting") or {}
+        title = str(meeting.get("title") or "").strip()
+        if title:
+            return title
+
+        started = metadata.get("start_wall_clock")
+        if started:
+            try:
+                from datetime import datetime
+
+                when = datetime.fromisoformat(str(started).replace("Z", "+00:00"))
+                return f"Recording — {when.astimezone():%Y-%m-%d %H:%M}"
+            except Exception:
+                pass
+        return "Recording"
 
     @staticmethod
     def _estimate_duration_min(metadata: dict[str, Any]) -> float:

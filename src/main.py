@@ -44,8 +44,14 @@ def _configure_logging(level: str) -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
+    # Handlers go on the root so anything that logs is captured, but the
+    # *level* is set on `src` alone. --log-level DEBUG used to turn on debug
+    # for every library in the process: urllib3 logs each request, googleapi
+    # logs whole payloads, and the 1 MB log file rotated away the Otis lines
+    # the flag was turned on to read.
     root = logging.getLogger()
-    root.setLevel(numeric)
+    root.setLevel(logging.WARNING)
+    logging.getLogger("src").setLevel(numeric)
     # Clear any handlers added by a previous call (re-runs in tests / REPL).
     for h in list(root.handlers):
         root.removeHandler(h)
