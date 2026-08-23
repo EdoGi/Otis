@@ -42,25 +42,17 @@ import os
 import queue
 import threading
 import time
-from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from src.audio.recorder import DualStreamRecorder, RecorderState
 from src.audio.wav_repair import repair_if_needed
-from src.storage.transcription_queue import TranscriptionQueue
-from src.storage.sessions import (
-    _format_session_label,
-    _resolve_session_audio,
-    find_orphan_sessions,
-)
 from src.config import Config
 from src.detection.detector import (
     MeetingContext,
     MeetingDetector,
-    MeetingState,
 )
 from src.health import (
     CALENDAR,
@@ -72,8 +64,35 @@ from src.health import (
     get_health,
 )
 from src.schedule import is_within_working_hours, working_hours_from_config
+from src.storage.sessions import (
+    _format_session_label,
+    _resolve_session_audio,
+    find_orphan_sessions,
+)
 from src.storage.transcript_store import TranscriptStore
+from src.storage.transcription_queue import TranscriptionQueue
 from src.ui.icons import ensure_icons
+from src.ui.menubar_settings import SettingsMenuMixin
+from src.ui.menubar_state import (
+    _GLYPH_FOR,
+    BLINK_INTERVAL,
+    DURATION_INTERVAL,
+    HOUR_END_PRESETS,
+    HOUR_START_PRESETS,
+    KNOWN_MEETING_APPS,
+    MAX_RUNNING_CANDIDATES,
+    QUEUE_DRAIN_INTERVAL,
+    SCHEDULE_CHECK_INTERVAL,
+    SUPPORTED_LANGUAGES,
+    WEEKDAY_NAMES,
+    WHISPER_MODELS,
+    UiSnapshot,
+    UiState,
+    format_duration_mmss,
+    running_app_names,
+    whitelist_candidates,
+    write_user_config_override,
+)
 from src.ui.notifications import (
     NotificationManager,
     NotificationType,
@@ -83,239 +102,38 @@ from src.ui.notifications import (
 
 logger = logging.getLogger(__name__)
 
-
-SUPPORTED_LANGUAGES: list[tuple[str, str | None]] = [
-    ("Auto-detect", None),
-    ("English", "en"),
-    ("French", "fr"),
-    ("Italian", "it"),
-    ("Portuguese", "pt"),
-    ("Spanish", "es"),
-    ("German", "de"),
-]
-
-WHISPER_MODELS: list[str] = ["tiny", "base", "small", "medium", "large-v3"]
-
-WEEKDAY_NAMES: list[str] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-
-# Hour presets offered in Settings → Working Hours.
-HOUR_START_PRESETS: list[str] = [f"{h:02d}:00" for h in range(6, 13)]   # 06:00–12:00
-HOUR_END_PRESETS: list[str] = [f"{h:02d}:00" for h in range(14, 23)]    # 14:00–22:00
-
-# Polling cadences for main-thread timers (rumps.Timer).
-QUEUE_DRAIN_INTERVAL = 0.1   # 100 ms — main-thread event drain
-BLINK_INTERVAL = 0.5         # 500 ms — DETECTED state blink
-DURATION_INTERVAL = 1.0      # 1 s — recording duration tick
-SCHEDULE_CHECK_INTERVAL = 60  # 60 s — off-hours window check
-
-# Suffix shown on the "Status" menu title when something is degraded.
-_GLYPH_FOR: dict[HealthState, str] = {
-    HealthState.OK: "",
-    HealthState.UNKNOWN: "·",
-    HealthState.WARN: "!",
-    HealthState.FAIL: "✕",
-}
-
-
-# ============================================================================
-# Helpers used both by the live app and by tests.
-# ============================================================================
-def format_duration_mmss(seconds: float) -> str:
-    """``93.4 -> "01:33"`` — used in the menu-bar title during recording."""
-    seconds = max(0, int(seconds))
-    return f"{seconds // 60:02d}:{seconds % 60:02d}"
-
-
-def write_user_config_override(
-    user_config_path: Path,
-    overrides: dict[str, Any],
-) -> None:
-    """Merge ``overrides`` into the user's YAML config and persist it.
-
-    Existing keys in the file are preserved; only the keys we touch are
-    written. Used by settings toggles (Whisper model, working days, etc.).
-    """
-    import yaml
-
-    user_config_path = user_config_path.expanduser()
-    user_config_path.parent.mkdir(parents=True, exist_ok=True)
-
-    existing: dict[str, Any] = {}
-    if user_config_path.exists():
-        try:
-            loaded = yaml.safe_load(user_config_path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            logger.warning(
-                "Could not parse %s (%s); rewriting from scratch.",
-                user_config_path,
-                exc,
-            )
-            loaded = None
-        if isinstance(loaded, dict):
-            existing = loaded
-        elif loaded is not None:
-            logger.warning(
-                "%s did not contain a mapping (got %s); rewriting from scratch.",
-                user_config_path,
-                type(loaded).__name__,
-            )
-
-    merged = _deep_merge_dicts(existing, overrides)
-    user_config_path.write_text(yaml.safe_dump(merged, sort_keys=False), encoding="utf-8")
-
-
-def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
-    out = dict(base)
-    for key, value in override.items():
-        if key in out and isinstance(out[key], dict) and isinstance(value, dict):
-            out[key] = _deep_merge_dicts(out[key], value)
-        else:
-            out[key] = value
-    return out
-
-
-# ============================================================================
-# State manager — the part of the app that has no rumps dependency, so it's
-# unit-testable.
-# ============================================================================
-class UiState(str):
-    """Stringly-typed enum of menu-bar display states (str so .value works)."""
-
-    IDLE = "idle"
-    APPROACHING = "approaching"
-    DETECTED = "detected"
-    #: Opening the capture devices. Transient, but not instant: measured on
-    #: this Mac, the first start in a process takes 5.3 s of cold CoreAudio
-    #: enumeration and later ones 200-270 ms.
-    STARTING = "starting"
-    RECORDING = "recording"
-    PAUSED = "paused"
-    #: Draining the capture queues and writing metadata, ~250 ms.
-    SAVING = "saving"
-    #: Recording is safely on disk and Whisper has NOT started. We are holding
-    #: off because a call is still in progress. Distinct from PROCESSING
-    #: because nothing is running: Start works, detection works, and quitting
-    #: discards nothing.
-    DEFERRED = "deferred"
-    PROCESSING = "processing"
-    OFF_HOURS = "off_hours"
-
-
-@dataclass
-class UiSnapshot:
-    """Pure-data snapshot of what the menu bar wants to show right now."""
-
-    state: str = UiState.IDLE
-    recording_started_monotonic: float | None = None
-    # When the current pause began. While paused, elapsed time freezes; on
-    # resume, recording_started_monotonic is shifted forward by the pause
-    # length so the MM:SS counter only counts recorded time.
-    paused_at_monotonic: float | None = None
-    current_meeting: MeetingContext | None = None
-    selected_language_code: str | None = None
-    show_off_hours: bool = False
-
-    def title_text(self, *, blink_filled: bool = False) -> str:
-        """The text rumps shows next to the icon. Empty for compact icons-only."""
-        if self.state == UiState.RECORDING and self.recording_started_monotonic is not None:
-            elapsed = time.monotonic() - self.recording_started_monotonic
-            return format_duration_mmss(elapsed)
-        if self.state == UiState.OFF_HOURS:
-            return "off-hours"
-        if self.state == UiState.STARTING:
-            return "starting…"
-        if self.state == UiState.SAVING:
-            return "saving…"
-        if self.state == UiState.DEFERRED:
-            return "waiting"
-        return ""
-
-
-#: Offered in the whitelist editor whether or not they are running, so a user
-#: who unticks one can ever tick it back on.
-KNOWN_MEETING_APPS: tuple[str, ...] = (
-    "zoom.us",
-    "Microsoft Teams",
-    "Webex",
-    "Slack",
-    "FaceTime",
-    "Discord",
-    "Google Meet",
-    "Whereby",
-)
-
-#: Cap on how many *running* apps get appended, so the submenu stays a menu.
-MAX_RUNNING_CANDIDATES = 20
-
-
-def running_app_names() -> list[str]:
-    """Names of applications running right now, best effort."""
-    try:
-        from src.detection.process_monitor import _nsworkspace_apps
-
-        apps = _nsworkspace_apps()
-    except Exception:  # pragma: no cover (non-macOS)
-        return []
-    if not apps:
-        return []
-    names: list[str] = []
-    for app in apps:
-        bundle = str(app.get("bundle_id") or "").lower()
-        # Apple's own apps are almost never what someone wants to whitelist,
-        # and they are most of the list. FaceTime is offered above regardless.
-        if bundle.startswith("com.apple."):
-            continue
-        name = str(app.get("name") or "").strip()
-        if name:
-            names.append(name)
-    return names
-
-
-def whitelist_candidates(
-    enabled: Iterable[str], *, running: Iterable[str] | None = None,
-) -> list[str]:
-    """Everything the whitelist editor should offer, in a stable order.
-
-    The old menu was built from the whitelist itself, with every entry ticked.
-    So unticking Slack removed it from the config, and after a restart it was
-    not in the list any more — unreachable except by hand-editing YAML. There
-    was no way to add an app either.
-
-    Offering enabled + known + running fixes both directions: what you turned
-    off stays visible to turn back on, and anything you are actually running
-    can be added without leaving the menu.
-    """
-    seen: set[str] = set()
-    out: list[str] = []
-
-    def add(name: str) -> None:
-        key = name.strip().lower()
-        if not key or key in seen:
-            return
-        seen.add(key)
-        out.append(name.strip())
-
-    for name in enabled:            # yours first — the ones you chose
-        add(str(name))
-    for name in KNOWN_MEETING_APPS:  # then what we ship
-        add(name)
-    extra = 0
-    for name in sorted(running or []):
-        if extra >= MAX_RUNNING_CANDIDATES:
-            break
-        before = len(out)
-        add(str(name))
-        extra += len(out) - before
-    return out
-
-
-# ============================================================================
-# The MenuBarApp — wraps rumps.App, owns recorder + detector + UI.
-# ============================================================================
 TranscriptionHandler = Callable[[dict[str, Any]], None]
 
+#: Re-exported so ``src.ui.menubar`` stays the one public name for the menu
+#: bar after the split (audit item 42). Listed explicitly rather than left as
+#: bare imports, which a lint --fix will happily delete as unused.
+__all__ = [
+    "BLINK_INTERVAL",
+    "DURATION_INTERVAL",
+    "HOUR_END_PRESETS",
+    "HOUR_START_PRESETS",
+    "KNOWN_MEETING_APPS",
+    "MAX_RUNNING_CANDIDATES",
+    "QUEUE_DRAIN_INTERVAL",
+    "SCHEDULE_CHECK_INTERVAL",
+    "SUPPORTED_LANGUAGES",
+    "WEEKDAY_NAMES",
+    "WHISPER_MODELS",
+    "MenuBarApp",
+    "TranscriptionHandler",
+    "UiSnapshot",
+    "UiState",
+    "_format_session_label",
+    "_resolve_session_audio",
+    "find_orphan_sessions",
+    "format_duration_mmss",
+    "running_app_names",
+    "whitelist_candidates",
+    "write_user_config_override",
+]
 
-class MenuBarApp:
+
+class MenuBarApp(SettingsMenuMixin):
     """The thing you see in the menu bar.
 
     Parameters
@@ -511,7 +329,7 @@ class MenuBarApp:
     def _build_app(self, rumps_app_factory: Callable[..., Any] | None) -> Any:
         """Lazily import rumps so non-macOS test envs can import this module."""
         if rumps_app_factory is None:
-            import rumps  # noqa: WPS433  (lazy by design)
+            import rumps
             rumps_app_factory = rumps.App
 
         app = rumps_app_factory(
@@ -626,72 +444,6 @@ class MenuBarApp:
         ]
         self._refresh_menu_visibility()
 
-    def _build_settings_submenu(self, root: Any) -> None:
-        import rumps
-
-        # Whisper model
-        model_root = rumps.MenuItem(
-            f"Whisper Model: {self._config.get('transcription', 'model', default='small')}"
-        )
-        self._model_items: dict[str, rumps.MenuItem] = {}
-        for m in WHISPER_MODELS:
-            it = rumps.MenuItem(m, callback=self._on_model_picked)
-            self._model_items[m] = it
-            model_root.add(it)
-        self._mi["settings_model_root"] = model_root
-        self._update_model_menu()
-
-        # Working days
-        days_root = rumps.MenuItem("Working Days")
-        self._day_items: dict[int, rumps.MenuItem] = {}
-        active_days = set(self._config.get("app", "working_days", default=[0, 1, 2, 3, 4]))
-        for idx, name in enumerate(WEEKDAY_NAMES):
-            it = rumps.MenuItem(name, callback=self._on_day_toggled)
-            it._otis_day_index = idx  # type: ignore[attr-defined]
-            it.state = idx in active_days
-            self._day_items[idx] = it
-            days_root.add(it)
-        self._mi["settings_days_root"] = days_root
-
-        # Working hours — Start / End submenus with hourly presets.
-        hours_root = rumps.MenuItem(self._working_hours_title())
-        self._hour_items: dict[tuple[str, str], rumps.MenuItem] = {}
-        for which, presets in (("start", HOUR_START_PRESETS), ("end", HOUR_END_PRESETS)):
-            sub = rumps.MenuItem(which.capitalize())
-            for hhmm in presets:
-                it = rumps.MenuItem(hhmm, callback=self._on_working_hour_picked)
-                it._otis_which = which  # type: ignore[attr-defined]
-                it._otis_hhmm = hhmm  # type: ignore[attr-defined]
-                self._hour_items[(which, hhmm)] = it
-                sub.add(it)
-            hours_root.add(sub)
-        self._mi["settings_hours_root"] = hours_root
-        self._update_working_hours_menu()
-
-        # App whitelist
-        wl_root = rumps.MenuItem("App Whitelist")
-        self._whitelist_items: dict[str, rumps.MenuItem] = {}
-        enabled = [
-            str(a) for a in self._config.get(
-                "detection", "process_monitor", "whitelisted_apps", default=[]
-            ) or []
-        ]
-        for app_name in whitelist_candidates(enabled, running=running_app_names()):
-            it = rumps.MenuItem(app_name, callback=self._on_whitelist_toggled)
-            it._otis_app_name = app_name  # type: ignore[attr-defined]
-            it.state = app_name in enabled
-            self._whitelist_items[app_name] = it
-            wl_root.add(it)
-        self._mi["settings_whitelist_root"] = wl_root
-
-        root.add(model_root)
-        root.add(days_root)
-        root.add(hours_root)
-        root.add(wl_root)
-
-    # =====================================================================
-    # Detector callback wiring (background-thread side)
-    # =====================================================================
     def _wire_detector_callbacks(self) -> None:
         self._detector.on_meeting_approaching(self._cb_approaching)
         self._detector.on_meeting_detected(self._cb_detected)
@@ -826,7 +578,11 @@ class MenuBarApp:
         elif event_type == "ended":
             # Only relevant if we never started recording — the detector keeps
             # us in RECORDING when a process exits mid-recording (advisory path).
-            if self._snapshot.state in (UiState.APPROACHING, UiState.DETECTED):
+            # Read under the lock like every other branch: a recorder worker
+            # can be writing this field from another thread.
+            with self._lock:
+                ended_state = self._snapshot.state
+            if ended_state in (UiState.APPROACHING, UiState.DETECTED):
                 self._set_state(UiState.IDLE)
                 self._stop_blink()
         elif event_type == "process_gone":
@@ -906,115 +662,6 @@ class MenuBarApp:
 
     def _on_stop_clicked(self, _sender: Any) -> None:
         self._do_stop_and_transcribe()
-
-    def _persist_setting(self, overrides: dict[str, Any]) -> None:
-        """Persist a settings change to disk AND the live config.
-
-        Without the in-memory half, anything that re-reads ``self._config``
-        (the schedule tick, the next transcription) would keep seeing the
-        stale pre-toggle value until restart.
-        """
-        write_user_config_override(self._user_config_path, overrides)
-        self._config.apply_overrides(overrides)
-
-    def _on_language_picked(self, sender: Any) -> None:
-        code = getattr(sender, "_otis_lang_code", None)
-        with self._lock:
-            self._snapshot.selected_language_code = code
-        self._update_language_menu(code)
-        # Persist so the choice survives restart and the transcription
-        # pipeline picks it up via load_user_config().
-        self._persist_setting({"transcription": {"language": code}})
-
-    def _on_model_picked(self, sender: Any) -> None:
-        model = sender.title
-        if model not in WHISPER_MODELS:
-            return
-        self._persist_setting({"transcription": {"model": model}})
-        self._mi["settings_model_root"].title = f"Whisper Model: {model}"
-        self._update_model_menu(active=model)
-        # Applied on a worker: switching takes the engine's run lock, which is
-        # held for the whole of a transcription — minutes. The checkmark and
-        # the config are already correct; this makes the engine agree.
-        threading.Thread(
-            target=self._apply_model_live,
-            args=(model,),
-            name="otis-model-switch",
-            daemon=True,
-        ).start()
-
-    def _apply_model_live(self, model: str) -> None:
-        engine = self._engine()
-        if engine is None:
-            self._notifications.notify(
-                NotificationType.SETTING_SAVED,
-                f"Whisper model: {model}",
-                "Takes effect on restart.",
-            )
-            return
-        try:
-            changed = engine.set_model(model)
-        except Exception as exc:
-            logger.exception("Could not switch the Whisper model")
-            self._notifications.notify(
-                NotificationType.ERROR, "Could not switch model", str(exc), force=True
-            )
-            return
-        if changed:
-            self._notifications.notify(
-                NotificationType.SETTING_SAVED,
-                f"Whisper model: {model}",
-                "In effect from the next transcription.",
-            )
-
-    def _engine(self) -> Any | None:
-        """The live WhisperEngine, if this front end has one.
-
-        ``None`` in tests and in record-only setups, where "takes effect on
-        restart" is the honest thing to say.
-        """
-        pipeline = getattr(self._transcribe, "pipeline", None)
-        processor = getattr(pipeline, "processor", None)
-        return getattr(processor, "_engine", None)
-
-    def _on_day_toggled(self, sender: Any) -> None:
-        idx = getattr(sender, "_otis_day_index", None)
-        if idx is None:
-            return
-        sender.state = not sender.state
-        active = sorted(i for i, item in self._day_items.items() if item.state)
-        self._persist_setting({"app": {"working_days": active}})
-        # Re-evaluate the window right away — a day toggle can flip us
-        # into/out of OFF_HOURS without waiting up to 60 s for the tick.
-        self._on_schedule_tick(None)
-
-    def _on_whitelist_toggled(self, sender: Any) -> None:
-        sender.state = not sender.state
-        active = [name for name, item in self._whitelist_items.items() if item.state]
-        self._persist_setting(
-            {"detection": {"process_monitor": {"whitelisted_apps": active}}}
-        )
-        applied = self._apply_whitelist_live(active)
-        self._notifications.notify(
-            NotificationType.SETTING_SAVED,
-            "Whitelist saved",
-            "Now watching: " + (", ".join(active) or "nothing")
-            if applied
-            else "Restart Otis for this to take effect.",
-        )
-
-    def _apply_whitelist_live(self, active: list[str]) -> bool:
-        """Push the new whitelist into the running monitor. True if it landed."""
-        monitor = getattr(self._detector, "process_monitor", None)
-        setter = getattr(monitor, "set_whitelist", None)
-        if setter is None:
-            return False
-        try:
-            setter(active)
-            return True
-        except Exception:
-            logger.exception("Could not apply the whitelist live")
-            return False
 
     def _on_open_transcripts_web(self, _sender: Any) -> None:
         host = self._config.get("web", "host", default="127.0.0.1")
@@ -1723,48 +1370,6 @@ class MenuBarApp:
             return
         self._open_in_finder(record["path"])
 
-    def _update_language_menu(self, code: str | None) -> None:
-        title = "Auto-detect"
-        for label, c in SUPPORTED_LANGUAGES:
-            if c == code:
-                title = label
-                break
-        self._mi["language_root"].title = f"Language: {title}"
-        for label, item in self._lang_items.items():
-            item.state = (label == title)
-
-    def _update_model_menu(self, active: str | None = None) -> None:
-        active = active or self._config.get("transcription", "model", default="small")
-        for name, item in self._model_items.items():
-            item.state = (name == active)
-
-    def _working_hours_title(self) -> str:
-        start = self._config.get("app", "working_hours", "start", default="08:00")
-        end = self._config.get("app", "working_hours", "end", default="20:00")
-        return f"Working Hours: {start} → {end}"
-
-    def _update_working_hours_menu(self) -> None:
-        current = {
-            "start": self._config.get("app", "working_hours", "start", default="08:00"),
-            "end": self._config.get("app", "working_hours", "end", default="20:00"),
-        }
-        for (which, hhmm), item in self._hour_items.items():
-            item.state = (hhmm == current[which])
-
-    def _on_working_hour_picked(self, sender: Any) -> None:
-        which = getattr(sender, "_otis_which", None)
-        hhmm = getattr(sender, "_otis_hhmm", None)
-        if which not in ("start", "end") or not hhmm:
-            return
-        self._persist_setting({"app": {"working_hours": {which: hhmm}}})
-        self._mi["settings_hours_root"].title = self._working_hours_title()
-        self._update_working_hours_menu()
-        # Apply immediately instead of waiting up to 60 s for the next tick.
-        self._on_schedule_tick(None)
-
-    # =====================================================================
-    # Recording lifecycle (called from main thread)
-    # =====================================================================
     def _drain_transcription_queue(self) -> None:
         """Re-run transcriptions a previous process never finished."""
         try:
