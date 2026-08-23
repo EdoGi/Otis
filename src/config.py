@@ -76,6 +76,7 @@ DEFAULTS: dict[str, Any] = {
         "transcript_dir": "~/Otis/transcripts",
         "audio_dir": "~/Otis/audio",
         "audio_retention_days": 30,
+        "audio_format": "flac",
     },
     "web": {
         "port": 8765,

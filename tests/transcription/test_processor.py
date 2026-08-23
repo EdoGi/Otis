@@ -354,8 +354,10 @@ def test_process_relocates_audio_into_year_month_tree(tmp_path: Path) -> None:
     expected_dir = (
         session.audio_dir / local_start.strftime("%Y") / local_start.strftime("%m")
     )
-    expected_mic = expected_dir / local_start.strftime("%Y-%m-%d_%H%M_mic.wav")
-    expected_sys = expected_dir / local_start.strftime("%Y-%m-%d_%H%M_system.wav")
+    # Recordings are archived as FLAC by default now (P3 item 24).
+    ext = processor._archive_suffix
+    expected_mic = expected_dir / (local_start.strftime("%Y-%m-%d_%H%M_mic") + ext)
+    expected_sys = expected_dir / (local_start.strftime("%Y-%m-%d_%H%M_system") + ext)
     assert expected_mic.exists()
     assert expected_sys.exists()
     # Original UUID-named files no longer exist.
@@ -364,7 +366,7 @@ def test_process_relocates_audio_into_year_month_tree(tmp_path: Path) -> None:
     # Frontmatter audio_files paths are relative to audio_dir.
     expected_relative = (
         f"{local_start.strftime('%Y')}/{local_start.strftime('%m')}/"
-        f"{local_start.strftime('%Y-%m-%d_%H%M_mic.wav')}"
+        f"{local_start.strftime('%Y-%m-%d_%H%M_mic')}{processor._archive_suffix}"
     )
     assert result.metadata["audio_files"]["mic"] == expected_relative
 
@@ -392,8 +394,8 @@ def test_process_same_minute_sessions_do_not_clobber_audio(tmp_path: Path) -> No
         results.append(processor.process(session, meeting=MeetingSnapshot()))
 
     audio_dir = tmp_path / "audio"
-    mic_wavs = sorted(audio_dir.rglob("*_mic.wav"))
-    sys_wavs = sorted(audio_dir.rglob("*_system.wav"))
+    mic_wavs = sorted(audio_dir.rglob("*_mic.*"))
+    sys_wavs = sorted(audio_dir.rglob("*_system.*"))
     metas = sorted(audio_dir.rglob("*_metadata.json"))
     assert len(mic_wavs) == 2, [p.name for p in mic_wavs]
     assert len(sys_wavs) == 2
@@ -421,7 +423,7 @@ def test_process_retranscribe_relocated_audio_reuses_paths(tmp_path: Path) -> No
     relocated_mic = session.audio_dir / first.metadata["audio_files"]["mic"]
     relocated_sys = session.audio_dir / first.metadata["audio_files"]["system"]
     relocated_meta = relocated_mic.with_name(
-        relocated_mic.name.replace("_mic.wav", "_metadata.json")
+        relocated_mic.stem.removesuffix("_mic") + "_metadata.json"
     )
     assert relocated_mic.exists() and relocated_meta.exists()
 
@@ -445,7 +447,7 @@ def test_process_retranscribe_relocated_audio_reuses_paths(tmp_path: Path) -> No
     second = processor2.process(second_session, meeting=MeetingSnapshot())
 
     assert second.metadata["audio_files"]["mic"] == first.metadata["audio_files"]["mic"]
-    assert len(list((tmp_path / "audio").rglob("*_mic.wav"))) == 1
+    assert len(list((tmp_path / "audio").rglob("*_mic.*"))) == 1
 
 
 # A transcript long enough to clear the title heuristic's minimum-words bar.

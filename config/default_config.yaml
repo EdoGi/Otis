@@ -78,6 +78,12 @@ storage:
   transcript_dir: "~/Otis/transcripts"
   audio_dir: "~/Otis/audio"
   audio_retention_days: 30
+  # How recordings are archived once transcribed. FLAC is lossless and roughly
+  # halves speech; a stream that captured nothing costs almost nothing at all
+  # (measured 721x on a real 85 MB silent system stream). Decoding uses macOS's
+  # own afconvert, so there is no ffmpeg dependency and old WAVs keep working.
+  # Set to "wav" to archive the raw capture instead.
+  audio_format: "flac"
 
 # Local transcript browser, started automatically by `otis ui`.
 web:

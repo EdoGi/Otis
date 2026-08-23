@@ -59,6 +59,9 @@ logger = logging.getLogger(__name__)
 ECHO_TIME_WINDOW_SECONDS = 1.0
 ECHO_WORD_OVERLAP_THRESHOLD = 0.80
 
+#: Ceiling on one afconvert compression. A 2-hour stream encodes in ~1 s.
+ENCODE_TIMEOUT_SECONDS = 600.0
+
 
 # ---------------------------------------------------------------------------
 # Public types
@@ -164,6 +167,7 @@ class TranscriptProcessor:
         model_name: str | None = None,
         dedup_echoes: bool = True,
         suggest_titles: bool = True,
+        archive_format: str = "flac",
     ) -> None:
         self._engine = engine
         self._store = store
@@ -179,6 +183,17 @@ class TranscriptProcessor:
         # the speakers — which makes the transcript unreadable. Verified on a
         # real recording: 25 of 66 lines were duplicated.
         self._dedup_echoes = dedup_echoes
+        # Recordings are archived compressed. 16-bit PCM at 16 kHz costs
+        # 230 MB per meeting-hour across the two streams; FLAC is lossless and
+        # roughly halves speech, while a stream that captured nothing costs
+        # essentially zero (measured 721x on a real 85 MB silent stream).
+        # Set to "wav" to keep the raw capture.
+        fmt = str(archive_format or "flac").lower().lstrip(".")
+        if fmt not in ("flac", "wav"):
+            logger.warning("Unknown archive format %r; keeping WAV.", archive_format)
+            fmt = "wav"
+        self._archive_format = fmt
+        self._archive_suffix = f".{fmt}"
 
     # ------------------------------------------------------------------ sync
     def process(
@@ -437,9 +452,10 @@ class TranscriptProcessor:
                 f"{date_str}_{time_compact}_{attempt}"
             )
             prefix = f"{rel_dir}/{base}"
+            ext = self._archive_suffix
             paths: dict[str, str | None] = {
-                "mic": f"{prefix}_mic.wav",
-                "system": f"{prefix}_system.wav" if session.system_wav else None,
+                "mic": f"{prefix}_mic{ext}",
+                "system": f"{prefix}_system{ext}" if session.system_wav else None,
             }
             if not self._relocation_collides(session, paths):
                 return paths
@@ -453,7 +469,11 @@ class TranscriptProcessor:
         assert mic_rel is not None
         pairs: list[tuple[Path, str]] = [
             (session.mic_wav, mic_rel),
-            (session.metadata_path, mic_rel.replace("_mic.wav", "_metadata.json")),
+            # Derive the metadata name from the stem, not by patching a
+            # literal ".wav" — the archive extension is configurable now, so a
+            # substring replace silently stopped matching and made every
+            # re-transcription look like a collision, bumping to _2.
+            (session.metadata_path, _metadata_name_for(mic_rel)),
         ]
         if session.system_wav is not None and relative_paths.get("system"):
             pairs.append((session.system_wav, relative_paths["system"]))
@@ -469,61 +489,100 @@ class TranscriptProcessor:
         relative_paths: dict[str, str | None],
         frontmatter: dict[str, Any],
     ) -> None:
-        """Move the recorder UUID-named WAVs into the ``YYYY/MM/`` tree.
+        """Archive the recorder's WAVs into ``YYYY/MM/``, compressing en route.
 
-        Importantly: rewrite ``metadata.json`` so its ``mic_wav`` /
-        ``system_wav`` / ``metadata_path`` fields point at the *new*
-        locations. Earlier versions only renamed the file but left the
-        contents pointing at the old UUID names, breaking retranscribe.
+        Order matters. This used to rewrite ``metadata.json`` to the new paths
+        *before* attempting the moves, so a failed move left the metadata
+        pointing at files that never arrived — and retranscribe and orphan
+        discovery both read that metadata. Now nothing is rewritten until the
+        files are actually in place, and the metadata records where they really
+        ended up.
+
+        A transcode failure is never fatal: the original WAV is moved instead,
+        so the recording survives even if compression doesn't.
         """
-        # Compute destinations up front so we can update metadata in-place.
         new_mic = self._audio_dir / relative_paths["mic"] if relative_paths.get("mic") else None
-        new_sys = self._audio_dir / relative_paths["system"] if relative_paths.get("system") else None
+        new_sys = (
+            self._audio_dir / relative_paths["system"]
+            if relative_paths.get("system") else None
+        )
         new_meta = (
-            self._audio_dir / relative_paths["mic"].replace("_mic.wav", "_metadata.json")
-            if relative_paths.get("mic")
-            else None
+            self._audio_dir / _metadata_name_for(relative_paths["mic"])
+            if relative_paths.get("mic") else None
         )
 
-        # Rewrite the metadata file BEFORE moving it so the on-disk content is
-        # already correct in its new home.
-        if session.metadata_path.exists():
+        landed: dict[str, str | None] = {"mic": None, "system": None}
+        failures = 0
+        for key, src, dst in (
+            ("mic", session.mic_wav, new_mic),
+            ("system", session.system_wav, new_sys),
+        ):
+            if src is None or dst is None or not src.exists():
+                continue
+            rel = self._archive_one(src, dst)
+            if rel is None:
+                failures += 1
+            else:
+                landed[key] = rel
+
+        # Only now is it safe to say where things are.
+        if session.metadata_path.exists() and new_meta is not None:
             try:
                 meta = json.loads(session.metadata_path.read_text(encoding="utf-8"))
                 if isinstance(meta, dict):
-                    if new_mic is not None:
-                        meta["mic_wav"] = relative_paths["mic"]
-                    meta["system_wav"] = relative_paths.get("system")
+                    meta["mic_wav"] = landed["mic"]
+                    meta["system_wav"] = landed["system"]
                     session.metadata_path.write_text(
                         json.dumps(meta, indent=2), encoding="utf-8"
                     )
+                new_meta.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(session.metadata_path), str(new_meta))
             except Exception as exc:
                 logger.warning(
-                    "Could not rewrite metadata at %s: %s",
-                    session.metadata_path,
-                    exc,
+                    "Could not finalise metadata at %s: %s", session.metadata_path, exc
                 )
 
-        moves: list[tuple[Path, Path]] = []
-        if session.mic_wav.exists() and new_mic is not None:
-            moves.append((session.mic_wav, new_mic))
-        if session.system_wav is not None and session.system_wav.exists() and new_sys is not None:
-            moves.append((session.system_wav, new_sys))
-        if session.metadata_path.exists() and new_meta is not None:
-            moves.append((session.metadata_path, new_meta))
-
-        for src, dst in moves:
+        updates: dict[str, Any] = {}
+        if landed != {k: relative_paths.get(k) for k in ("mic", "system")}:
+            updates["audio_files"] = {"mic": landed["mic"], "system": landed["system"]}
+        if failures:
+            # The transcript must not advertise audio that isn't there.
+            updates["audio_available"] = bool(landed["mic"] or landed["system"])
+        if updates:
+            # Keep the caller's copy in step with what actually landed, so the
+            # returned result and the saved transcript can't disagree.
+            frontmatter.update(updates)
             try:
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(src), str(dst))
-                logger.debug("Moved %s → %s", src, dst)
-            except Exception as exc:
-                logger.warning("Could not move %s → %s: %s", src, dst, exc)
-                # If audio relocation fails, mark the transcript so the user
-                # knows the WAV path in the frontmatter is wrong.
-                self._store.update_frontmatter(
-                    session.session_id, {"audio_available": False}
-                )
+                self._store.update_frontmatter(session.session_id, updates)
+            except Exception:
+                logger.exception("Could not correct transcript audio paths")
+
+    def _archive_one(self, src: Path, dst: Path) -> str | None:
+        """Put one capture file at ``dst``. Returns its path relative to audio_dir.
+
+        Compresses when the archive format asks for it and the source isn't
+        already in that format. Falls back to a plain move on any failure —
+        losing compression is a rounding error, losing the recording is not.
+        """
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if dst.suffix.lower() != src.suffix.lower():
+                if encode_audio(src, dst):
+                    src.unlink(missing_ok=True)
+                    logger.info(
+                        "Archived %s -> %s (%.1f MB -> %.1f MB)",
+                        src.name, dst.name,
+                        _size_mb(src), _size_mb(dst),
+                    )
+                    return str(dst.relative_to(self._audio_dir))
+                # Compression failed: keep the audio as-is under its own name.
+                dst = dst.with_suffix(src.suffix)
+                logger.warning("Falling back to an uncompressed archive for %s", src.name)
+            shutil.move(str(src), str(dst))
+            return str(dst.relative_to(self._audio_dir))
+        except Exception as exc:
+            logger.warning("Could not archive %s -> %s: %s", src, dst, exc)
+            return None
 
 
 # ============================================================================
@@ -533,6 +592,51 @@ class TranscriptProcessor:
 class _LabelledSegment:
     segment: Segment
     speaker: str
+
+
+def _metadata_name_for(mic_relative: str) -> str:
+    """``2026/08/2026-08-21_1749_mic.flac`` -> ``..._metadata.json``."""
+    stem = Path(mic_relative)
+    return str(stem.with_name(stem.stem.removesuffix("_mic") + "_metadata.json"))
+
+
+def _size_mb(path: Path) -> float:
+    try:
+        return path.stat().st_size / 1e6
+    except Exception:
+        return 0.0
+
+
+def encode_audio(src: Path, dst: Path) -> bool:
+    """Losslessly compress ``src`` into ``dst`` using macOS ``afconvert``.
+
+    Returns False (without raising) if it can't, so callers fall back to
+    keeping the original. There is no ffmpeg on a stock Mac; afconvert ships
+    with the OS, and its FLAC round-trip is bit-exact — verified against real
+    recordings before any of this was allowed to write.
+    """
+    import shutil as _shutil
+    import subprocess
+
+    fmt = dst.suffix.lower().lstrip(".")
+    if fmt != "flac":
+        return False
+    tool = _shutil.which("afconvert")
+    if tool is None:  # pragma: no cover (afconvert ships with macOS)
+        return False
+    try:
+        subprocess.run(
+            [tool, "-f", "flac", "-d", "flac", str(src), str(dst)],
+            check=True, capture_output=True, timeout=ENCODE_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        logger.warning("Could not compress %s: %s", src.name, exc)
+        dst.unlink(missing_ok=True)
+        return False
+    if not dst.exists() or dst.stat().st_size == 0:
+        dst.unlink(missing_ok=True)
+        return False
+    return True
 
 
 def _compute_offset(mic_anchor: float | None, sys_anchor: float | None) -> float:

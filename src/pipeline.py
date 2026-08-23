@@ -65,6 +65,7 @@ def build_pipeline(cfg: Config) -> TranscriptionPipeline:
         model_name=engine.model_name,
         suggest_titles=bool(cfg.get("transcription", "suggest_titles", default=True)),
         dedup_echoes=bool(cfg.get("transcription", "dedup_echoes", default=True)),
+        archive_format=str(cfg.get("storage", "audio_format", default="flac")),
     )
     return TranscriptionPipeline(
         audio_dir=audio_dir,

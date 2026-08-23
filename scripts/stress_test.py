@@ -259,7 +259,10 @@ def t_end_to_end_pipeline(tmp: Path) -> None:
     relocated_meta = next(audio_dir.rglob("*_metadata.json"), None)
     assert relocated_meta is not None
     relocated_data = json.loads(relocated_meta.read_text())
-    assert relocated_data["mic_wav"].endswith("_mic.wav") and "/" in relocated_data["mic_wav"], (
+    # Recordings are archived compressed now (P3 item 24), so the extension is
+    # whatever the archive format produced — what matters is that the metadata
+    # points at the relocated file and that the file is really there.
+    assert Path(relocated_data["mic_wav"]).stem.endswith("_mic") and "/" in relocated_data["mic_wav"], (
         f"metadata.json mic_wav not updated to relative YYYY/MM path: {relocated_data['mic_wav']}"
     )
 
