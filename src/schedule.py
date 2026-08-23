@@ -6,11 +6,15 @@ daemon can use it without any conceptual dependency on the UI layer.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable
-from datetime import datetime, time as dtime
+from datetime import datetime
+from datetime import time as dtime
 from typing import Any
 
 from src.config import Config
+
+logger = logging.getLogger(__name__)
 
 
 def is_within_working_hours(
@@ -25,17 +29,33 @@ def is_within_working_hours(
     ``working_days`` are Python weekday() values (0 = Monday … 6 = Sunday).
     ``start_hhmm`` / ``end_hhmm`` are ``"HH:MM"`` strings in local time.
     """
-    if now.weekday() not in set(working_days):
-        return False
     try:
         sh, sm = map(int, start_hhmm.split(":"))
         eh, em = map(int, end_hhmm.split(":"))
+        start = dtime(sh, sm)
+        end = dtime(eh, em)
     except (ValueError, AttributeError):
-        return True  # malformed config → don't block
-    start = dtime(sh, sm)
-    end = dtime(eh, em)
+        logger.warning(
+            "Unparseable working hours (%r-%r); treating every hour as a "
+            "working hour rather than silently disabling detection.",
+            start_hhmm, end_hhmm,
+        )
+        return True
+    days = set(working_days)
     cur = now.time()
-    return start <= cur <= end
+
+    if start <= end:
+        return now.weekday() in days and start <= cur <= end
+
+    # Overnight window, e.g. 22:00-02:00. `start <= cur <= end` is never true
+    # for those bounds, so this silently reported "outside working hours" all
+    # day and detection never ran. The window is two pieces, and the piece
+    # after midnight belongs to the day it *started* on: at 01:00 on Tuesday
+    # the user is still inside Monday's window.
+    if cur >= start:
+        return now.weekday() in days
+    yesterday = (now.weekday() - 1) % 7
+    return cur <= end and yesterday in days
 
 
 def working_hours_from_config(cfg: Config) -> dict[str, Any]:

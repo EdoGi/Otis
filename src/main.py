@@ -23,6 +23,7 @@ from typing import Any
 from src.audio.blackhole_check import format_setup_instructions, verify_blackhole_setup
 from src.audio.devices import DeviceManager
 from src.config import Config, load_user_config
+from src.config_schema import ConfigError, validate
 from src.daemon import OtisDaemon
 
 logger = logging.getLogger("otis")
@@ -283,6 +284,33 @@ def _run_menubar(cfg: Config) -> int:
     return 0
 
 
+def _report_bad_config(exc: BaseException, *, gui: bool = False) -> int:
+    """Tell the user their config is wrong, somewhere they will see it."""
+    message = str(exc)
+    logger.error("Config error: %s", message)
+    print(f"Otis could not start — your config is not usable.\n\n{message}\n",
+          file=sys.stderr)
+    print("Edit ~/.otis/config.yaml, or delete it to fall back to the "
+          "bundled defaults.", file=sys.stderr)
+    # A dialog only on the menu-bar path — that is the Login Item case the
+    # audit describes, where there is no terminal to read the text above. On
+    # any CLI subcommand a modal that blocks until someone clicks it would be
+    # worse than the traceback it replaces.
+    if gui:
+        try:
+            import rumps
+
+            rumps.alert(
+                title="Otis could not start",
+                message=f"{message}\n\nEdit ~/.otis/config.yaml, or delete it "
+                        f"to use the bundled defaults.",
+                ok="OK",
+            )
+        except Exception:  # pragma: no cover (headless / no rumps)
+            logger.debug("Could not show a config dialog", exc_info=True)
+    return 2
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     _configure_logging(args.log_level)
@@ -290,10 +318,17 @@ def main(argv: list[str] | None = None) -> int:
     # Every mode honours ~/.otis/config.yaml — the settings toggled in the
     # menu bar (model, whitelist, working hours) apply to the headless
     # daemon too, instead of silently reverting to bundled defaults.
-    cfg = load_user_config(args.config)
-    logger.info("Loaded config; storage at %s", cfg.get("storage", "transcript_dir"))
-
     command = args.command or ("check-audio" if args.check_audio else "ui")
+
+    try:
+        cfg = load_user_config(args.config)
+        validate(dict(cfg.raw))
+    except (ConfigError, FileNotFoundError, ValueError) as exc:
+        # Audit E9: an invalid model raised out of build_pipeline with no
+        # handler, so launching from a Login Item produced no menu bar and a
+        # traceback on a stdout nobody reads. Say what is wrong, where.
+        return _report_bad_config(exc, gui=(command == "ui"))
+    logger.info("Loaded config; storage at %s", cfg.get("storage", "transcript_dir"))
 
     if command == "prune-models":
         return _prune_models(cfg, dry_run=bool(getattr(args, "dry_run", False)))
