@@ -192,6 +192,11 @@ class UiState(str):
     PAUSED = "paused"
     #: Draining the capture queues and writing metadata, ~250 ms.
     SAVING = "saving"
+    #: Recording is safely on disk and Whisper has NOT started. We are holding
+    #: off because a call is still in progress. Distinct from PROCESSING
+    #: because nothing is running: Start works, detection works, and quitting
+    #: discards nothing.
+    DEFERRED = "deferred"
     PROCESSING = "processing"
     OFF_HOURS = "off_hours"
 
@@ -221,6 +226,8 @@ class UiSnapshot:
             return "starting…"
         if self.state == UiState.SAVING:
             return "saving…"
+        if self.state == UiState.DEFERRED:
+            return "waiting"
         return ""
 
 
@@ -308,6 +315,8 @@ class MenuBarApp:
         self._state_before_starting: str = UiState.IDLE
         self._blink_phase = 0  # 0 / 1, used by blink timer
 
+        # Set by "Transcribe Now" to cut a deferral short.
+        self._skip_deferral = threading.Event()
         # Survives a quit or a crash mid-transcription; drained by run().
         # Sited next to the config so it lands in ~/.otis/queue in real use and
         # inside the tmp dir under test, without a separate knob.
@@ -459,6 +468,11 @@ class MenuBarApp:
         self._mi["pause"] = rumps.MenuItem("Pause Recording", callback=self._on_pause_clicked)
         self._mi["resume"] = rumps.MenuItem("Resume Recording", callback=self._on_resume_clicked)
         self._mi["stop"] = rumps.MenuItem("Stop & Transcribe", callback=self._on_stop_clicked)
+        # Only shown while DEFERRED: cuts the wait short when the user would
+        # rather have the transcript than a cool laptop.
+        self._mi["transcribe_now"] = rumps.MenuItem(
+            "Transcribe Now", callback=self._on_transcribe_now_clicked
+        )
 
         # Language submenu
         self._mi["language_root"] = rumps.MenuItem("Language: Auto-detect")
@@ -517,6 +531,7 @@ class MenuBarApp:
             self._mi["pause"],
             self._mi["resume"],
             self._mi["stop"],
+            self._mi["transcribe_now"],
             None,  # separator
             self._mi["language_root"],
             None,
@@ -683,6 +698,9 @@ class MenuBarApp:
                     event_type,
                 )
                 return
+            # DEFERRED deliberately falls through: nothing is running, and the
+            # whole reason we are waiting is that a call is in progress — so
+            # the next meeting is exactly what the user needs to hear about.
             if ui_state in (UiState.RECORDING, UiState.PAUSED):
                 # Heads-up only: notify, don't change state.
                 ctx = payload
@@ -888,14 +906,28 @@ class MenuBarApp:
         # it will be killed the moment we exit, losing the transcript. Warn
         # the user explicitly so they can wait it out.
         with self._lock:
-            in_processing = self._snapshot.state == UiState.PROCESSING
-        if in_processing:
+            ui_state = self._snapshot.state
+        if ui_state in (UiState.PROCESSING, UiState.DEFERRED):
+            # These used to be the same state, so the dialog said a
+            # transcription was running during a wait where nothing had
+            # started — frightening the user into waiting out a job that had
+            # not begun, for up to two hours. The recording is on disk and
+            # queued either way; only PROCESSING actually loses work.
+            if ui_state == UiState.PROCESSING:
+                message = (
+                    "A transcription is running. Quitting now will discard it "
+                    "and it will restart next launch. Wait for it to finish, "
+                    "or quit anyway?"
+                )
+            else:
+                message = (
+                    "A recording is waiting for your call to finish before it "
+                    "transcribes. Nothing is running — it is saved and will "
+                    "resume next launch. Quit?"
+                )
             response = rumps.alert(
-                title="Transcription in progress",
-                message=(
-                    "A transcription is running. Quitting now will discard it. "
-                    "Wait for it to finish, or quit anyway?"
-                ),
+                title="Transcription pending",
+                message=message,
                 ok="Quit anyway",
                 cancel="Wait",
             )
@@ -968,7 +1000,8 @@ class MenuBarApp:
         # Don't fiddle with state during active recording / paused / processing —
         # transitioning to OFF_HOURS would clear recorder context and hide the
         # Stop button.
-        if current_state in (UiState.RECORDING, UiState.PAUSED, UiState.PROCESSING):
+        if current_state in (UiState.RECORDING, UiState.PAUSED,
+                             UiState.PROCESSING, UiState.DEFERRED):
             return
 
         currently_off = current_state == UiState.OFF_HOURS
@@ -1079,10 +1112,15 @@ class MenuBarApp:
         # by rebuilding visibility via .set_callback(None) for disabled items.
         # The simpler approach used here: call .hidden = True/False which rumps
         # exposes via the underlying NSMenuItem.
-        self._set_visible(self._mi["start"], s in (UiState.IDLE, UiState.APPROACHING, UiState.DETECTED, UiState.OFF_HOURS))
+        self._set_visible(
+            self._mi["start"],
+            s in (UiState.IDLE, UiState.APPROACHING, UiState.DETECTED,
+                  UiState.OFF_HOURS, UiState.DEFERRED),
+        )
         self._set_visible(self._mi["pause"], s == UiState.RECORDING)
         self._set_visible(self._mi["resume"], s == UiState.PAUSED)
         self._set_visible(self._mi["stop"], s in (UiState.RECORDING, UiState.PAUSED))
+        self._set_visible(self._mi["transcribe_now"], s == UiState.DEFERRED)
         # The two repair actions only appear when they'd actually do something.
         cal = self._health.get(CALENDAR)
         self._set_visible(
@@ -1380,6 +1418,8 @@ class MenuBarApp:
         # process two streams concurrently and the icon would lie.
         with self._lock:
             current = self._snapshot.state
+        # DEFERRED is not busy — nothing is running, and refusing here was
+        # part of the same conflation that hid Start for up to two hours.
         if current in (UiState.RECORDING, UiState.PAUSED, UiState.PROCESSING):
             self._notifications.notify(
                 NotificationType.ERROR,
@@ -1611,6 +1651,16 @@ class MenuBarApp:
                 daemon=True,
             ).start()
 
+    def _on_transcribe_now_clicked(self, _sender: Any) -> None:
+        """Stop waiting for the call to end and transcribe immediately."""
+        self._skip_deferral.set()
+        self._notifications.notify(
+            NotificationType.RECORDING_STARTED,
+            "Transcribing now",
+            "Skipping the wait for your call to finish.",
+            force=True,
+        )
+
     def _do_start_recording(self) -> None:
         """Begin a recording. Returns at once; the device work runs on a worker.
 
@@ -1798,7 +1848,16 @@ class MenuBarApp:
         # with a live call (e.g. back-to-back meetings). Wait until the mic
         # frees up before starting the heavy work; the recording is safe on
         # disk either way.
+        #
+        # The wait gets its own state. It used to run inside PROCESSING, so
+        # for up to DEFER_MAX_SECONDS the app hid Start, dropped detector
+        # events, refused Generate Transcript as "Busy" and warned on quit
+        # that a transcription would be lost — all while nothing was running.
+        # And the trigger for waiting is that another call is live, so Otis
+        # was unrecordable during exactly the meeting you would want it for.
+        self._events.put(("force_state", UiState.DEFERRED))
         self._defer_while_in_call()
+        self._events.put(("force_state", UiState.PROCESSING))
 
         try:
             self._detector.transcription_started()
@@ -1847,7 +1906,11 @@ class MenuBarApp:
 
         probe = make_call_probe(self._config, detector=self._detector)
 
+        self._skip_deferral.clear()
+
         def busy() -> bool:
+            if self._skip_deferral.is_set():
+                return False
             with self._lock:
                 if self._recorder is not None:
                     return True
