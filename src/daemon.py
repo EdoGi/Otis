@@ -103,6 +103,20 @@ class OtisDaemon:
         self._detector_started = False
         self._schedule_thread: threading.Thread | None = None
 
+        # Audio retention. This only ever ran in the menu bar, so `otis run`
+        # accumulated WAVs forever with audio_retention_days silently inert.
+        self._retention = None
+        if transcription_pipeline is not None:
+            from src.storage.audio_retention import AudioRetentionManager
+
+            self._retention = AudioRetentionManager(
+                audio_dir=transcription_pipeline.audio_dir,
+                transcript_store=transcription_pipeline.store,
+                retention_days=int(
+                    config.get("storage", "audio_retention_days", default=30)
+                ),
+            )
+
         self._detector = detector or self._build_detector()
         self._wire_callbacks()
 
@@ -116,6 +130,8 @@ class OtisDaemon:
         self._notify(self._summary_line())
         # Honour the working-hours window from tick zero; the schedule
         # thread keeps re-checking every minute.
+        if self._retention is not None:
+            self._retention.start_periodic()
         self._apply_schedule()
         self._schedule_thread = threading.Thread(
             target=self._schedule_loop, name="otis-daemon-schedule", daemon=True
@@ -423,6 +439,8 @@ class OtisDaemon:
         self.request_stop()
 
     def _shutdown(self) -> None:
+        if self._retention is not None:
+            self._retention.stop()
         self._stop_recording()
         with self._lock:
             pending = [t for t in self._transcribe_threads if t.is_alive()]

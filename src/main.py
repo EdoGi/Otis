@@ -97,6 +97,15 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         "ui",
         help="Start the menu-bar app (default — manual recording controls).",
     )
+    prune = sub.add_parser(
+        "prune-models",
+        help="Delete cached Whisper models other than the configured one.",
+    )
+    prune.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be removed without deleting anything.",
+    )
 
     # Legacy back-compat: ``--check-audio`` without a subcommand.
     parser.add_argument(
@@ -105,6 +114,39 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         help=argparse.SUPPRESS,
     )
     return parser.parse_args(argv)
+
+
+def _prune_models(cfg: Config, *, dry_run: bool = False) -> int:
+    """Reclaim disk from Whisper models the configured setup no longer uses.
+
+    mlx-whisper never removes a downloaded model, so switching model once
+    leaves the old weights behind forever. Deliberately an explicit command:
+    silently deleting a 1.4 GB download the user might switch back to trades a
+    long re-download for disk they may not need.
+    """
+    from src.storage.model_cache import list_cached_models, prune_models
+
+    active = str(cfg.get("transcription", "model", default="small"))
+    cached = list_cached_models()
+    if not cached:
+        print("No Whisper models are cached.")
+        return 0
+
+    print(f"Configured model: {active}\n")
+    for model in cached:
+        mark = "keep  " if model.name.lower() == active.lower() else "remove"
+        print(f"  {mark}  {model.name:10s} {model.size_mb:7.0f} MB")
+
+    removed = prune_models(active, dry_run=dry_run)
+    if not removed:
+        print("\nNothing to remove.")
+        return 0
+    total = sum(m.size_mb for m in removed)
+    if dry_run:
+        print(f"\nWould free {total:.0f} MB. Re-run without --dry-run to do it.")
+    else:
+        print(f"\nFreed {total:.0f} MB.")
+    return 0
 
 
 def _print_audio_status(_cfg: Config) -> int:
@@ -253,6 +295,8 @@ def main(argv: list[str] | None = None) -> int:
 
     command = args.command or ("check-audio" if args.check_audio else "ui")
 
+    if command == "prune-models":
+        return _prune_models(cfg, dry_run=bool(getattr(args, "dry_run", False)))
     if command == "check-audio":
         return _print_audio_status(cfg)
     if command == "run":

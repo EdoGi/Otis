@@ -37,6 +37,12 @@ DEFAULT_RETENTION_DAYS = 30
 #: indefinitely. After ``retention_days * this`` it is deleted anyway.
 DEFAULT_PROTECTED_GRACE_MULTIPLIER = 3.0
 
+#: Warn below this much free space, and sweep immediately rather than waiting
+#: for the daily tick. A two-hour meeting needs ~460 MB of WAV before it is
+#: compressed, so running out mid-recording costs a meeting.
+LOW_DISK_WARN_BYTES = 5 * 1000**3
+LOW_DISK_CRITICAL_BYTES = 2 * 1000**3
+
 
 @dataclass
 class CleanupReport:
@@ -110,8 +116,39 @@ class AudioRetentionManager:
                 self._timer.cancel()
                 self._timer = None
 
+    def report_disk_health(self) -> int:
+        """Publish free space to the health panel. Returns bytes free.
+
+        DISK has been in the panel's canonical order since P0 and nothing ever
+        reported it, so the row could never appear. Running out of space is the
+        one storage failure that costs a meeting rather than an old recording.
+        """
+        from src.health import DISK, HealthState, get_health
+        from src.storage.model_cache import free_bytes
+
+        free = free_bytes(self._audio_dir if self._audio_dir.exists() else Path.home())
+        if not free:
+            return 0
+        gb = free / 1000**3
+        if free < LOW_DISK_CRITICAL_BYTES:
+            state, hint = HealthState.FAIL, (
+                "Free space or lower storage.audio_retention_days; a two-hour "
+                "meeting needs about 460 MB while recording."
+            )
+        elif free < LOW_DISK_WARN_BYTES:
+            state, hint = HealthState.WARN, (
+                "Consider lowering storage.audio_retention_days."
+            )
+        else:
+            state, hint = HealthState.OK, None
+        get_health().report(
+            DISK, label="Disk", state=state, detail=f"{gb:.0f} GB free", hint=hint,
+        )
+        return free
+
     def cleanup_now(self) -> CleanupReport:
         """Delete WAV/JSON files older than the retention horizon. Returns a report."""
+        self.report_disk_health()
         if not self._audio_dir.exists():
             return CleanupReport([], [], [])
 
@@ -277,9 +314,22 @@ class AudioRetentionManager:
         return corrected
 
     def delete_audio(self, session_id: str) -> CleanupReport:
-        """Manual delete: drop every audio artefact for ``session_id``."""
-        candidates = [
-            p for p in self._iter_audio_files() if _matches_session(p, session_id)
+        """Manual delete: drop every audio artefact for ``session_id``.
+
+        Matching used to be filename-based (``{session_id}_``), but a session
+        is renamed to ``YYYY-MM-DD_HHMM_*`` the moment it transcribes
+        successfully — the id survives only inside the metadata JSON. So for
+        every normally-processed session this found nothing, deleted nothing,
+        and then marked the transcript ``audio_available: false`` anyway: the
+        user was told the audio was gone while it sat on disk, and nothing
+        would ever surface it again.
+        """
+        mapping = self._map_paths_to_sessions()
+        candidates = [p for p, sid in mapping.items() if sid == session_id]
+        # Fall back to the filename for audio that has no metadata at all.
+        candidates += [
+            p for p in self._iter_audio_files()
+            if p not in mapping and _matches_session(p, session_id)
         ]
         deleted: list[Path] = []
         for p in candidates:
@@ -292,7 +342,10 @@ class AudioRetentionManager:
                 logger.warning("Could not delete %s: %s", p, exc)
 
         transcripts_marked: list[str] = []
-        if self._store is not None:
+        # Only claim the audio is gone if something actually went. Marking
+        # unconditionally is how a transcript came to say audio_available:
+        # false while the files were still there.
+        if self._store is not None and deleted:
             try:
                 if self._store.mark_audio_unavailable(session_id) is not None:
                     transcripts_marked.append(session_id)
@@ -302,6 +355,8 @@ class AudioRetentionManager:
                     session_id,
                     exc,
                 )
+        elif not deleted:
+            logger.info("delete_audio(%s): no audio found on disk.", session_id)
 
         self._prune_empty_dirs()
         return CleanupReport(

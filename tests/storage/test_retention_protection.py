@@ -209,3 +209,106 @@ def test_audio_with_no_discoverable_session_id_is_protected(dirs) -> None:
 
     assert stray.exists()
     assert report.deleted_files == []
+
+
+# ---------------------------------------------------------------------------
+# P3 item 28 — delete_audio must find relocated audio, and not lie when it can't
+# ---------------------------------------------------------------------------
+def test_delete_audio_finds_relocated_files(dirs) -> None:
+    """A session is renamed to YYYY-MM-DD_HHMM_* the moment it transcribes, so
+    the id survives only inside the metadata JSON. Filename matching found
+    nothing for every normally-processed session."""
+    audio, store = dirs
+    files = make_session(audio, "relocated-sid", days_old=1, relocated=True)
+    store.save(frontmatter("relocated-sid"), "# ok\n\nbody")
+
+    report = AudioRetentionManager(
+        audio_dir=audio, transcript_store=store, retention_days=30
+    ).delete_audio("relocated-sid")
+
+    assert not files["mic"].exists()
+    assert not files["system"].exists()
+    assert report.transcripts_marked == ["relocated-sid"]
+
+
+def test_delete_audio_still_handles_uuid_named_files(dirs) -> None:
+    audio, store = dirs
+    files = make_session(audio, "uuid-sid", days_old=1)
+    store.save(frontmatter("uuid-sid"), "# ok\n\nbody")
+
+    report = AudioRetentionManager(
+        audio_dir=audio, transcript_store=store, retention_days=30
+    ).delete_audio("uuid-sid")
+
+    assert not files["mic"].exists()
+    assert "uuid-sid" in report.deleted_session_ids
+
+
+def test_delete_audio_does_not_claim_a_deletion_it_did_not_make(dirs) -> None:
+    """It used to mark audio_available:false unconditionally — telling the user
+    the audio was gone while it sat on disk, and nothing would surface it."""
+    audio, store = dirs
+    store.save(frontmatter("no-audio-anywhere"), "# ok\n\nbody")
+
+    report = AudioRetentionManager(
+        audio_dir=audio, transcript_store=store, retention_days=30
+    ).delete_audio("no-audio-anywhere")
+
+    assert report.deleted_files == []
+    assert report.transcripts_marked == []
+    fm = store.list_transcripts(limit=5)[0]
+    assert fm["audio_available"] is True, "nothing was deleted; nothing to declare"
+
+
+def test_delete_audio_leaves_other_sessions_alone(dirs) -> None:
+    audio, store = dirs
+    mine = make_session(audio, "mine", days_old=1)
+    theirs = make_session(audio, "theirs", days_old=1, relocated=True)
+
+    AudioRetentionManager(
+        audio_dir=audio, transcript_store=store, retention_days=30
+    ).delete_audio("mine")
+
+    assert not mine["mic"].exists()
+    assert theirs["mic"].exists()
+
+
+# ---------------------------------------------------------------------------
+# P3 item 27 — the disk row
+# ---------------------------------------------------------------------------
+def test_disk_health_is_reported(dirs) -> None:
+    """DISK has been in the panel's canonical order since P0 and nothing ever
+    reported it, so the row could never appear."""
+    from src.health import DISK, HealthState, get_health, reset_health
+
+    audio, store = dirs
+    reset_health()
+    try:
+        free = AudioRetentionManager(
+            audio_dir=audio, transcript_store=store, retention_days=30
+        ).report_disk_health()
+        assert free > 0
+        rep = get_health().get(DISK)
+        assert rep is not None
+        assert "GB free" in rep.detail
+        assert rep.state in (HealthState.OK, HealthState.WARN, HealthState.FAIL)
+    finally:
+        reset_health()
+
+
+def test_low_disk_is_a_warning_and_very_low_is_a_failure(dirs, monkeypatch) -> None:
+    from src.health import DISK, HealthState, get_health, reset_health
+    import src.storage.model_cache as mc
+
+    audio, store = dirs
+    mgr = AudioRetentionManager(
+        audio_dir=audio, transcript_store=store, retention_days=30
+    )
+    for free, expected in ((1 * 1000**3, HealthState.FAIL),
+                           (4 * 1000**3, HealthState.WARN),
+                           (50 * 1000**3, HealthState.OK)):
+        reset_health()
+        monkeypatch.setattr(mc, "free_bytes", lambda _p, _f=free: _f)
+        mgr.report_disk_health()
+        assert get_health().get(DISK).state is expected
+    reset_health()
