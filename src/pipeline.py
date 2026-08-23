@@ -26,7 +26,10 @@ from src.transcription.processor import (
     RecordingSession,
     TranscriptProcessor,
 )
-from src.transcription.whisper_engine import WhisperEngine
+from src.transcription.whisper_engine import (
+    DEFAULT_IDLE_TIMEOUT_SECONDS,
+    WhisperEngine,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +60,10 @@ def build_pipeline(cfg: Config) -> TranscriptionPipeline:
     engine = WhisperEngine(
         model_name=str(cfg.get("transcription", "model", default="small")),
         rtf_state_path="~/.otis/rtf_state.json",
+        idle_timeout_seconds=float(
+            cfg.get("transcription", "idle_timeout_seconds",
+                    default=DEFAULT_IDLE_TIMEOUT_SECONDS)
+        ),
     )
     processor = TranscriptProcessor(
         engine=engine,

@@ -605,6 +605,28 @@ class _MlxImportFailure(RuntimeError):
     """Raised when mlx-whisper isn't installed."""
 
 
+#: Transcribe long recordings in windows of this many seconds.
+#:
+#: mlx-whisper builds the mel spectrogram for the WHOLE file before decoding a
+#: single token — ``log_mel_spectrogram`` runs one STFT across the entire array
+#: — so MLX's allocator grows with meeting length. Measured on this Mac with
+#: ``medium``, via ``mx.get_peak_memory()``:
+#:
+#:      5 min  2.31 GB      20 min  2.78 GB
+#:     10 min  2.50 GB      45 min  3.53 GB
+#:
+#: about 31 MB per minute of audio over a ~2.2 GB floor, which puts a 97-minute
+#: meeting near 5.2 GB of unified memory. None of it shows up in RSS (1.05 GB
+#: for that 45-minute run) because MLX allocates through Metal, which is why
+#: this went unnoticed. Windowing caps the audio-dependent part.
+CHUNK_SECONDS = 600.0
+
+#: Never advance less than this between windows. Only a pathological window
+#: (Whisper returning almost nothing for ten minutes of audio) can hit it; it
+#: exists so the loop always terminates.
+MIN_ADVANCE_SECONDS = 30.0
+
+
 def _default_mlx_transcribe(audio: str, **kwargs: Any) -> dict[str, Any]:
     """Hand audio to mlx-whisper as a pre-decoded numpy array.
 
@@ -620,7 +642,93 @@ def _default_mlx_transcribe(audio: str, **kwargs: Any) -> dict[str, Any]:
         raise _MlxImportFailure(str(exc)) from exc
 
     samples = decode_to_float32_mono16k(audio)
-    return mlx_whisper.transcribe(samples, **kwargs)  # type: ignore[no-any-return]
+    if len(samples) <= int(CHUNK_SECONDS * TARGET_SAMPLE_RATE):
+        return mlx_whisper.transcribe(samples, **kwargs)  # type: ignore[no-any-return]
+    return _transcribe_windowed(mlx_whisper, samples, **kwargs)
+
+
+def _transcribe_windowed(
+    mlx_whisper: Any, samples: Any, **kwargs: Any,
+) -> dict[str, Any]:
+    """Transcribe a long recording window by window, stitched back together.
+
+    Each window resumes exactly where the previous window's last *complete*
+    segment ended, so there is no gap and nothing is transcribed twice.
+
+    The subtlety is the final segment of a window: its audio was cut off by
+    the window edge, so it is the one Whisper had least context for. It is
+    dropped and re-read as part of the next window, which sees the whole
+    sentence. Advancing by a fixed step with a fixed overlap instead — the
+    obvious design — lost about 15 words at every seam, measured as 91.6%
+    word agreement against a single pass on a real 45-minute meeting, where
+    Whisper agrees with *itself* 100.00%.
+
+    Language is decided once. mlx-whisper detects it from the first 30 s of
+    whatever it is handed, so left on auto every window votes again and a
+    meeting could change language halfway through.
+    """
+    window = int(CHUNK_SECONDS * TARGET_SAMPLE_RATE)
+    floor = int(MIN_ADVANCE_SECONDS * TARGET_SAMPLE_RATE)
+    total = len(samples)
+    language = kwargs.get("language")
+    segments: list[dict[str, Any]] = []
+    pos = 0
+    windows = 0
+
+    while pos < total:
+        chunk = samples[pos:pos + window]
+        offset = pos / TARGET_SAMPLE_RATE
+        raw = mlx_whisper.transcribe(chunk, **{**kwargs, "language": language})
+        windows += 1
+        if language is None:
+            language = raw.get("language") or None
+
+        kept = list(raw.get("segments") or [])
+        is_last = pos + window >= total
+        if not is_last and len(kept) > 1:
+            kept = kept[:-1]  # cut by the window edge; the next window owns it
+
+        for seg in kept:
+            shifted = dict(seg)
+            shifted["start"] = float(seg.get("start", 0.0)) + offset
+            shifted["end"] = float(seg.get("end", 0.0)) + offset
+            segments.append(shifted)
+
+        _flush_mlx_buffers()
+        if is_last:
+            break
+        # Resume where the kept text ended. A window that recognised nothing
+        # advances by its whole length — there is nothing there to re-read.
+        if kept:
+            advance = int(float(kept[-1].get("end", 0.0)) * TARGET_SAMPLE_RATE)
+        else:
+            advance = window
+        pos += max(advance, floor)
+
+    logger.info(
+        "Transcribed %.1f min in %d windows of %.0f s.",
+        total / TARGET_SAMPLE_RATE / 60.0, windows, CHUNK_SECONDS,
+    )
+    return {
+        "text": " ".join(str(s.get("text", "")).strip() for s in segments).strip(),
+        "segments": segments,
+        "language": language,
+        "duration": total / TARGET_SAMPLE_RATE,
+    }
+
+
+def _flush_mlx_buffers() -> None:
+    """Return MLX's cached buffers to the OS, keeping the loaded model.
+
+    Distinct from :func:`_release_mlx_model_cache`, which also drops the model
+    and so forces a multi-second reload on the next run.
+    """
+    try:
+        import mlx.core as mx
+
+        mx.clear_cache()
+    except Exception:  # pragma: no cover (older mlx / mlx absent)
+        logger.debug("mx.clear_cache unavailable", exc_info=True)
 
 
 #: Formats we can decode without ffmpeg, via macOS's own AudioToolbox.
