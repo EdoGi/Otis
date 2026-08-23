@@ -273,6 +273,13 @@ class MenuBarApp:
         self._events: queue.Queue[tuple[str, Any]] = queue.Queue()
         self._lock = threading.RLock()
 
+        # Menu contents come from disk, so they are scanned on a worker and
+        # rendered from the drain timer. Requests coalesce: a scan already in
+        # flight picks up later requests instead of stacking threads.
+        self._scan_lock = threading.Lock()
+        self._scan_thread: threading.Thread | None = None
+        self._scan_pending = False
+
         self._snapshot = UiSnapshot(
             selected_language_code=config.get("transcription", "language"),
         )
@@ -305,6 +312,11 @@ class MenuBarApp:
             os.getcwd(), n_pollers, self._icons_dir,
         )
         self._warn_if_blackhole_missing()
+        # First fill of the two disk-backed menus. Deliberately here and not
+        # in __init__: it must not run before the drain timer exists to render
+        # the result, and constructing the app (tests included) should not
+        # start touching disk on its own.
+        self._request_menu_rescan()
 
         # Honour the working-hours window from the very first tick — otherwise
         # we'd run detection for up to ``SCHEDULE_CHECK_INTERVAL`` seconds even
@@ -447,12 +459,12 @@ class MenuBarApp:
         # don't yet have a transcript (e.g. recordings whose Stop & Transcribe
         # crashed mid-flight, leaving orphan WAVs on disk).
         self._mi["generate_root"] = rumps.MenuItem("Generate Transcript")
-        self._refresh_generate_menu()
+        self._render_generate_menu(None)
 
         # Recent transcripts — populated from disk now and refreshed after
         # each transcription completes.
         self._mi["recent_root"] = rumps.MenuItem("Recent Transcripts")
-        self._refresh_recent_menu()
+        self._render_recent_menu(None)
 
         # Status — the panel whose absence let three failures run silently for
         # months. Every subsystem reports here; a degraded component also puts
@@ -726,12 +738,14 @@ class MenuBarApp:
         elif event_type == "health":
             self._handle_health_change(*payload)
         elif event_type == "refresh_recent":
-            # The transcription worker just landed (or failed); reload the
-            # Recent Transcripts submenu so the new item shows up.
-            self._refresh_recent_menu()
-            # Same trigger refreshes the orphan list so a successful run
-            # disappears from "Generate Transcript".
-            self._refresh_generate_menu()
+            # The transcription worker just landed (or failed); rescan so the
+            # new transcript shows up under Recent and the session it came
+            # from disappears from Generate Transcript.
+            self._request_menu_rescan()
+        elif event_type == "render_menus":
+            recent, orphans = payload
+            self._render_recent_menu(recent)
+            self._render_generate_menu(orphans)
 
     # =====================================================================
     # User-clicked menu callbacks (main-thread, courtesy of rumps)
@@ -1208,12 +1222,11 @@ class MenuBarApp:
                 hint=status.message(),
             )
 
-    def _refresh_generate_menu(self, *, limit: int = 10) -> None:
-        """Rebuild the "Generate Transcript" submenu from disk.
+    def _render_generate_menu(self, sessions: list[dict[str, Any]] | None) -> None:
+        """Draw the "Generate Transcript" submenu. Main thread, no disk.
 
-        Lists every audio session under ``audio_dir`` that does NOT yet have
-        a saved transcript, so the user can manually re-trigger transcription
-        for orphan WAVs (e.g. when the auto-flow crashed mid-recording).
+        ``None`` means the scan hasn't landed yet — the menu exists from the
+        first paint, it just says so.
         """
         import rumps
 
@@ -1226,9 +1239,10 @@ class MenuBarApp:
         except Exception:  # pragma: no cover (older rumps)
             pass
 
-        sessions = self._find_orphan_sessions(limit=limit)
         if not sessions:
-            placeholder = rumps.MenuItem("(no orphan recordings)")
+            placeholder = rumps.MenuItem(
+                "(scanning…)" if sessions is None else "(no orphan recordings)"
+            )
             placeholder.set_callback(None)  # render disabled
             root.add(placeholder)
             return
@@ -1243,6 +1257,64 @@ class MenuBarApp:
                 str(entry["system_path"]) if entry["system_path"] else None
             )  # type: ignore[attr-defined]
             root.add(item)
+
+    # =====================================================================
+    # Menu contents (scanned on a worker, rendered on the main thread)
+    # =====================================================================
+    def _request_menu_rescan(self) -> None:
+        """Ask the worker to rescan disk and repaint the two disk-backed menus.
+
+        Audit C5: both menus were built synchronously inside the rumps main
+        thread — at startup before ``app.run()``, and again after every
+        transcription. That is two rglobs of the audio tree, a JSON parse per
+        session, and a store scan, on the thread that also draws the menu:
+        ~1.8 s frozen at 1 000 transcripts.
+
+        Requests coalesce rather than stack. A scan already running picks up
+        anything asked for while it was working, so a burst of events costs
+        one extra pass, not one thread each.
+        """
+        with self._scan_lock:
+            self._scan_pending = True
+            if self._scan_thread is not None and self._scan_thread.is_alive():
+                return
+            self._scan_thread = threading.Thread(
+                target=self._scan_loop, name="otis-menu-scan", daemon=True
+            )
+            self._scan_thread.start()
+
+    def _scan_loop(self) -> None:
+        while True:
+            with self._scan_lock:
+                if not self._scan_pending:
+                    # Clear before returning, under the lock, so the next
+                    # request starts a thread instead of waiting on this one.
+                    self._scan_thread = None
+                    return
+                self._scan_pending = False
+            try:
+                payload = self._scan_menus()
+            except Exception:
+                logger.exception("Menu scan failed")
+                continue
+            self._events.put(("render_menus", payload))
+
+    def _scan_menus(
+        self, *, recent_limit: int = 5, orphan_limit: int = 10,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """All the disk work behind the two menus. Worker thread only."""
+        recent: list[dict[str, Any]] = []
+        if self._store is not None:
+            try:
+                recent = self._store.list_transcripts(limit=recent_limit)
+            except Exception:
+                logger.exception("Could not list transcripts for the Recent menu")
+        try:
+            orphans = self._find_orphan_sessions(limit=orphan_limit)
+        except Exception:
+            logger.exception("Could not scan for orphan recordings")
+            orphans = []
+        return recent, orphans
 
     def _find_orphan_sessions(self, *, limit: int = 10) -> list[dict[str, Any]]:
         """Convenience: pull audio_dir / store / current-session from self."""
@@ -1302,11 +1374,29 @@ class MenuBarApp:
             force=True,
         )
         threading.Thread(
-            target=self._run_transcription,
-            args=(metadata,),
+            target=self._repair_then_transcribe,
+            args=(metadata, Path(mic_str), Path(sys_str) if sys_str else None),
             name="otis-on-demand-transcribe",
             daemon=True,
         ).start()
+
+    def _repair_then_transcribe(
+        self, metadata: dict[str, Any], mic_path: Path, system_path: Path | None,
+    ) -> None:
+        """Fix a crash-truncated header, then transcribe. Worker thread.
+
+        Repair used to happen inside the menu build, against every recording
+        on disk, every time the menu was drawn — reading 64 KB per file and
+        potentially rewriting headers as a side effect of opening a menu. It
+        belongs to whoever is about to read the audio, which is this: two
+        files, once, on the session the user actually chose.
+        """
+        try:
+            repair_if_needed(mic_path)
+            repair_if_needed(system_path)
+        except Exception:
+            logger.exception("Could not repair audio for %s", mic_path)
+        self._run_transcription(metadata)
 
     def _build_recorder_metadata(
         self,
@@ -1363,12 +1453,10 @@ class MenuBarApp:
         meta.setdefault("pauses", [])
         return meta
 
-    def _refresh_recent_menu(self, *, limit: int = 5) -> None:
-        """Rebuild the Recent Transcripts submenu from the store.
+    def _render_recent_menu(self, entries: list[dict[str, Any]] | None) -> None:
+        """Draw the Recent Transcripts submenu. Main thread, no disk.
 
-        Called once at startup and again after every transcription completes.
-        Falls back to a "(no transcripts yet)" placeholder when the store
-        isn't wired (tests) or is genuinely empty.
+        ``None`` means the scan hasn't landed yet.
         """
         import rumps
 
@@ -1383,16 +1471,10 @@ class MenuBarApp:
         except Exception:  # pragma: no cover (older rumps)
             pass
 
-        entries: list[dict[str, Any]] = []
-        if self._store is not None:
-            try:
-                entries = self._store.list_transcripts(limit=limit)
-            except Exception:
-                logger.exception("Could not list transcripts for the Recent menu")
-                entries = []
-
         if not entries:
-            root.add(rumps.MenuItem("(no transcripts yet)"))
+            root.add(rumps.MenuItem(
+                "(scanning…)" if entries is None else "(no transcripts yet)"
+            ))
             return
 
         for fm in entries:
@@ -1739,6 +1821,11 @@ def find_orphan_sessions(
       — recorder.stop() crashed mid-write. The caller can still transcribe
       these via a synthesised metadata dict.
 
+    Read-only: this only ever looks. Repairing a crash-truncated header is
+    the job of whoever transcribes the session
+    (:meth:`MenuBarApp._repair_then_transcribe`), because a listing that
+    rewrites files is a listing you cannot run from a menu build.
+
     ``current_recording_session_id`` excludes the session being actively
     recorded right now — its WAV files are still being written and would
     otherwise show up as a tempting (but corrupted) orphan.
@@ -1786,12 +1873,6 @@ def find_orphan_sessions(
         )
         if mic_path is None:
             continue
-        # A crash mid-recording leaves a 0-frame header with PCM data behind
-        # it; repair so the session is actually transcribable when picked.
-        # (The actively-recording session was excluded above via
-        # seen_session_ids, so we never touch a file still being written.)
-        repair_if_needed(mic_path)
-        repair_if_needed(sys_path)
         seen_audio_paths.add(mic_path)
         if sys_path is not None:
             seen_audio_paths.add(sys_path)
@@ -1824,8 +1905,6 @@ def find_orphan_sessions(
             continue
         seen_session_ids.add(sid)
         sys_path = mic_path.with_name(f"{sid}_system.wav")
-        repair_if_needed(mic_path)
-        repair_if_needed(sys_path if sys_path.exists() else None)
         results.append({
             "session_id": sid,
             "label": _format_session_label(mic_path, mic_path) + "  (orphan)",
