@@ -126,6 +126,11 @@ class HealthRegistry:
         self._lock = threading.RLock()
         self._reports: dict[str, HealthReport] = {}
         self._callbacks: list[ChangeCallback] = []
+        # Held across report+dispatch so two threads reporting A->B and B->C
+        # cannot deliver C before B. Deliberately not _lock: callbacks still
+        # run with the state lock released, so a callback may read the
+        # registry it was called about.
+        self._dispatch_lock = threading.Lock()
 
     # =====================================================================
     # Reporting
@@ -152,28 +157,39 @@ class HealthRegistry:
             hint=hint,
             updated_at=self._clock(),
         )
-        with self._lock:
-            previous = self._reports.get(key)
-            self._reports[key] = rep
-            prev_state = previous.state if previous is not None else HealthState.UNSET
-            # Callbacks fire on a first report too — the menu panel is rendered
-            # from this same signal and must stay in sync. Subscribers tell the
-            # two cases apart by ``prev_state is UNSET``: render it, but don't
-            # announce a "recovery" from a state that was never broken.
-            changed = prev_state is not state
-            callbacks = list(self._callbacks) if changed else []
+        # The dispatch lock wraps recording *and* notifying, so two threads
+        # reporting A->B and B->C cannot deliver C before B and leave the panel
+        # showing a state the component has already left. The state lock is
+        # released before any callback runs, so a callback may still read the
+        # registry it was called about.
+        with self._dispatch_lock:
+            with self._lock:
+                previous = self._reports.get(key)
+                self._reports[key] = rep
+                prev_state = (
+                    previous.state if previous is not None else HealthState.UNSET
+                )
+                # Callbacks fire on a first report too — the menu panel is
+                # rendered from this same signal and must stay in sync.
+                # Subscribers tell the two cases apart by ``prev_state is
+                # UNSET``: render it, but don't announce a "recovery" from a
+                # state that was never broken.
+                changed = prev_state is not state
+                callbacks = list(self._callbacks) if changed else []
 
-        if changed:
-            logger.info(
-                "health[%s] %s → %s%s",
-                key, prev_state.value, state.value,
-                f" ({detail})" if detail else "",
-            )
-            for cb in callbacks:
-                try:
-                    cb(rep, prev_state)
-                except Exception:
-                    logger.exception("Health change callback failed for %s", key)
+            if changed:
+                logger.info(
+                    "health[%s] %s -> %s%s",
+                    key, prev_state.value, state.value,
+                    f" ({detail})" if detail else "",
+                )
+                for cb in callbacks:
+                    try:
+                        cb(rep, prev_state)
+                    except Exception:
+                        logger.exception(
+                            "Health change callback failed for %s", key
+                        )
         return rep
 
     def clear(self, key: str) -> None:

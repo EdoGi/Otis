@@ -331,6 +331,12 @@ class TranscriptProcessor:
         last_t = max((s.segment.end for s in labelled_mic), default=0.0)
         last_t_sys = max((s.segment.end for s in labelled_sys), default=0.0)
         duration_seconds = max(last_t, last_t_sys)
+        # A meeting where Whisper found nothing — everyone on mute, a failed
+        # capture — has no segments, and taking the last segment's end then
+        # reported a 45-minute recording as 0 minutes, in the frontmatter, the
+        # web UI and any time accounting. The audio knows how long it was.
+        if duration_seconds <= 0.0:
+            duration_seconds = _recorded_seconds(merged_meta)
         local_end = local_start + timedelta(seconds=duration_seconds)
 
         # Where the audio files will live after rename — relative to audio_dir.
@@ -880,6 +886,18 @@ def _clean_pauses(pauses: "list[Any] | None") -> list[tuple[float, float]]:
         out.append((float(start), float(end)))
     out.sort()
     return out
+
+
+def _recorded_seconds(metadata: dict[str, Any]) -> float:
+    """How long the recorder actually captured, from the byte counts."""
+    rate = metadata.get("sample_rate") or 16000
+    width = 2  # the recorder writes 16-bit PCM
+    best = 0.0
+    for key in ("mic_bytes", "system_bytes"):
+        raw = metadata.get(key)
+        if isinstance(raw, (int, float)) and raw > 0:
+            best = max(best, float(raw) / (float(rate) * width))
+    return best
 
 
 def _system_audio_state(sys_result: "TranscriptionResult | None") -> str:

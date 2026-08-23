@@ -191,6 +191,42 @@ def default_routing_probe() -> RoutingProbe:
     )
 
 
+#: An aggregate nested inside an aggregate is unusual but legal, and macOS
+#: offers no depth limit. Bounded so a device that somehow contains itself
+#: cannot spin the routing check.
+_MAX_AGGREGATE_DEPTH = 4
+
+
+def _expand_members(probe: RoutingProbe, device_id: int) -> list[int]:
+    """Every leaf device the output eventually reaches.
+
+    One level was walked before, so an aggregate containing another aggregate
+    that contains BlackHole reported NOT_ROUTED — telling the user system
+    audio was broken while it was working. A health panel that cries wolf is
+    the failure P0 set out to fix, just pointed the other way.
+    """
+    seen: set[int] = set()
+    leaves: list[int] = []
+
+    def walk(did: int, depth: int) -> None:
+        if did in seen or depth > _MAX_AGGREGATE_DEPTH:
+            return
+        seen.add(did)
+        try:
+            children = list(probe.aggregate_members(did))
+        except Exception:  # pragma: no cover (defensive)
+            children = []
+        if not children:
+            if depth > 0:
+                leaves.append(did)
+            return
+        for child in children:
+            walk(child, depth + 1)
+
+    walk(device_id, 0)
+    return leaves
+
+
 def check_output_routing(probe: RoutingProbe | None = None) -> RoutingStatus:
     """Report whether the current default output actually feeds BlackHole."""
     if probe is None:
@@ -202,7 +238,7 @@ def check_output_routing(probe: RoutingProbe | None = None) -> RoutingStatus:
     try:
         out_id = probe.default_output_id()
         out_name = probe.device_name(out_id)
-        members = list(probe.aggregate_members(out_id))
+        members = _expand_members(probe, out_id)
     except Exception as exc:
         logger.warning("Audio routing probe failed: %s", exc)
         return RoutingStatus(state=RoutingState.UNKNOWN, error=str(exc))

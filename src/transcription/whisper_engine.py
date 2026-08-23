@@ -168,6 +168,7 @@ class WhisperEngine:
         #: Local snapshot directory, resolved on first use. See
         #: :func:`resolve_model_path` for why we do not just pass the repo id.
         self._resolved_model_path: str | None = None
+        self._shutdown = False
         self._idle_timeout = float(idle_timeout_seconds)
         self._transcribe_fn = transcribe_fn or _default_mlx_transcribe
         self._health = health
@@ -329,6 +330,7 @@ class WhisperEngine:
         # starting in that window could get a half-cleared holder back from
         # ModelHolder.get_model() and fail deep inside decoding.
         with self._lock:
+            self._shutdown = True
             self._warm = False
             if self._idle_timer is not None:
                 self._idle_timer.cancel()
@@ -483,6 +485,12 @@ class WhisperEngine:
         logger.debug("Measured RTF %.1fx (smoothed %.1fx)", measured, smoothed)
 
     def _reset_idle_timer(self) -> None:
+        if self._shutdown:
+            # shutdown() cancelled the timer, but transcribe()'s finally block
+            # re-armed it on the way out — leaving a timer alive on a shut-down
+            # engine to fire minutes later and clear mlx's cache under whoever
+            # owns the process next.
+            return
         if self._idle_timer is not None:
             self._idle_timer.cancel()
         self._idle_timer = threading.Timer(self._idle_timeout, self._on_idle_expired)
