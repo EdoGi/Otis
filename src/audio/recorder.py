@@ -1048,6 +1048,55 @@ def _looks_like_disk_full(exc: BaseException) -> bool:
     return "no space left" in text or "enospc" in text
 
 
+_BRIDGE_CLASS: Any = None
+_BRIDGE_CLASS_LOCK = threading.Lock()
+
+
+def sleep_wake_bridge_class() -> Any:
+    """Define the sleep/wake Objective-C bridge exactly once per process.
+
+    This class used to be declared inside ``_SleepWakeObserver._run``. ObjC
+    registers class names process-wide, so the first recorder defined it and
+    every recorder after that died on::
+
+        objc.error: _Bridge is overriding existing Objective-C class
+
+    inside its observer thread, where nothing was watching. The menu bar builds
+    a fresh recorder for every meeting, so sleep/wake handling worked for the
+    first recording of a session and silently stopped for all the rest — and
+    with it the wake-time stream revival added in P2, whose entire purpose is
+    that a lid closed mid-meeting does not produce a dead stream.
+    """
+    global _BRIDGE_CLASS
+    with _BRIDGE_CLASS_LOCK:
+        if _BRIDGE_CLASS is not None:
+            return _BRIDGE_CLASS
+
+        from Foundation import NSObject
+
+        class _OtisSleepWakeBridge(NSObject):
+            def workspaceWillSleep_(self, _notification):
+                handler = getattr(self, "otis_on_sleep", None)
+                if handler is None:
+                    return
+                try:
+                    handler()
+                except Exception:
+                    logger.exception("on_sleep handler raised")
+
+            def workspaceDidWake_(self, _notification):
+                handler = getattr(self, "otis_on_wake", None)
+                if handler is None:
+                    return
+                try:
+                    handler()
+                except Exception:
+                    logger.exception("on_wake handler raised")
+
+        _BRIDGE_CLASS = _OtisSleepWakeBridge
+        return _BRIDGE_CLASS
+
+
 class _SleepWakeObserver:
     """Listens for ``NSWorkspaceWillSleepNotification`` / ``DidWakeNotification``.
 
@@ -1094,38 +1143,27 @@ class _SleepWakeObserver:
     def _run(self) -> None:  # pragma: no cover (requires macOS GUI session)
         import objc
         from AppKit import NSWorkspace
-        from Foundation import NSDate, NSObject, NSRunLoop
+        from Foundation import NSDate, NSRunLoop
 
-        on_sleep = self._on_sleep
-        on_wake = self._on_wake
-
-        class _Bridge(NSObject):
-            def workspaceWillSleep_(self, _notification):
-                try:
-                    on_sleep()
-                except Exception:
-                    logger.exception("on_sleep handler raised")
-
-            def workspaceDidWake_(self, _notification):
-                try:
-                    on_wake()
-                except Exception:
-                    logger.exception("on_wake handler raised")
-
-        bridge = _Bridge.alloc().init()
+        cls = sleep_wake_bridge_class()
+        bridge = cls.alloc().init()
+        # Handlers live on the instance, not in a closure, because the class
+        # is now shared by every recorder in the process.
+        bridge.otis_on_sleep = self._on_sleep
+        bridge.otis_on_wake = self._on_wake
         self._impl = bridge
 
         try:
             nc = NSWorkspace.sharedWorkspace().notificationCenter()
             nc.addObserver_selector_name_object_(
                 bridge,
-                objc.selector(_Bridge.workspaceWillSleep_, signature=b"v@:@"),
+                objc.selector(cls.workspaceWillSleep_, signature=b"v@:@"),
                 "NSWorkspaceWillSleepNotification",
                 None,
             )
             nc.addObserver_selector_name_object_(
                 bridge,
-                objc.selector(_Bridge.workspaceDidWake_, signature=b"v@:@"),
+                objc.selector(cls.workspaceDidWake_, signature=b"v@:@"),
                 "NSWorkspaceDidWakeNotification",
                 None,
             )
