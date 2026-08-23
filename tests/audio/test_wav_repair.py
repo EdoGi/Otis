@@ -109,3 +109,83 @@ def test_repair_refuses_nonzero_declared_size_with_trailing_data(tmp_path: Path)
     assert wav_needs_repair(path) is False
     assert repair_wav_header(path) is False  # even when called directly
     assert path.read_bytes() == before
+
+
+# ---------------------------------------------------------------------------
+# P2 item 22 — the shape that can actually reach us
+# ---------------------------------------------------------------------------
+def _pcm_wav(path: Path, *, frames: int = 8000) -> Path:
+    import wave as _wave
+
+    with _wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(16000)
+        wf.writeframes(b"\x11\x22" * frames)
+    return path
+
+
+def _declared_data_size(path: Path) -> int:
+    raw = path.read_bytes()
+    idx = raw.index(b"data")
+    return struct.unpack_from("<I", raw, idx + 4)[0]
+
+
+def test_a_truncated_file_is_repaired(tmp_path: Path) -> None:
+    """An interrupted copy or a half-finished sync: the header outlives the bytes.
+
+    This is the case the module used to refuse, and the only one this
+    recorder's files can realistically arrive in.
+    """
+    path = _pcm_wav(tmp_path / "truncated.wav")
+    full = path.stat().st_size
+    with path.open("r+b") as fh:  # lop off a third of the audio
+        fh.truncate(full - 5000)
+
+    assert wav_needs_repair(path) is True
+    assert repair_wav_header(path) is True
+
+    with wave.open(str(path), "rb") as wf:
+        assert wf.getnframes() > 0
+        assert len(wf.readframes(wf.getnframes())) == wf.getnframes() * 2
+    assert _declared_data_size(path) == path.stat().st_size - 44
+
+
+def test_a_truncated_file_is_unreadable_until_repaired(tmp_path: Path) -> None:
+    """Whisper gets the tail as garbage or an exception; that is the harm."""
+    path = _pcm_wav(tmp_path / "truncated.wav")
+    with path.open("r+b") as fh:
+        fh.truncate(path.stat().st_size - 5000)
+
+    with wave.open(str(path), "rb") as wf:
+        claimed = wf.getnframes()
+        got = len(wf.readframes(claimed))
+    assert got < claimed * 2, "the header promises audio the file does not have"
+
+
+def test_a_header_declaring_less_than_the_file_is_left_alone(tmp_path: Path) -> None:
+    """That is how a valid WAV carries trailing LIST/INFO chunks."""
+    path = _pcm_wav(tmp_path / "with_trailer.wav")
+    with path.open("ab") as fh:
+        fh.write(b"LIST" + struct.pack("<I", 4) + b"INFO")
+
+    assert wav_needs_repair(path) is False
+    assert repair_wav_header(path) is False
+
+
+def test_an_intact_file_is_never_touched(tmp_path: Path) -> None:
+    path = _pcm_wav(tmp_path / "fine.wav")
+    before = path.read_bytes()
+    assert wav_needs_repair(path) is False
+    assert repair_if_needed(path) is False
+    assert path.read_bytes() == before
+
+
+def test_repair_truncates_to_whole_frames(tmp_path: Path) -> None:
+    """A cut can land mid-sample; half a frame is not audio."""
+    path = _pcm_wav(tmp_path / "odd.wav")
+    with path.open("r+b") as fh:
+        fh.truncate(path.stat().st_size - 4001)  # odd byte count
+
+    assert repair_wav_header(path) is True
+    assert _declared_data_size(path) % 2 == 0

@@ -1,22 +1,38 @@
-"""Repair WAV headers left broken by a crash mid-recording.
+"""Make a damaged WAV readable again, when we can be sure what "damaged" is.
 
-Python's ``wave`` module patches the RIFF and data chunk sizes only when the
-file is closed. If Otis is killed (crash, force-quit, power loss) while the
-writer thread is streaming, the header still says "0 frames" even though the
-PCM data is sitting right there in the file — and every reader downstream
-(``wave.open``, the silence pre-check, Whisper) sees an empty recording.
+Two shapes of broken header, and it is worth being exact about which one this
+recorder can actually produce.
 
-``repair_wav_header`` rewrites the two size fields from the actual file
-size, making the recording readable again. It only touches classic PCM WAVs
-(what our recorder writes) and is deliberately conservative: anything it
-doesn't fully understand is left untouched.
+**Declared size zero, data present.** The original reason this module existed:
+the belief that a force-quit leaves ``wave`` having never patched the header.
+Measured against a real SIGKILL of a live recording, that does not happen —
+CPython's ``Wave_write.writeframes`` calls ``_patchheader()`` after *every*
+write, so the killed process left 90156 bytes on disk and a header declaring
+45056 frames, which is exactly right:
+
+    1fcb09d1..._mic.wav   90156 bytes  header frames=45056  needs_repair=False
+
+So this case is dead for our own files. It is kept because it costs nothing
+and other writers do produce it.
+
+**Declared size larger than the file.** This is the shape that can really
+reach us, and the one the module used to refuse outright: a WAV whose data
+chunk claims more bytes than the file contains. A copy interrupted partway, a
+half-finished cloud sync, a truncated restore from a backup. Every reader then
+either raises or runs off the end of the data, so the recording is unusable —
+and clamping the declared size down to what is actually present loses nothing,
+because those bytes do not exist.
+
+The opposite (declared *smaller* than the file) is still refused, and that
+asymmetry is deliberate: a short data chunk is how a perfectly valid WAV
+carries trailing ``LIST``/``INFO`` chunks after the audio, and "repairing" it
+would swallow that metadata into the samples.
 """
 
 from __future__ import annotations
 
 import logging
 import struct
-import wave
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -46,16 +62,12 @@ def _find_chunks(data: bytes) -> dict[bytes, tuple[int, int]]:
 
 
 def wav_needs_repair(path: Path) -> bool:
-    """True iff the WAV header claims 0 frames but PCM bytes exist on disk."""
-    try:
-        with wave.open(str(path), "rb") as wf:
-            if wf.getnframes() > 0:
-                return False
-    except (wave.Error, EOFError, OSError):
-        # Unreadable header — possibly repairable, let repair decide.
-        pass
-    except Exception:
-        return False
+    """True iff the header disagrees with the file in a way we can fix."""
+    # Deliberately no `wave.open(...).getnframes() > 0` fast path. A truncated
+    # file still declares its original frame count, so that check called it
+    # healthy and short-circuited the one case worth catching. The chunk walk
+    # below is the authority: it compares what the header claims against what
+    # the file actually holds.
     try:
         with path.open("rb") as fh:
             head = fh.read(64 * 1024)
@@ -66,7 +78,12 @@ def wav_needs_repair(path: Path) -> bool:
             return False
         data_offset, declared = chunks[b"data"]
         actual_body = path.stat().st_size - (data_offset + 8)
-        return declared == 0 and actual_body > 0
+        if actual_body <= 0:
+            return False
+        # Zero: the header was never written. Larger than the file: the file
+        # was truncated. Smaller is legitimate — trailing chunks — so it is
+        # not ours to touch.
+        return declared == 0 or declared > actual_body
     except Exception:
         return False
 
@@ -98,14 +115,14 @@ def repair_wav_header(path: Path) -> bool:
             return False  # not plain PCM — don't guess
 
         data_offset, declared_size = chunks[b"data"]
-        if declared_size != 0:
-            # Only the crash signature (size patched as 0 at open time) is
-            # repairable. A non-zero size that disagrees with the file size
-            # can be legitimate — e.g. trailing LIST/INFO chunks after data —
-            # and "repairing" it would swallow that metadata into the audio.
-            return False
         body = size - (data_offset + 8)
         if body <= 0:
+            return False
+        if declared_size != 0 and declared_size <= body:
+            # Either it already agrees, or it declares less than the file
+            # holds — which is how a valid WAV carries trailing LIST/INFO
+            # chunks after the audio. Rewriting that would fold the metadata
+            # into the samples.
             return False
         # Truncate to a whole number of frames (a crash can land mid-frame).
         body -= body % block_align
@@ -118,8 +135,9 @@ def repair_wav_header(path: Path) -> bool:
             fh.seek(data_offset + 4)
             fh.write(struct.pack("<I", body))
         logger.info(
-            "Repaired truncated WAV header: %s (data size %d → %d bytes)",
+            "Repaired WAV header: %s (data size %d → %d bytes; %s)",
             path.name, declared_size, body,
+            "header never written" if declared_size == 0 else "file truncated",
         )
         return True
     except Exception:
