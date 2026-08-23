@@ -258,7 +258,8 @@ def _run_menubar(cfg: Config) -> int:
     try:
         from src.web.server import serve_in_background
 
-        serve_in_background(pipeline.store, host=web_host, port=web_port)
+        serve_in_background(pipeline.store, host=web_host, port=web_port,
+                            audio_dir=pipeline.audio_dir)
         logger.info("Web UI listening on http://%s:%d", web_host, web_port)
     except OSError as exc:
         logger.warning(

@@ -25,7 +25,9 @@ def test_render_headings_bold_and_paragraphs() -> None:
     out = render_markdown_min(body)
     assert "<h1>Standup — 2026-06-01</h1>" in out
     assert "<h2>Transcript</h2>" in out
-    assert "<strong>[00:01]</strong> Me: hello there<br>" in out
+    # The timestamp became a seek link; the bold speaker label is unchanged.
+    assert '<a class="ts" href="#" data-t="1"' in out
+    assert "Me: hello there<br>" in out
     assert out.count("<p>") == 2
 
 
@@ -101,7 +103,9 @@ def test_index_title_filter(client) -> None:
 def test_transcript_view_renders_body_and_meta(client) -> None:
     text = client.get("/transcript/id-1").get_data(as_text=True)
     assert "<h1>Sprint Planning</h1>" in text
-    assert "<strong>[00:01]</strong> Me: the roadmap is ready" in text
+    # The timestamp is a seek link now, still inside the bold speaker label.
+    assert 'data-t="1"' in text
+    assert "Me: the roadmap is ready" in text
     assert "Alice" in text
 
 
@@ -122,15 +126,23 @@ def test_transcript_escapes_malicious_title(tmp_path: Path) -> None:
 
 
 def test_search_returns_snippets(client) -> None:
-    text = client.get("/search?q=roadmap").get_data(as_text=True)
+    """Body search lives on the index now; /search keeps old links working."""
+    text = client.get("/?q=roadmap").get_data(as_text=True)
     assert "Sprint Planning" in text
     assert "roadmap" in text
     assert "Retro" not in text
 
 
-def test_search_empty_query_shows_form(client) -> None:
+def test_the_old_search_url_still_lands_somewhere_useful(client) -> None:
+    resp = client.get("/search?q=roadmap")
+    assert resp.status_code == 302
+    assert resp.headers["Location"].endswith("/?q=roadmap")
+
+
+def test_search_empty_query_goes_to_the_list(client) -> None:
     resp = client.get("/search")
-    assert resp.status_code == 200
+    assert resp.status_code == 302
+    assert resp.headers["Location"].endswith("/")
 
 
 # ---------------------------------------------------------------------------
