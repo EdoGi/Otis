@@ -20,11 +20,13 @@ app, no UI:
 
 from __future__ import annotations
 
+import json
 import logging
 import signal
 import threading
 from collections.abc import Callable
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from src.audio.recorder import DualStreamRecorder
@@ -117,6 +119,15 @@ class OtisDaemon:
                 ),
             )
 
+        # Unfinished transcriptions, so a reboot does not lose them. `otis run`
+        # had neither this nor an orphan scan, so anything interrupted was gone
+        # until retention deleted the audio 30 days later.
+        from src.storage.transcription_queue import TranscriptionQueue
+
+        self._queue = TranscriptionQueue(
+            Path(str(config.get("storage", "queue_dir", default="~/.otis/queue")))
+        )
+
         self._detector = detector or self._build_detector()
         self._wire_callbacks()
 
@@ -128,6 +139,7 @@ class OtisDaemon:
         self._install_signal_handlers()
         self._notify("Otis is watching for meetings. Press Ctrl-C to stop.")
         self._notify(self._summary_line())
+        self._recover_unfinished_work()
         # Honour the working-hours window from tick zero; the schedule
         # thread keeps re-checking every minute.
         if self._retention is not None:
@@ -267,6 +279,72 @@ class OtisDaemon:
     # =====================================================================
     # Transcription (worker thread; same handler as the menu bar)
     # =====================================================================
+    def _recover_unfinished_work(self) -> None:
+        """Pick up transcriptions a previous run never finished.
+
+        Two sources, because they catch different failures. The queue holds
+        jobs whose handler was running when the process died. The orphan scan
+        catches recordings that never reached the handler at all — a crash
+        between recorder.stop() and the transcription starting, which leaves
+        WAVs and a metadata.json and nothing else.
+        """
+        if self._transcription_handler is None:
+            return
+
+        store = self._pipeline.store if self._pipeline is not None else None
+        seen: set[str] = set()
+
+        try:
+            jobs = self._queue.recoverable(self._queue.pending(), store=store)
+        except Exception:
+            logger.exception("Could not read the transcription queue")
+            jobs = []
+        for job in jobs:
+            seen.add(job.session_id)
+            self._notify(f"↻  Resuming transcription for {job.session_id[:8]}…")
+            self._maybe_transcribe(dict(job.metadata), None)
+
+        if self._pipeline is None:
+            return
+        try:
+            from src.storage.sessions import find_orphan_sessions
+
+            orphans = find_orphan_sessions(
+                audio_dir=self._pipeline.audio_dir, store=store, limit=10,
+            )
+        except Exception:
+            logger.exception("Could not scan for orphan recordings")
+            return
+        for entry in orphans:
+            sid = str(entry.get("session_id") or "")
+            if not sid or sid in seen:
+                continue
+            metadata = self._metadata_for_orphan(entry)
+            if metadata is None:
+                continue
+            self._notify(f"↻  Transcribing orphan recording {sid[:8]}…")
+            self._maybe_transcribe(metadata, None)
+
+    def _metadata_for_orphan(self, entry: dict[str, Any]) -> dict[str, Any] | None:
+        """Read (or synthesise) recorder metadata for an orphan session."""
+        meta_path = entry.get("metadata_path")
+        metadata: dict[str, Any] = {}
+        if meta_path is not None:
+            try:
+                loaded = json.loads(Path(str(meta_path)).read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    metadata = dict(loaded)
+            except Exception:
+                logger.warning("Could not read %s; synthesising metadata.", meta_path)
+        mic = entry.get("mic_path")
+        if mic is None:
+            return None
+        metadata.setdefault("session_id", str(entry.get("session_id") or ""))
+        metadata["mic_wav"] = str(mic)
+        system = entry.get("system_path")
+        metadata["system_wav"] = str(system) if system else None
+        return metadata
+
     def _maybe_transcribe(
         self, metadata: dict[str, Any], meeting: MeetingContext | None,
     ) -> None:
@@ -320,6 +398,7 @@ class OtisDaemon:
                 except Exception:  # pragma: no cover
                     logger.exception("Detector transcription_started raised")
             self._notify(f"📝  Transcribing session {session_id[:8]}…")
+            self._queue.enqueue(metadata)
             try:
                 assert self._transcription_handler is not None
                 self._transcription_handler(metadata)
@@ -329,6 +408,9 @@ class OtisDaemon:
                 self._notify(f"❌  Transcription failed: {exc}")
                 self._save_failure_placeholder(metadata, exc)
             finally:
+                # The handler returned either way — success, or a failure
+                # placeholder the user can see. Only a dead process stays queued.
+                self._queue.resolve(session_id)
                 if manage_detector_state:
                     try:
                         self._detector.transcription_finished()
