@@ -4,7 +4,7 @@
 with Whisper on-device, exposes transcripts to Claude via MCP. Nothing leaves
 your Mac.
 
-[![status](https://img.shields.io/badge/phase-6%2F6-blue)](#phases) [![tests](https://img.shields.io/badge/tests-315%2B%20passing-brightgreen)](#tests) [![python](https://img.shields.io/badge/python-3.12-blue)](https://www.python.org) [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![status](https://img.shields.io/badge/phase-6%2F6-blue)](#phases) [![tests](https://img.shields.io/badge/tests-881%20passing-brightgreen)](#tests) [![python](https://img.shields.io/badge/python-3.12-blue)](https://www.python.org) [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 > Status: **Phase 6 of 6** — all phases shipped: recording, detection, transcription, storage, web UI, and the MCP server for Claude.
 
@@ -78,6 +78,7 @@ itself is per-machine — not committed to the repo.
 ```bash
 ./scripts/run.sh                # menu-bar app (default)
 ./scripts/run.sh check-audio    # one-shot: BlackHole + audio device list
+./scripts/run.sh prune-models   # reclaim Whisper models nothing uses (--dry-run to look first)
 ./scripts/run.sh run            # headless daemon: auto-records AND transcribes
 ```
 
@@ -220,7 +221,10 @@ The most relevant knobs:
 | `app.working_hours` | `08:00 → 20:00` | Outside this, detection is paused. |
 | `storage.audio_dir` | `~/Otis/audio` | WAVs + metadata land here. |
 | `storage.transcript_dir` | `~/Otis/transcripts` | Phase 4. |
-| `transcription.model` | `small` | `tiny` / `base` / `small` / `medium` / `large-v3`. **Heat warning:** `medium` runs at ~3× realtime — an hour-long meeting means ~20-30 min of full GPU load; `small` is ~3× faster with a modest quality cost. |
+| `transcription.model` | `small` | `tiny` / `base` / `small` / `medium` / `large-v3`. `medium` measured at ~9× realtime on an M1: a 45-minute stream takes ~5 min, and a meeting is two streams. `small` is faster still, with a modest quality cost. |
+| `transcription.idle_timeout_seconds` | `300` | How long the model stays resident after the last transcription. `medium` is 1.5 GB, so on an 8 GB machine dropping it sooner frees real memory at the cost of a reload. |
+| `transcription.dedup_echoes` | `true` | A call on speakers is captured twice — once through BlackHole, once by the mic hearing your own speakers. BlackHole records output and can never contain your voice, so a duplicate always means the mic echoed and the system copy is kept. |
+| `storage.audio_format` | `flac` | Lossless, and roughly halves speech. A stream that captured nothing costs almost nothing (measured 721× on a real 85 MB silent stream). Decoding uses macOS's own `afconvert`, so there is no ffmpeg dependency and old WAVs keep working. |
 | `transcription.defer_while_in_call` | `true` | Don't start the GPU-heavy transcription while the mic is in use — wait for the call to end (max 2 h), so back-to-back meetings stay smooth. |
 | `transcription.suggest_titles` | `true` | Ad-hoc recordings get a transcript-derived title ("Onboarding with Acme") instead of "Ad-hoc Recording"; the file keeps its date+time prefix. Local heuristic only. |
 
@@ -233,12 +237,13 @@ see the inline comment in the YAML.
 pytest
 ```
 
-315+ tests across audio, detection, transcription, storage, daemon, web, MCP,
+881 tests across audio, detection, transcription, storage, daemon, web, MCP,
 and UI, plus an aggressive end-to-end harness (`python scripts/stress_test.py`,
-22 checks). The suite uses a fake `sounddevice` module and never touches a
-real CoreAudio stack, so it runs anywhere — the only exception is the
-menu-bar behavioural tests, which need macOS + rumps and skip themselves
-elsewhere.
+22 checks). Most of the suite uses a fake `sounddevice` module and never
+touches a real CoreAudio stack, so it runs anywhere. Two groups do not: the
+menu-bar behavioural tests need macOS + rumps, and a handful exercise
+`coreaudio_probe` and the real process source against the live system — both
+skip themselves elsewhere.
 
 ## Layout
 
@@ -255,6 +260,8 @@ otis/
 │   ├── mcp/           # MCP server                                 (Phase 6)
 │   ├── daemon.py      # headless `otis run` daemon
 │   ├── config.py      # YAML loader
+│   ├── config_schema.py  # what a config may say, and what to do when it doesn't
+│   ├── health.py      # the registry every subsystem reports into
 │   └── main.py        # CLI entry point
 ├── scripts/
 │   ├── setup.sh                  # full bootstrap
@@ -285,7 +292,11 @@ Everything is on-device:
   (no network socket at all) and is read-only.
 - The Google Calendar token is OAuth-2 with the **read-only** scope —
   Otis can't write to or delete your calendars.
-- No telemetry. No analytics. No phone-home.
+- No telemetry. No analytics. No phone-home. Until recently that last one was
+  not quite true: mlx-whisper resolves its model through `snapshot_download`,
+  which contacted huggingface.co on every load even with the weights already
+  cached. The model path is now resolved locally, so the only host Otis talks
+  to is Google Calendar, and only if you connect it.
 
 The OAuth client (`credentials.json`) and tokens you generate live in
 `~/.otis/` — outside the project tree, never staged for git.
