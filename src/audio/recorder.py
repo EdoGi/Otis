@@ -88,6 +88,11 @@ class RecorderState(str, Enum):
     IDLE = "idle"
     RECORDING = "recording"
     PAUSED = "paused"
+    #: Capture has been told to halt and the slow part — draining queues,
+    #: joining writers, writing metadata — is still running. Distinct from
+    #: STOPPED so pause/resume and the stall watchdog stand down while it
+    #: happens, without the state lock being held across the whole teardown.
+    STOPPING = "stopping"
     STOPPED = "stopped"
     ERROR = "error"
 
@@ -195,6 +200,10 @@ class DualStreamRecorder:
 
         self._state = RecorderState.IDLE
         self._state_lock = threading.RLock()
+        # Serialises stop() without _state_lock being held across its slow
+        # half. A second stop() waits here, then sees STOPPED and returns the
+        # metadata the first one wrote.
+        self._stop_lock = threading.Lock()
 
         # Pause/resume control: when set ⇒ recording is active; when cleared ⇒
         # paused (callbacks discard incoming frames).
@@ -398,36 +407,56 @@ class DualStreamRecorder:
         empty dict. Calling :meth:`stop` twice returns the metadata that was
         written the first time.
         """
-        with self._state_lock:
-            if self._state == RecorderState.IDLE:
-                logger.debug("stop() called before start(); ignoring.")
-                return {}
-            if self._state == RecorderState.STOPPED:
-                # Idempotent
-                return self._read_metadata_file()
+        with self._stop_lock:
+            with self._state_lock:
+                if self._state == RecorderState.IDLE:
+                    logger.debug("stop() called before start(); ignoring.")
+                    return {}
+                if self._state == RecorderState.STOPPED:
+                    # Idempotent
+                    return self._read_metadata_file()
 
-            # Close out any open pause window so metadata is internally consistent.
-            if self._state == RecorderState.PAUSED and self._current_pause_started is not None:
-                self._pauses.append(
-                    {
-                        "paused_at": self._current_pause_started,
-                        "resumed_at": self._elapsed_seconds(),
-                    }
-                )
-                self._current_pause_started = None
+                # Close out any open pause window so metadata is internally
+                # consistent.
+                if (
+                    self._state == RecorderState.PAUSED
+                    and self._current_pause_started is not None
+                ):
+                    self._pauses.append(
+                        {
+                            "paused_at": self._current_pause_started,
+                            "resumed_at": self._elapsed_seconds(),
+                        }
+                    )
+                    self._current_pause_started = None
 
-            self._active.set()  # release writer threads if still waiting
+                self._state = RecorderState.STOPPING
+                self._active.set()  # release writer threads if still waiting
+
+            # Everything below is slow — two writer joins of up to 5 s each,
+            # plus a metadata write — and none of it needs the state lock.
+            #
+            # Holding it here was worse than a stall: _note_writer_failure runs
+            # ON the writer thread and takes the same lock, so a writer dying
+            # as we stopped (a full disk, the case it exists for) blocked
+            # against the very thread joining it. The join burned its whole
+            # 5 s timeout, logged "writer thread did not exit", and the failure
+            # went unreported.
             self._stop_watchdog()
             self._teardown_streams()
             metadata = self._write_metadata()
             self._stop_sleep_wake_observer()
-            self._state = RecorderState.STOPPED
+
+            with self._state_lock:
+                self._state = RecorderState.STOPPED
             files = []
             if self._mic_state is not None:
                 files.append(str(self._mic_state.wav_path))
             if self._system_state is not None:
                 files.append(str(self._system_state.wav_path))
-            logger.info("Recording stopped: session=%s files=%s", self._session_id, files)
+            logger.info(
+                "Recording stopped: session=%s files=%s", self._session_id, files
+            )
             return metadata
 
     # =====================================================================

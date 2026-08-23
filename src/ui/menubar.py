@@ -178,8 +178,14 @@ class UiState(str):
     IDLE = "idle"
     APPROACHING = "approaching"
     DETECTED = "detected"
+    #: Opening the capture devices. Transient, but not instant: measured on
+    #: this Mac, the first start in a process takes 5.3 s of cold CoreAudio
+    #: enumeration and later ones 200-270 ms.
+    STARTING = "starting"
     RECORDING = "recording"
     PAUSED = "paused"
+    #: Draining the capture queues and writing metadata, ~250 ms.
+    SAVING = "saving"
     PROCESSING = "processing"
     OFF_HOURS = "off_hours"
 
@@ -205,6 +211,10 @@ class UiSnapshot:
             return format_duration_mmss(elapsed)
         if self.state == UiState.OFF_HOURS:
             return "off-hours"
+        if self.state == UiState.STARTING:
+            return "starting…"
+        if self.state == UiState.SAVING:
+            return "saving…"
         return ""
 
 
@@ -284,6 +294,12 @@ class MenuBarApp:
             selected_language_code=config.get("transcription", "language"),
         )
         self._recorder: DualStreamRecorder | None = None
+        # Set while the start worker is opening devices, so a second click
+        # (or a detector event) cannot launch a competing recorder.
+        self._starting = False
+        # What to fall back to if starting fails — the user may have been in
+        # DETECTED or APPROACHING, not IDLE.
+        self._state_before_starting: str = UiState.IDLE
         self._blink_phase = 0  # 0 / 1, used by blink timer
 
         self._icons = ensure_icons(self._icons_dir)
@@ -742,6 +758,14 @@ class MenuBarApp:
             # new transcript shows up under Recent and the session it came
             # from disappears from Generate Transcript.
             self._request_menu_rescan()
+        elif event_type == "recorder_started":
+            self._handle_recorder_started(*payload)
+        elif event_type == "recorder_start_failed":
+            self._handle_recorder_start_failed(payload)
+        elif event_type == "recorder_stopped":
+            self._handle_recorder_stopped(payload)
+        elif event_type == "recorder_stop_failed":
+            self._handle_recorder_stop_failed(payload)
         elif event_type == "render_menus":
             recent, orphans = payload
             self._render_recent_menu(recent)
@@ -1553,22 +1577,45 @@ class MenuBarApp:
     # Recording lifecycle (called from main thread)
     # =====================================================================
     def _do_start_recording(self) -> None:
+        """Begin a recording. Returns at once; the device work runs on a worker.
+
+        Opening CoreAudio input streams is not fast — 5.3 s measured for the
+        first start in a process (cold device enumeration), 200-270 ms after
+        that. All of it used to run on the rumps main thread, so the menu bar
+        froze from the click until capture was live.
+        """
         with self._lock:
-            if self._recorder is not None:
+            if self._recorder is not None or self._starting:
                 return
+            self._starting = True
+            self._state_before_starting = self._snapshot.state
+        self._set_state(UiState.STARTING)
+        threading.Thread(
+            target=self._start_recorder_worker,
+            name="otis-recorder-start",
+            daemon=True,
+        ).start()
+
+    def _start_recorder_worker(self) -> None:
+        """Build and start the recorder off the main thread."""
         try:
             recorder = self._recorder_factory(self._config)
             recorder.on_device_error = self._cb_device_error
             session_id = recorder.start()
         except Exception as exc:
             logger.exception("Failed to start recorder")
-            self._notifications.notify(
-                NotificationType.ERROR, "Could not start recording", str(exc), force=True
-            )
+            self._events.put(("recorder_start_failed", exc))
             return
+        self._events.put(("recorder_started", (recorder, session_id)))
+
+    def _handle_recorder_started(self, recorder: Any, session_id: str) -> None:
         with self._lock:
+            self._starting = False
             self._recorder = recorder
-        self._detector.user_started_recording()
+        try:
+            self._detector.user_started_recording()
+        except Exception:  # pragma: no cover
+            logger.exception("Detector user_started_recording raised")
         self._stop_blink()
         self._set_state(UiState.RECORDING)
         self._timer_duration.start()
@@ -1578,9 +1625,70 @@ class MenuBarApp:
             f"Session {session_id[:8]}",
         )
 
+    def _handle_recorder_start_failed(self, exc: BaseException) -> None:
+        with self._lock:
+            self._starting = False
+            previous = self._state_before_starting
+        self._notifications.notify(
+            NotificationType.ERROR, "Could not start recording", str(exc), force=True
+        )
+        # Back to whatever we interrupted, not blindly to IDLE — a meeting may
+        # still be detected and the user may want to try again.
+        self._set_state(previous)
+
     def _do_stop_and_transcribe(self) -> None:
-        metadata = self._do_stop_if_recording()
+        """Stop and hand off to transcription, without blocking the UI thread.
+
+        ``recorder.stop()`` drains the capture queues, joins both writer
+        threads and writes metadata — ~250 ms measured, and up to ~12 s if a
+        writer is wedged. SAVING gives the user something truthful to look at
+        meanwhile, and hides Start/Stop so the click cannot be repeated.
+        """
+        with self._lock:
+            recorder = self._recorder
+            self._recorder = None
+        if recorder is None:
+            return
+        if recorder.state in (RecorderState.IDLE, RecorderState.STOPPED):
+            return
+        self._timer_duration.stop()
+        self._set_state(UiState.SAVING)
+        threading.Thread(
+            target=self._stop_recorder_worker,
+            args=(recorder,),
+            name="otis-recorder-stop",
+            daemon=True,
+        ).start()
+
+    def _stop_recorder_worker(self, recorder: Any) -> None:
+        """Flush the recording off the main thread, then continue the handoff."""
+        try:
+            metadata = recorder.stop()
+        except Exception as exc:
+            logger.exception("Recorder stop raised")
+            self._events.put(("recorder_stop_failed", exc))
+            return
+        try:
+            self._detector.user_stopped_recording()
+        except Exception:  # pragma: no cover
+            logger.exception("Detector user_stopped_recording raised")
+        self._events.put(("recorder_stopped", metadata))
+
+    def _handle_recorder_stop_failed(self, exc: BaseException) -> None:
+        self._notifications.notify(
+            NotificationType.ERROR, "Save failed", str(exc), force=True
+        )
+        try:
+            self._detector.user_stopped_recording()
+        except Exception:  # pragma: no cover
+            logger.exception("Detector user_stopped_recording raised")
+        # The recorder is gone and we could not flush it; SAVING must not be
+        # where the UI comes to rest.
+        self._set_state(UiState.IDLE)
+
+    def _handle_recorder_stopped(self, metadata: dict[str, Any] | None) -> None:
         if not metadata:
+            self._set_state(UiState.IDLE)
             return
         # Decorate the recorder metadata with everything the transcription
         # handler needs: the user's chosen Whisper language and the live
