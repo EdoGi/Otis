@@ -672,14 +672,18 @@ def t_web_routes_smoke(tmp: Path) -> None:
     assert "<script>alert(1)</script>" not in index
 
     view = client.get("/transcript/web-1").get_data(as_text=True)
-    assert "<strong>[00:01]</strong> Me: hello web" in view
+    # Timestamps are seek links now (P5 item 41); the speaker label is not.
+    assert 'data-t="1"' in view
+    assert "Me: hello web" in view
 
     evil = client.get("/transcript/web-2").get_data(as_text=True)
     assert "<img src=x" not in evil and "&lt;script&gt;" in evil
 
     assert client.get("/transcript/missing").status_code == 404
-    search = client.get("/search?q=hello").get_data(as_text=True)
+    # Search is on the index now; /search redirects there.
+    search = client.get("/?q=hello").get_data(as_text=True)
     assert "Web Check" in search
+    assert client.get("/search?q=hello").status_code == 302
 
 
 def t_mcp_core_tools_roundtrip(tmp: Path) -> None:
