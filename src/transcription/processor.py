@@ -230,6 +230,30 @@ class TranscriptProcessor:
         )
 
         # Phase 2 — mic transcription (0-45 %).
+        #
+        # Two full Whisper passes per meeting is the honest cost, not an
+        # oversight. Audit item 31 proposed halving it; both routes were
+        # measured on real recordings and both failed.
+        #
+        # Merging the streams into one mono track saves 64% of the time and
+        # loses half the meeting. Measured on two genuinely independent
+        # speakers overlapping in time: the merged pass recovered 36% of the
+        # near-end speaker's words and 56% of the far end's, 263 words against
+        # 491 transcribed separately. Whisper cannot separate two voices from
+        # one channel. (An earlier check looked fine only because that session
+        # was a video on speakers, so the streams were 94.5% identical and
+        # there was no second speaker to lose.)
+        #
+        # Gating out silence keeps the streams separate, so attribution is
+        # safe, but the saving is not there. On a real 10-minute recording,
+        # dropping 9% of the audio saved 2.4% of wall time and changed 9.3% of
+        # the words; dropping 23% ran 8.4% *slower*. Whisper's decoder runs
+        # until it emits an end-of-segment, so compressing silence makes each
+        # remaining 30 s window denser and costlier — fewer windows, more
+        # tokens per window, and the two cancel.
+        #
+        # A stream that is genuinely silent already costs nothing: the engine
+        # skips it on the RMS pre-check (SILENCE_RMS_THRESHOLD).
         progress(1.0)
         mic_result = self._engine.transcribe(
             session.mic_wav,
