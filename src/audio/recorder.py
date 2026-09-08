@@ -281,6 +281,8 @@ class DualStreamRecorder:
             self._current_pause_started = None
 
             mic_dev = self._resolve_device(self._mic_device_spec, role="mic")
+            if mic_dev is None:  # role="mic" raises; this keeps the contract visible
+                raise DeviceNotFoundError("No microphone device available.")
             sys_dev = self._resolve_device(self._system_device_spec, role="system")
 
             self._mic_state = _StreamState(
@@ -734,7 +736,9 @@ class DualStreamRecorder:
     def _start_input_stream(self, st: _StreamState, sd: Any = None) -> None:
         """Create and start the InputStream for ``st``. Raises on failure."""
         if sd is None:
-            import sounddevice as sd
+            import sounddevice as _sounddevice
+
+            sd = _sounddevice
         try:
             st.stream = sd.InputStream(
                 samplerate=self._sample_rate,

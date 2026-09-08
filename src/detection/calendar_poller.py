@@ -842,5 +842,5 @@ def _as_plain_dict(node: Any) -> dict[str, Any]:
     if hasattr(node, "raw"):
         return dict(node.raw)
     if hasattr(node, "_data"):
-        return dict(node._data)  # type: ignore[attr-defined]
+        return dict(node._data)
     return dict(node) if node is not None else {}

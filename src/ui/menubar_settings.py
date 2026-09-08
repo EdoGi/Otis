@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from src.ui.menubar_state import (
     HOUR_END_PRESETS,
@@ -25,11 +25,34 @@ from src.ui.menubar_state import (
 )
 from src.ui.notifications import NotificationType
 
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from src.config import Config
+    from src.detection.detector import MeetingDetector
+    from src.ui.menubar_state import UiSnapshot
+    from src.ui.notifications import NotificationManager
+
 logger = logging.getLogger(__name__)
 
 
 class SettingsMenuMixin:
     """Settings menu behaviour for :class:`~src.ui.menubar.MenuBarApp`."""
+
+    if TYPE_CHECKING:
+        # Provided by MenuBarApp. Declared so the checker knows what the mixin
+        # reads and writes; nothing here is assigned — that is the host's job.
+        _config: Config
+        _mi: dict[str, Any]
+        _notifications: NotificationManager
+        _user_config_path: Path
+        _transcribe: Any
+        _snapshot: UiSnapshot
+        _lock: threading.RLock
+        _lang_items: dict[str, Any]
+        _detector: MeetingDetector
+
+        def _on_schedule_tick(self, _timer: Any) -> None: ...
 
     def _build_settings_submenu(self, root: Any) -> None:
         import rumps
@@ -52,7 +75,7 @@ class SettingsMenuMixin:
         active_days = set(self._config.get("app", "working_days", default=[0, 1, 2, 3, 4]))
         for idx, name in enumerate(WEEKDAY_NAMES):
             it = rumps.MenuItem(name, callback=self._on_day_toggled)
-            it._otis_day_index = idx  # type: ignore[attr-defined]
+            it._otis_day_index = idx
             it.state = idx in active_days
             self._day_items[idx] = it
             days_root.add(it)
@@ -65,8 +88,8 @@ class SettingsMenuMixin:
             sub = rumps.MenuItem(which.capitalize())
             for hhmm in presets:
                 it = rumps.MenuItem(hhmm, callback=self._on_working_hour_picked)
-                it._otis_which = which  # type: ignore[attr-defined]
-                it._otis_hhmm = hhmm  # type: ignore[attr-defined]
+                it._otis_which = which
+                it._otis_hhmm = hhmm
                 self._hour_items[(which, hhmm)] = it
                 sub.add(it)
             hours_root.add(sub)
@@ -83,7 +106,7 @@ class SettingsMenuMixin:
         ]
         for app_name in whitelist_candidates(enabled, running=running_app_names()):
             it = rumps.MenuItem(app_name, callback=self._on_whitelist_toggled)
-            it._otis_app_name = app_name  # type: ignore[attr-defined]
+            it._otis_app_name = app_name
             it.state = app_name in enabled
             self._whitelist_items[app_name] = it
             wl_root.add(it)

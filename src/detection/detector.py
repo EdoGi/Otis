@@ -405,6 +405,7 @@ class MeetingDetector:
             ):
                 current_key = self._context.calendar_key
                 new_key = matched.canonical_key if matched is not None else None
+                matched_title = matched.title if matched is not None else None
                 if new_key == current_key:
                     logger.debug(
                         "Process heartbeat for %s while already DETECTED; ignoring.",
@@ -414,7 +415,7 @@ class MeetingDetector:
                 if current_key is None:
                     logger.info(
                         "Calendar caught up with running process %s → %s.",
-                        app_name, matched.title,
+                        app_name, matched_title,
                     )
                 elif new_key is None:
                     # The correlated meeting ended but the app is still up. Keep
@@ -428,7 +429,7 @@ class MeetingDetector:
                 else:
                     logger.info(
                         "New meeting on the same app %s: %r → %r.",
-                        app_name, self._context.title, matched.title,
+                        app_name, self._context.title, matched_title,
                     )
             if matched is not None:
                 self._context = _context_from_event(matched, MeetingState.DETECTED)

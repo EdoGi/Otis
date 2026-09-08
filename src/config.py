@@ -220,7 +220,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
       with a clear, actionable message.
     """
     explicit = path is not None
-    cfg_path = Path(path) if explicit else DEFAULT_CONFIG_PATH
+    cfg_path = Path(path) if path is not None else DEFAULT_CONFIG_PATH
     file_data: dict[str, Any] = {}
 
     if cfg_path.exists():

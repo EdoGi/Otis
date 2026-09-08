@@ -706,7 +706,7 @@ def resolve_model_path(repo: str) -> str:
     id and let mlx-whisper raise the error that actually explains the problem.
     """
     try:
-        from huggingface_hub import snapshot_download  # type: ignore[import-not-found]
+        from huggingface_hub import snapshot_download
     except Exception:  # pragma: no cover (hub always ships with mlx-whisper)
         return repo
 
@@ -734,14 +734,14 @@ def _default_mlx_transcribe(audio: str, **kwargs: Any) -> dict[str, Any]:
     dependency and one extra subprocess per call.
     """
     try:
-        import mlx_whisper  # type: ignore[import-not-found]
+        import mlx_whisper
         import numpy as np  # noqa: WPS433
     except Exception as exc:  # pragma: no cover (no mlx-whisper in tests)
         raise _MlxImportFailure(str(exc)) from exc
 
     samples = decode_to_float32_mono16k(audio)
     if len(samples) <= int(CHUNK_SECONDS * TARGET_SAMPLE_RATE):
-        return mlx_whisper.transcribe(samples, **kwargs)  # type: ignore[no-any-return]
+        return mlx_whisper.transcribe(samples, **kwargs)
     return _transcribe_windowed(mlx_whisper, samples, **kwargs)
 
 
@@ -860,7 +860,7 @@ def decode_to_float32_mono16k(path: str | Path) -> "Any":
     # Last resort: mlx-whisper's own loader. Needs ffmpeg, which is usually
     # absent — but if the user has it, better to use it than to fail.
     logger.info("Falling back to mlx-whisper's loader for %s", path.name)
-    import mlx_whisper.audio  # type: ignore[import-not-found]
+    import mlx_whisper.audio
 
     return mlx_whisper.audio.load_audio(str(path))
 

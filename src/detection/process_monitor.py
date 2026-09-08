@@ -414,7 +414,7 @@ def _psutil_processes() -> Iterable[dict[str, Any]]:
 
     for proc in psutil.process_iter(attrs=["pid", "name"]):
         try:
-            yield proc.info  # type: ignore[attr-defined]
+            yield proc.info
         except (psutil.NoSuchProcess, psutil.AccessDenied):  # pragma: no cover
             continue
         except Exception:  # pragma: no cover

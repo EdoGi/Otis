@@ -267,7 +267,7 @@ class TranscriptProcessor:
             session.mic_wav,
             language=language,
             stream="mic",
-            on_progress=lambda p, base=0.0, span=45.0: progress(base + (p / 100.0) * span),
+            on_progress=_progress_window(progress, 0.0, 45.0),
         )
         progress(45.0)
 
@@ -278,7 +278,7 @@ class TranscriptProcessor:
                 session.system_wav,
                 language=language,
                 stream="system",
-                on_progress=lambda p, base=45.0, span=45.0: progress(base + (p / 100.0) * span),
+                on_progress=_progress_window(progress, 45.0, 45.0),
             )
         progress(90.0)
 
@@ -513,8 +513,9 @@ class TranscriptProcessor:
             # re-transcription look like a collision, bumping to _2.
             (session.metadata_path, _metadata_name_for(mic_rel)),
         ]
-        if session.system_wav is not None and relative_paths.get("system"):
-            pairs.append((session.system_wav, relative_paths["system"]))
+        sys_rel = relative_paths.get("system")
+        if session.system_wav is not None and sys_rel:
+            pairs.append((session.system_wav, sys_rel))
         for src, rel in pairs:
             dst = self._audio_dir / rel
             if dst.exists() and dst.resolve() != src.resolve():
@@ -539,14 +540,12 @@ class TranscriptProcessor:
         A transcode failure is never fatal: the original WAV is moved instead,
         so the recording survives even if compression doesn't.
         """
-        new_mic = self._audio_dir / relative_paths["mic"] if relative_paths.get("mic") else None
-        new_sys = (
-            self._audio_dir / relative_paths["system"]
-            if relative_paths.get("system") else None
-        )
+        mic_rel_path = relative_paths.get("mic")
+        sys_rel_path = relative_paths.get("system")
+        new_mic = self._audio_dir / mic_rel_path if mic_rel_path else None
+        new_sys = self._audio_dir / sys_rel_path if sys_rel_path else None
         new_meta = (
-            self._audio_dir / _metadata_name_for(relative_paths["mic"])
-            if relative_paths.get("mic") else None
+            self._audio_dir / _metadata_name_for(mic_rel_path) if mic_rel_path else None
         )
 
         landed: dict[str, str | None] = {"mic": None, "system": None}
@@ -886,6 +885,17 @@ def _clean_pauses(pauses: "list[Any] | None") -> list[tuple[float, float]]:
         out.append((float(start), float(end)))
     out.sort()
     return out
+
+
+def _progress_window(
+    progress: Callable[[float], None], base: float, span: float,
+) -> Callable[[float], None]:
+    """Map one stream's 0-100 progress onto its slice of the whole job."""
+
+    def scaled(pct: float) -> None:
+        progress(base + (pct / 100.0) * span)
+
+    return scaled
 
 
 def _recorded_seconds(metadata: dict[str, Any]) -> float:

@@ -375,7 +375,7 @@ class MenuBarApp(SettingsMenuMixin):
         self._lang_items: dict[str, rumps.MenuItem] = {}
         for label, code in SUPPORTED_LANGUAGES:
             it = rumps.MenuItem(label, callback=self._on_language_picked)
-            it._otis_lang_code = code  # type: ignore[attr-defined]
+            it._otis_lang_code = code
             self._mi["language_root"].add(it)
             self._lang_items[label] = it
         self._update_language_menu(self._snapshot.selected_language_code)
@@ -551,7 +551,7 @@ class MenuBarApp(SettingsMenuMixin):
                 return
 
         if event_type == "approaching":
-            ctx: MeetingContext = payload
+            ctx = payload
             logger.info(
                 "UI ← APPROACHING (%s, link=%s)",
                 ctx.title or "(untitled)", ctx.meeting_link or "-",
@@ -1108,12 +1108,12 @@ class MenuBarApp(SettingsMenuMixin):
         for entry in sessions:
             label = entry["label"]
             item = rumps.MenuItem(label, callback=self._on_generate_clicked)
-            item._otis_session_id = entry["session_id"]  # type: ignore[attr-defined]
-            item._otis_metadata_path = str(entry["metadata_path"])  # type: ignore[attr-defined]
-            item._otis_mic_path = str(entry["mic_path"])  # type: ignore[attr-defined]
+            item._otis_session_id = entry["session_id"]
+            item._otis_metadata_path = str(entry["metadata_path"])
+            item._otis_mic_path = str(entry["mic_path"])
             item._otis_system_path = (
                 str(entry["system_path"]) if entry["system_path"] else None
-            )  # type: ignore[attr-defined]
+            )
             root.add(item)
 
     # =====================================================================
@@ -1340,7 +1340,7 @@ class MenuBarApp(SettingsMenuMixin):
         for fm in entries:
             label = self._format_recent_label(fm)
             item = rumps.MenuItem(label, callback=self._on_recent_picked)
-            item._otis_transcript_id = fm.get("id")  # type: ignore[attr-defined]
+            item._otis_transcript_id = fm.get("id")
             root.add(item)
 
     @staticmethod

@@ -121,7 +121,7 @@ def _ensure_from_source(
             target = icons_dir / _icon_filename(state, size)
             if target.exists() and not force:
                 continue
-            icon = base.resize((size, size), Image.LANCZOS)
+            icon = base.resize((size, size), Image.Resampling.LANCZOS)
             if badge is not None:
                 _draw_corner_badge(icon, badge, size)
             elif state == "idle":
