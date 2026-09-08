@@ -11,8 +11,6 @@ import json
 import wave
 from pathlib import Path
 
-import pytest
-
 from src.storage.transcript_store import TranscriptStore
 from src.ui.menubar import (
     _format_session_label,

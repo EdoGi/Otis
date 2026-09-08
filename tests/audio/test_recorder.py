@@ -41,7 +41,7 @@ def test_init_does_not_touch_audio(tmp_path: Path) -> None:
     assert rec.session_id is None
 
 
-def test_start_stop_creates_wavs_and_metadata(fake_sounddevice, tmp_path: Path) -> None:  # noqa: ARG001
+def test_start_stop_creates_wavs_and_metadata(fake_sounddevice, tmp_path: Path) -> None:
     rec = _make_recorder(tmp_path)
     session = rec.start()
     assert rec.state == RecorderState.RECORDING
@@ -71,7 +71,7 @@ def test_start_stop_creates_wavs_and_metadata(fake_sounddevice, tmp_path: Path) 
 
 
 def test_metadata_has_required_keys_and_monotonic_anchors(
-    fake_sounddevice, tmp_path: Path  # noqa: ARG001
+    fake_sounddevice, tmp_path: Path
 ) -> None:
     rec = _make_recorder(tmp_path)
     rec.start()
@@ -103,7 +103,7 @@ def test_metadata_has_required_keys_and_monotonic_anchors(
 
 
 def test_pause_and_resume_logged_in_metadata(
-    fake_sounddevice, tmp_path: Path  # noqa: ARG001
+    fake_sounddevice, tmp_path: Path
 ) -> None:
     rec = _make_recorder(tmp_path)
     rec.start()
@@ -126,7 +126,7 @@ def test_pause_and_resume_logged_in_metadata(
 
 
 def test_callback_stops_queueing_after_writer_death(
-    fake_sounddevice, tmp_path: Path  # noqa: ARG001
+    fake_sounddevice, tmp_path: Path
 ) -> None:
     """Once the writer thread dies, the audio callback must drop frames
     instead of growing the queue without bound."""
@@ -146,7 +146,7 @@ def test_callback_stops_queueing_after_writer_death(
 
 
 def test_on_device_error_setter_fires_on_writer_crash(
-    fake_sounddevice, tmp_path: Path, monkeypatch  # noqa: ARG001
+    fake_sounddevice, tmp_path: Path, monkeypatch
 ) -> None:
     """The late-bound callback (set after construction, before start) must
     be invoked when the writer loop crashes."""
@@ -175,7 +175,7 @@ def test_on_device_error_setter_fires_on_writer_crash(
 
 
 def test_wake_does_not_resume_user_initiated_pause(
-    fake_sounddevice, tmp_path: Path  # noqa: ARG001
+    fake_sounddevice, tmp_path: Path
 ) -> None:
     """User pauses, lid closes, Mac wakes — recording must stay paused."""
     rec = _make_recorder(tmp_path)
@@ -191,7 +191,7 @@ def test_wake_does_not_resume_user_initiated_pause(
 
 
 def test_wake_resumes_sleep_initiated_pause(
-    fake_sounddevice, tmp_path: Path  # noqa: ARG001
+    fake_sounddevice, tmp_path: Path
 ) -> None:
     rec = _make_recorder(tmp_path)
     rec.start()
@@ -204,7 +204,7 @@ def test_wake_resumes_sleep_initiated_pause(
 
 
 def test_user_resume_clears_pause_source(
-    fake_sounddevice, tmp_path: Path  # noqa: ARG001
+    fake_sounddevice, tmp_path: Path
 ) -> None:
     """After a full user pause/resume cycle, sleep/wake behaves normally again."""
     rec = _make_recorder(tmp_path)
@@ -228,7 +228,7 @@ def test_pause_while_idle_is_a_noop(tmp_path: Path) -> None:
     assert rec.state == RecorderState.IDLE
 
 
-def test_double_start_raises(fake_sounddevice, tmp_path: Path) -> None:  # noqa: ARG001
+def test_double_start_raises(fake_sounddevice, tmp_path: Path) -> None:
     rec = _make_recorder(tmp_path)
     rec.start()
     try:
@@ -251,7 +251,7 @@ def test_stop_before_start_returns_gracefully(tmp_path: Path) -> None:
 
 
 def test_records_mic_only_when_blackhole_missing(
-    fake_sounddevice_no_blackhole, tmp_path: Path, caplog: pytest.LogCaptureFixture  # noqa: ARG001
+    fake_sounddevice_no_blackhole, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Graceful degradation: warn but keep recording the mic, no system.wav."""
     rec = DualStreamRecorder(
@@ -284,7 +284,7 @@ def test_records_mic_only_when_blackhole_missing(
                for r in caplog.records)
 
 
-def test_open_pause_window_closed_on_stop(fake_sounddevice, tmp_path: Path) -> None:  # noqa: ARG001
+def test_open_pause_window_closed_on_stop(fake_sounddevice, tmp_path: Path) -> None:
     """Stopping while paused should close the open pause window in metadata."""
     rec = _make_recorder(tmp_path)
     rec.start()
@@ -298,7 +298,7 @@ def test_open_pause_window_closed_on_stop(fake_sounddevice, tmp_path: Path) -> N
 
 
 def test_streams_open_with_low_power_capture_settings(
-    fake_sounddevice, tmp_path: Path  # noqa: ARG001
+    fake_sounddevice, tmp_path: Path
 ) -> None:
     """Large capture blocks are the difference between ~19% and ~6% CPU
     during a meeting — never silently regress to PortAudio's ~9 ms default."""

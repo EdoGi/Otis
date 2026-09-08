@@ -9,9 +9,6 @@ methods that production code reaches via callbacks.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Any
-
-import pytest
 
 from src.detection.calendar_poller import CalendarEvent
 from src.detection.detector import (

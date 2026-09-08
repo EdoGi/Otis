@@ -297,8 +297,8 @@ def test_disk_health_is_reported(dirs) -> None:
 
 
 def test_low_disk_is_a_warning_and_very_low_is_a_failure(dirs, monkeypatch) -> None:
-    from src.health import DISK, HealthState, get_health, reset_health
     import src.storage.model_cache as mc
+    from src.health import DISK, HealthState, get_health, reset_health
 
     audio, store = dirs
     mgr = AudioRetentionManager(

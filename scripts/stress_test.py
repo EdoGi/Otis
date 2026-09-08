@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import json
 import math
-import shutil
 import struct
 import sys
 import tempfile
@@ -41,7 +40,6 @@ from src.transcription.processor import (
     TranscriptProcessor,
     apply_offset,
     deduplicate_echo,
-    interleave_with_overlaps,
 )
 from src.transcription.whisper_engine import (
     Segment,
@@ -49,7 +47,6 @@ from src.transcription.whisper_engine import (
     WhisperEngine,
     filter_hallucinations,
 )
-
 
 PASS = "\033[1;32m✓\033[0m"
 FAIL = "\033[1;31m✗\033[0m"

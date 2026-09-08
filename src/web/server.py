@@ -19,9 +19,9 @@ from __future__ import annotations
 
 import html
 import logging
-from pathlib import Path
 import re
 import threading
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from src.storage.transcript_store import TranscriptStore
@@ -200,7 +200,7 @@ _PLAYABLE_SUFFIXES = {".wav": "audio/wav", ".flac": "audio/flac",
 
 def create_app(
     store: TranscriptStore, audio_dir: str | Path | None = None,
-) -> "Flask":
+) -> Flask:
     from flask import Flask, abort, render_template_string, request, send_file
 
     app = Flask("otis-web")

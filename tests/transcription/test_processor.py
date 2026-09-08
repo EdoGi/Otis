@@ -14,7 +14,6 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-import yaml
 
 from src.storage.transcript_store import TranscriptStore, split_frontmatter
 from src.transcription.processor import (
@@ -31,7 +30,6 @@ from src.transcription.processor import (
 from src.transcription.processor import _LabelledSegment as LabelledSegment
 from src.transcription.whisper_engine import (
     Segment,
-    TranscriptionResult,
     WhisperEngine,
 )
 

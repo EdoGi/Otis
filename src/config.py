@@ -163,7 +163,7 @@ class Config:
         self._data: _AttrDict = _AttrDict(data)
 
     @classmethod
-    def load(cls, path: str | os.PathLike[str] | None = None) -> "Config":
+    def load(cls, path: str | os.PathLike[str] | None = None) -> Config:
         """Convenience classmethod equivalent to :func:`load_config`."""
         return load_config(path)
 

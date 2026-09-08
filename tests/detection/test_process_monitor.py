@@ -8,8 +8,8 @@ exercise the matching, debouncing, and event logic.
 from __future__ import annotations
 
 import time
-from typing import Any, Iterable
-
+from collections.abc import Iterable
+from typing import Any
 
 from src.detection.process_monitor import ProcessMonitor
 

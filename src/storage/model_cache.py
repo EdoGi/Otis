@@ -116,8 +116,8 @@ def free_bytes(path: Path) -> int:
 
 
 __all__ = [
-    "CachedModel",
     "DEFAULT_HUB_DIR",
+    "CachedModel",
     "free_bytes",
     "list_cached_models",
     "prune_models",

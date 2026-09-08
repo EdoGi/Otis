@@ -8,15 +8,13 @@ through the right lifecycle, and that shutdown is clean.
 from __future__ import annotations
 
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
-
-import pytest
 
 from src.config import Config
 from src.daemon import OtisDaemon
 from src.detection.calendar_poller import CalendarEvent
-from src.detection.detector import MeetingContext, MeetingDetector, MeetingState
+from src.detection.detector import MeetingDetector, MeetingState
 
 
 # ============================================================================

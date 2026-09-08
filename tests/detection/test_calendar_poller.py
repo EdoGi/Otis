@@ -11,8 +11,6 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-import pytest
-
 from src.detection.calendar_poller import (
     CalendarEvent,
     GoogleCalendarPoller,
@@ -145,10 +143,10 @@ class _FakeService:
         self.last_kwargs: dict[str, Any] | None = None
         self.calendars_queried: list[str] = []
 
-    def events(self) -> "_FakeService":
+    def events(self) -> _FakeService:
         return self
 
-    def list(self, **kwargs: Any) -> "_FakeService":
+    def list(self, **kwargs: Any) -> _FakeService:
         self.last_kwargs = kwargs
         cal = kwargs.get("calendarId")
         if cal is not None:

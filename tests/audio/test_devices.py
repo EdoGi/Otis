@@ -7,7 +7,7 @@ import pytest
 from src.audio.devices import DeviceManager, DeviceNotFoundError
 
 
-def test_lists_all_devices(fake_sounddevice) -> None:  # noqa: ARG001
+def test_lists_all_devices(fake_sounddevice) -> None:
     dm = DeviceManager()
     names = [d.name for d in dm.devices]
     assert "MacBook Pro Microphone" in names
@@ -15,7 +15,7 @@ def test_lists_all_devices(fake_sounddevice) -> None:  # noqa: ARG001
     assert "MacBook Pro Speakers" in names
 
 
-def test_input_devices_filter(fake_sounddevice) -> None:  # noqa: ARG001
+def test_input_devices_filter(fake_sounddevice) -> None:
     dm = DeviceManager()
     input_names = [d.name for d in dm.input_devices()]
     assert "MacBook Pro Microphone" in input_names
@@ -24,20 +24,20 @@ def test_input_devices_filter(fake_sounddevice) -> None:  # noqa: ARG001
     assert "MacBook Pro Speakers" not in input_names
 
 
-def test_default_input_returns_mic(fake_sounddevice) -> None:  # noqa: ARG001
+def test_default_input_returns_mic(fake_sounddevice) -> None:
     dm = DeviceManager()
     default = dm.default_input()
     assert default is not None
     assert default.name == "MacBook Pro Microphone"
 
 
-def test_get_default_mic_alias(fake_sounddevice) -> None:  # noqa: ARG001
+def test_get_default_mic_alias(fake_sounddevice) -> None:
     """The review references DeviceManager.get_default_mic() — must be an alias."""
     dm = DeviceManager()
     assert dm.get_default_mic() is dm.default_input()
 
 
-def test_list_devices_returns_full_list(fake_sounddevice) -> None:  # noqa: ARG001
+def test_list_devices_returns_full_list(fake_sounddevice) -> None:
     """The review references DeviceManager.list_devices()."""
     dm = DeviceManager()
     listed = dm.list_devices()
@@ -62,7 +62,7 @@ def test_default_input_falls_back_when_coreaudio_returns_minus_one(
     assert fallback.name == "MacBook Pro Microphone"
 
 
-def test_detects_blackhole_when_present(fake_sounddevice) -> None:  # noqa: ARG001
+def test_detects_blackhole_when_present(fake_sounddevice) -> None:
     dm = DeviceManager()
     assert dm.is_blackhole_installed()
     bh = dm.find_blackhole()
@@ -70,20 +70,20 @@ def test_detects_blackhole_when_present(fake_sounddevice) -> None:  # noqa: ARG0
     assert "blackhole" in bh.name.lower()
 
 
-def test_detects_missing_blackhole(fake_sounddevice_no_blackhole) -> None:  # noqa: ARG001
+def test_detects_missing_blackhole(fake_sounddevice_no_blackhole) -> None:
     dm = DeviceManager()
     assert not dm.is_blackhole_installed()
     assert dm.find_blackhole() is None
 
 
-def test_finds_multi_output_device(fake_sounddevice) -> None:  # noqa: ARG001
+def test_finds_multi_output_device(fake_sounddevice) -> None:
     dm = DeviceManager()
     multi = dm.find_multi_output_device()
     assert multi is not None
     assert "multi-output" in multi.name.lower()
 
 
-def test_no_multi_output_when_not_configured(fake_sounddevice_no_multi_output) -> None:  # noqa: ARG001
+def test_no_multi_output_when_not_configured(fake_sounddevice_no_multi_output) -> None:
     dm = DeviceManager()
     assert dm.find_multi_output_device() is None
 
@@ -91,6 +91,7 @@ def test_no_multi_output_when_not_configured(fake_sounddevice_no_multi_output) -
 def test_finds_user_renamed_multi_output_via_coreaudio(monkeypatch) -> None:
     """A user-renamed multi-output (e.g. 'Otis BT') must be detected."""
     import sys
+
     from tests.conftest import make_fake_sd_module
 
     sd = make_fake_sd_module(
@@ -118,7 +119,7 @@ def test_finds_user_renamed_multi_output_via_coreaudio(monkeypatch) -> None:
     assert multi.name == "Otis BT"
 
 
-def test_falls_back_to_name_heuristic_when_coreaudio_fails(monkeypatch, fake_sounddevice) -> None:  # noqa: ARG001
+def test_falls_back_to_name_heuristic_when_coreaudio_fails(monkeypatch, fake_sounddevice) -> None:
     """If CoreAudio enumeration fails, the substring heuristic still catches the default name."""
     import src.audio.coreaudio_probe as probe
 
@@ -134,14 +135,14 @@ def test_falls_back_to_name_heuristic_when_coreaudio_fails(monkeypatch, fake_sou
     assert "multi-output" in multi.name.lower()
 
 
-def test_require_raises_clear_error_when_missing(fake_sounddevice) -> None:  # noqa: ARG001
+def test_require_raises_clear_error_when_missing(fake_sounddevice) -> None:
     dm = DeviceManager()
     with pytest.raises(DeviceNotFoundError) as excinfo:
         dm.require("Nonexistent Device")
     assert "Nonexistent" in str(excinfo.value)
 
 
-def test_find_by_name_is_case_insensitive(fake_sounddevice) -> None:  # noqa: ARG001
+def test_find_by_name_is_case_insensitive(fake_sounddevice) -> None:
     dm = DeviceManager()
     assert dm.find_by_name("blackhole") is not None
     assert dm.find_by_name("BLACKHOLE") is not None

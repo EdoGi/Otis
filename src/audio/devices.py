@@ -50,7 +50,7 @@ class AudioDevice:
         return self.max_output_channels > 0
 
     @classmethod
-    def from_sd(cls, index: int, raw: dict[str, Any]) -> "AudioDevice":
+    def from_sd(cls, index: int, raw: dict[str, Any]) -> AudioDevice:
         return cls(
             index=index,
             name=str(raw.get("name", "")),

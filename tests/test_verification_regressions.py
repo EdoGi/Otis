@@ -169,7 +169,6 @@ def test_the_default_process_source_is_the_one_that_always_works() -> None:
     seeing it appear."""
     from src.detection.process_monitor import (
         _default_process_iter,
-        _psutil_processes,
         nsworkspace_process_iter,
     )
 

@@ -91,7 +91,7 @@ class RecordingSession:
         recorder_metadata: dict[str, Any],
         *,
         audio_dir: str | Path,
-    ) -> "RecordingSession":
+    ) -> RecordingSession:
         audio_dir = Path(audio_dir).expanduser()
         session_id = str(recorder_metadata["session_id"])
         mic_name = recorder_metadata.get("mic_wav") or f"{session_id}_mic.wav"
@@ -405,7 +405,7 @@ class TranscriptProcessor:
                 result = self.process(
                     session, meeting=meeting, language=language, on_progress=on_progress
                 )
-            except Exception as exc:  # noqa: BLE001 — surface to UI
+            except Exception as exc:
                 logger.exception("Transcription failed for session %s", session.session_id)
                 if on_error is not None:
                     on_error(exc)
@@ -830,7 +830,7 @@ class PauseTimeline:
     ``paused_at`` minus every earlier pause's duration.
     """
 
-    def __init__(self, pauses: "list[Any] | None") -> None:
+    def __init__(self, pauses: list[Any] | None) -> None:
         self._gaps: list[tuple[float, float]] = []  # (audio_position, duration)
         cumulative = 0.0
         for entry in _clean_pauses(pauses):
@@ -856,7 +856,7 @@ class PauseTimeline:
                 wall += duration
         return wall
 
-    def shift_segments(self, segments: "list[Segment]") -> "list[Segment]":
+    def shift_segments(self, segments: list[Segment]) -> list[Segment]:
         """Return segments with start/end re-stamped onto the wall clock."""
         if not self._gaps:
             return list(segments)
@@ -866,7 +866,7 @@ class PauseTimeline:
         ]
 
 
-def _clean_pauses(pauses: "list[Any] | None") -> list[tuple[float, float]]:
+def _clean_pauses(pauses: list[Any] | None) -> list[tuple[float, float]]:
     """Extract usable ``(paused_at, resumed_at)`` pairs, sorted, junk dropped.
 
     A crash mid-pause leaves an entry with no ``resumed_at``; a malformed file
@@ -910,7 +910,7 @@ def _recorded_seconds(metadata: dict[str, Any]) -> float:
     return best
 
 
-def _system_audio_state(sys_result: "TranscriptionResult | None") -> str:
+def _system_audio_state(sys_result: TranscriptionResult | None) -> str:
     """Classify the system stream for the transcript frontmatter."""
     if sys_result is None:
         return "missing"

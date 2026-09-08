@@ -18,7 +18,6 @@ from typing import Any
 
 import pytest
 
-from src.transcription import whisper_engine as we
 from src.transcription.whisper_engine import WhisperEngine, resolve_model_path
 
 REPO = "mlx-community/whisper-medium-mlx"

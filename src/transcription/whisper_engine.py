@@ -82,7 +82,7 @@ class Segment:
         return {"start": self.start, "end": self.end, "text": self.text}
 
     @classmethod
-    def from_raw(cls, raw: dict[str, Any]) -> "Segment":
+    def from_raw(cls, raw: dict[str, Any]) -> Segment:
         return cls(
             start=float(raw.get("start", 0.0)),
             end=float(raw.get("end", 0.0)),
@@ -735,7 +735,6 @@ def _default_mlx_transcribe(audio: str, **kwargs: Any) -> dict[str, Any]:
     """
     try:
         import mlx_whisper
-        import numpy as np  # noqa: WPS433
     except Exception as exc:  # pragma: no cover (no mlx-whisper in tests)
         raise _MlxImportFailure(str(exc)) from exc
 
@@ -838,7 +837,7 @@ DECODABLE_SUFFIXES = (".wav", ".flac", ".caf", ".m4a", ".aiff", ".aif", ".mp3")
 TARGET_SAMPLE_RATE = 16000
 
 
-def decode_to_float32_mono16k(path: str | Path) -> "Any":
+def decode_to_float32_mono16k(path: str | Path) -> Any:
     """Decode any supported audio file to 1-D float32 mono at 16 kHz.
 
     Whisper wants exactly that shape. Our recorder writes it directly, so a
@@ -865,7 +864,7 @@ def decode_to_float32_mono16k(path: str | Path) -> "Any":
     return mlx_whisper.audio.load_audio(str(path))
 
 
-def _read_conforming_wav(path: Path) -> "Any | None":
+def _read_conforming_wav(path: Path) -> Any | None:
     """Fast path: a WAV already at 16 kHz / mono / 16-bit. ``None`` otherwise."""
     import numpy as np
 
@@ -888,7 +887,7 @@ def _read_conforming_wav(path: Path) -> "Any | None":
     return arr
 
 
-def _afconvert_decode(path: Path) -> "Any | None":
+def _afconvert_decode(path: Path) -> Any | None:
     """Transcode via macOS ``afconvert`` into a temp WAV, then read it."""
     import shutil
     import subprocess
