@@ -47,7 +47,7 @@ def test_format_duration_mmss(seconds: float, expected: str) -> None:
 # is_within_working_hours
 # ============================================================================
 def test_inside_window_normal_workday() -> None:
-    """Tuesday at 10:00 with Mon–Fri / 08:00–20:00 → in window."""
+    """Tuesday at 10:00 with Mon-Fri / 08:00-20:00 → in window."""
     tuesday_10am = datetime(2026, 5, 12, 10, 0)
     assert is_within_working_hours(
         tuesday_10am,

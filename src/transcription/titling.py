@@ -36,7 +36,7 @@ TOPIC_FLOOR_RATIO = 0.008
 #: own. Two corroborating topics are better evidence than one frequent word.
 SOLO_TOPIC_MULTIPLIER = 2.0
 
-_WORD_RE = re.compile(r"[A-Za-zÀ-ÖØ-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ'’-]*")
+_WORD_RE = re.compile(r"[A-Za-zÀ-ÖØ-öø-ÿ][A-Za-zÀ-ÖØ-öø-ÿ'’-]*")  # noqa: RUF001 - Whisper emits U+2019 (curly) apostrophes
 _SENTENCE_SPLIT_RE = re.compile(r"[.!?\n]+")
 
 # Function words + conversational fillers across en/fr/es/it/pt/de. Compact

@@ -8,8 +8,8 @@ Pipeline
 --------
 1. **Read metadata** ``{session_id}_metadata.json`` for the
    ``mic_start_monotonic`` / ``system_start_monotonic`` anchors.
-2. **Transcribe mic** stream (0–45 % progress).
-3. **Transcribe system** stream (45–90 % progress) if it exists; fallback to
+2. **Transcribe mic** stream (0-45 % progress).
+3. **Transcribe system** stream (45-90 % progress) if it exists; fallback to
    mic-only if BlackHole was unconfigured.
 4. **Align**: shift system segments by
    ``offset = system_start - mic_start`` so both tracks live on the mic
@@ -451,7 +451,7 @@ class TranscriptProcessor:
             "date": local_start.strftime("%Y-%m-%d"),
             "start_time": local_start.strftime("%H:%M"),
             "end_time": local_end.strftime("%H:%M"),
-            "duration_minutes": int(round(duration_seconds / 60.0)),
+            "duration_minutes": round(duration_seconds / 60.0),
             "language": language,
             "app": meeting.app,
             "participants": [_format_participant(p) for p in meeting.participants],

@@ -2,7 +2,7 @@
 
 Why mlx-whisper?
     The MLX framework runs natively on Apple Silicon (Metal-backed). On an M1
-    Pro a 1-hour meeting transcribes with the ``small`` model in ~3–8 minutes
+    Pro a 1-hour meeting transcribes with the ``small`` model in ~3-8 minutes
     — significantly faster than ``openai-whisper`` (which only uses CPU on
     macOS unless you wrestle with PyTorch + MPS).
 
@@ -55,8 +55,8 @@ DEFAULT_IDLE_TIMEOUT_SECONDS = 300.0
 
 # RMS below this counts as "essentially silent" and skips Whisper entirely.
 # Empirically, real (even quiet) speech via the built-in MacBook mic sits at
-# 0.01–0.05 RMS; ambient room noise / muted streams are 0.0001–0.001. We pick
-# 0.001 (~−60 dBFS) — comfortably below quiet speech, comfortably above the
+# 0.01-0.05 RMS; ambient room noise / muted streams are 0.0001-0.001. We pick
+# 0.001 (~-60 dBFS) — comfortably below quiet speech, comfortably above the
 # noise floor of a healthy capture chain. The other anti-hallucination defences
 # (``condition_on_previous_text=False`` + the post-filter) are what catch the
 # really pathological cases.
@@ -182,7 +182,7 @@ class WhisperEngine:
         # concurrency is not the same as preventing it.
         self._run_lock = threading.Lock()
         # mlx-whisper caches the loaded model in its own module state
-        # (ModelHolder) — 0.5–2 GB of unified memory depending on the model.
+        # (ModelHolder) — 0.5-2 GB of unified memory depending on the model.
         # We track warmth + an idle timer, and on expiry we actually CLEAR
         # that cache so the memory goes back to the OS instead of being held
         # until the app quits.
@@ -191,7 +191,7 @@ class WhisperEngine:
         self._inflight = 0  # transcriptions currently running
         # Measured real-time factor (audio seconds per wall-clock second),
         # EMA-updated after each successful run so progress estimates adapt
-        # to this machine + model instead of assuming the M1-Pro/small 8×.
+        # to this machine + model instead of assuming the M1-Pro/small 8x.
         # Optionally persisted per-model so restarts keep honest estimates.
         self._rtf_state_path = Path(rtf_state_path).expanduser() if rtf_state_path else None
         self._measured_rtf: float | None = self._load_persisted_rtf()
@@ -553,7 +553,7 @@ class _ProgressEstimator:
     """Approximate progress (0-99 %) by wall-clock vs estimated total time.
 
     Whisper's runtime depends on the model, audio length, and Mac model. For
-    the small model on M1 Pro, real-time factor is roughly 8× — i.e. a 5-min
+    the small model on M1 Pro, real-time factor is roughly 8x — i.e. a 5-min
     audio file takes ~40 s. We estimate total = ``duration / RTF`` and tick
     every 0.5 s.
     """
@@ -614,7 +614,7 @@ def _release_mlx_model_cache() -> None:
     """Drop mlx-whisper's module-level model cache and flush Metal buffers.
 
     mlx-whisper keeps the last-used model in ``transcribe.ModelHolder`` —
-    0.5–2 GB of unified memory depending on the model — until the process
+    0.5-2 GB of unified memory depending on the model — until the process
     exits. Clearing the holder + ``mx.clear_cache()`` actually returns that
     memory to the OS. No-op when mlx isn't installed (tests, CI).
 

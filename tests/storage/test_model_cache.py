@@ -26,7 +26,8 @@ PREFIX = "models--mlx-community--whisper-"
 def _model(hub: Path, name: str, *, size: int = 4096, symlinked: bool = False) -> Path:
     root = hub / f"{PREFIX}{name}-mlx"
     blobs, snaps = root / "blobs", root / "snapshots" / "abc123"
-    blobs.mkdir(parents=True); snaps.mkdir(parents=True)
+    blobs.mkdir(parents=True)
+    snaps.mkdir(parents=True)
     blob = blobs / "deadbeef"
     blob.write_bytes(b"\0" * size)
     if symlinked:
@@ -37,7 +38,8 @@ def _model(hub: Path, name: str, *, size: int = 4096, symlinked: bool = False) -
 
 @pytest.fixture()
 def hub(tmp_path: Path) -> Path:
-    h = tmp_path / "hub"; h.mkdir()
+    h = tmp_path / "hub"
+    h.mkdir()
     return h
 
 

@@ -83,7 +83,7 @@ def test_programmatic_icon_colour_appears_in_pixels(tmp_path: Path) -> None:
 # Avatar-based pipeline (with a source image)
 # ============================================================================
 def _make_dummy_source(tmp_path: Path) -> Path:
-    """Create a 64×64 solid-blue square as a stand-in for OtisIcon.png."""
+    """Create a 64x64 solid-blue square as a stand-in for OtisIcon.png."""
     pytest.importorskip("PIL")
     from PIL import Image
 

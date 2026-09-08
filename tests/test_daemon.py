@@ -114,7 +114,7 @@ def test_meeting_detected_starts_recorder() -> None:
         calendar_pollers=[],
         clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc),
     )
-    daemon, notes, rec = _make_daemon(detector)
+    _daemon, notes, rec = _make_daemon(detector)
 
     pm.fire_detected("zoom.us")
     assert rec.started, "recorder should auto-start on DETECTED"
@@ -130,7 +130,7 @@ def test_user_stop_via_meeting_ended_stops_recorder() -> None:
         calendar_pollers=[],
         clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc),
     )
-    daemon, notes, rec = _make_daemon(detector)
+    _daemon, notes, rec = _make_daemon(detector)
 
     pm.fire_detected("zoom.us")
     detector.user_stopped_recording()
@@ -146,7 +146,7 @@ def test_process_disappearing_keeps_recording_but_warns() -> None:
         calendar_pollers=[],
         clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc),
     )
-    daemon, notes, rec = _make_daemon(detector)
+    _daemon, notes, rec = _make_daemon(detector)
 
     pm.fire_detected("zoom.us")
     assert rec.started and not rec.stopped
@@ -167,7 +167,7 @@ def test_request_stop_unblocks_run_and_cleans_up() -> None:
         calendar_pollers=[],
         clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc),
     )
-    daemon, notes, rec = _make_daemon(detector)
+    daemon, _notes, rec = _make_daemon(detector)
 
     # Start a recording, then ask the daemon to stop in a worker thread.
     pm.fire_detected("zoom.us")
@@ -210,7 +210,7 @@ def test_calendar_approaching_does_not_start_recording() -> None:
         calendar_pollers=[],
         clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc),
     )
-    daemon, notes, rec = _make_daemon(detector)
+    _daemon, notes, rec = _make_daemon(detector)
 
     # Drive the detector directly through its calendar handler.
     ev = CalendarEvent(
@@ -357,7 +357,7 @@ def test_no_pipeline_means_record_only(tmp_path) -> None:
         calendar_pollers=[],
         clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc),
     )
-    daemon, notes, rec = _make_daemon(detector)
+    daemon, _notes, rec = _make_daemon(detector)
     pm.fire_detected("zoom.us")
     detector.user_stopped_recording()
     assert rec.stopped
@@ -389,7 +389,7 @@ def _daemon_with_clock(now: datetime):
 
 def test_apply_schedule_starts_detector_inside_window() -> None:
     monday_noon = datetime(2026, 6, 8, 12, 0)  # Monday, inside 08-20
-    daemon, detector, pm, notes, _clock, _rec = _daemon_with_clock(monday_noon)
+    daemon, _detector, pm, notes, _clock, _rec = _daemon_with_clock(monday_noon)
     daemon._apply_schedule()
     assert pm.started
     assert any("detection active" in n.lower() for n in notes)

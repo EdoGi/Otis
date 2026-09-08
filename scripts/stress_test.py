@@ -366,7 +366,10 @@ def t_processor_handles_silent_streams(tmp: Path) -> None:
     silent = bytes(rate * 2)
     for p in (mic, sysw):
         with wave.open(str(p), "wb") as wf:
-            wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(rate); wf.writeframes(silent)
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(rate)
+            wf.writeframes(silent)
     (audio_dir / f"{sid}_metadata.json").write_text(json.dumps({
         "session_id": sid, "mic_wav": mic.name, "system_wav": sysw.name,
         "mic_start_monotonic": 0.0, "system_start_monotonic": 0.0,
@@ -421,7 +424,9 @@ def t_silent_head_then_speech_is_not_skipped(tmp: Path) -> None:
         sample = int(amp * math.sin(2 * math.pi * 440.0 * i / rate))
         frames += struct.pack("<h", sample)
     with wave.open(str(p), "wb") as wf:
-        wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(rate)
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(rate)
         wf.writeframes(bytes(frames))
 
     called = {"hit": False}
@@ -487,7 +492,8 @@ def t_orphan_finder_handles_mixed_layouts(tmp: Path) -> None:
 
     audio = tmp / "audio"
     transcripts = tmp / "transcripts"
-    audio.mkdir(); transcripts.mkdir()
+    audio.mkdir()
+    transcripts.mkdir()
     store = TranscriptStore(transcripts)
 
     # Session A — standard UUID layout, no transcript yet.
@@ -599,8 +605,10 @@ def t_wav_repair_recovers_crashed_recording(tmp: Path) -> None:
     _audible_wav(mic, seconds=2.0)
     # Zero the size fields the way an un-closed wave file looks after SIGKILL.
     with mic.open("r+b") as fh:
-        fh.seek(4); fh.write(struct.pack("<I", 36))
-        fh.seek(40); fh.write(struct.pack("<I", 0))
+        fh.seek(4)
+        fh.write(struct.pack("<I", 36))
+        fh.seek(40)
+        fh.write(struct.pack("<I", 0))
     with wave.open(str(mic), "rb") as wf:
         assert wf.getnframes() == 0, "corruption fixture is wrong"
 

@@ -176,7 +176,8 @@ def render_markdown_min(body: str) -> str:
         if heading is not None:
             flush()
             level, text = heading
-            out.append(f"<h{level}>{_BOLD_RE.sub(r'<strong>\1</strong>', text)}</h{level}>")
+            strong = _BOLD_RE.sub(r"<strong>\1</strong>", text)
+            out.append(f"<h{level}>{strong}</h{level}>")
             continue
         paragraph.append(
             _linkify_timestamps(_BOLD_RE.sub(r"<strong>\1</strong>", stripped))

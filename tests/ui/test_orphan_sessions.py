@@ -121,7 +121,8 @@ def test_skips_sessions_already_transcribed(tmp_path: Path) -> None:
     sid = "transcribed-1"
     audio = tmp_path / "audio"
     transcripts = tmp_path / "transcripts"
-    audio.mkdir(); transcripts.mkdir()
+    audio.mkdir()
+    transcripts.mkdir()
     _make_wav(audio / f"{sid}_mic.wav")
     _write_metadata(audio / f"{sid}_metadata.json", session_id=sid)
     store = TranscriptStore(transcripts)
@@ -141,7 +142,8 @@ def test_failed_placeholder_does_not_hide_session(tmp_path: Path) -> None:
     sid = "failed-1"
     audio = tmp_path / "audio"
     transcripts = tmp_path / "transcripts"
-    audio.mkdir(); transcripts.mkdir()
+    audio.mkdir()
+    transcripts.mkdir()
     _make_wav(audio / f"{sid}_mic.wav")
     _write_metadata(audio / f"{sid}_metadata.json", session_id=sid)
     store = TranscriptStore(transcripts)

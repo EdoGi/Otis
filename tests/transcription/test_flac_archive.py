@@ -41,14 +41,18 @@ def _tone(path: Path, *, seconds: float = 1.0, amp: int = 9000) -> None:
         frames += struct.pack("<h", int(amp * math.sin(2 * math.pi * 440 * i / rate)))
     path.parent.mkdir(parents=True, exist_ok=True)
     with wave.open(str(path), "wb") as w:
-        w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate)
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
         w.writeframes(bytes(frames))
 
 
 def _session(tmp_path: Path, sid: str = "s1") -> RecordingSession:
-    audio = tmp_path / "audio"; audio.mkdir(exist_ok=True)
+    audio = tmp_path / "audio"
+    audio.mkdir(exist_ok=True)
     mic, sysw = audio / f"{sid}_mic.wav", audio / f"{sid}_system.wav"
-    _tone(mic); _tone(sysw, amp=6000)
+    _tone(mic)
+    _tone(sysw, amp=6000)
     meta = audio / f"{sid}_metadata.json"
     meta.write_text(json.dumps({
         "session_id": sid, "mic_wav": mic.name, "system_wav": sysw.name,
@@ -177,7 +181,7 @@ def test_a_broken_encoder_falls_back_to_keeping_the_audio(
     import src.transcription.processor as proc_mod
 
     monkeypatch.setattr(proc_mod, "encode_audio", lambda src, dst: False)
-    _proc, session, result = _process(tmp_path)
+    _proc, _session, result = _process(tmp_path)
 
     mic = result.metadata["audio_files"]["mic"]
     assert mic.endswith(".wav"), "must keep the raw capture rather than lose it"
@@ -197,7 +201,7 @@ def test_a_failed_move_marks_the_transcript_honestly(
         proc_mod.shutil, "move",
         lambda *a, **k: (_ for _ in ()).throw(OSError("disk gone")),
     )
-    _proc, _s, result = _process(tmp_path)
+    _proc, _s, _result = _process(tmp_path)
 
     store = TranscriptStore(tmp_path / "t")
     fm = store.list_transcripts(limit=5)[0]

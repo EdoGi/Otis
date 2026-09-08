@@ -28,7 +28,9 @@ from src.storage.transcript_store import TranscriptStore, transcript_is_complete
 def _wav(p: Path) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     with wave.open(str(p), "wb") as w:
-        w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
         w.writeframes(b"\x00\x00" * 1600)
 
 
@@ -59,10 +61,12 @@ def test_a_half_captured_meeting_is_not_complete(system_audio: str) -> None:
 
 
 def test_retention_keeps_audio_for_a_silent_system_stream(tmp_path: Path) -> None:
-    audio = tmp_path / "audio"; audio.mkdir()
+    audio = tmp_path / "audio"
+    audio.mkdir()
     store = TranscriptStore(tmp_path / "t")
     sid = "half-lost"
-    _wav(audio / f"{sid}_mic.wav"); _wav(audio / f"{sid}_system.wav")
+    _wav(audio / f"{sid}_mic.wav")
+    _wav(audio / f"{sid}_system.wav")
     (audio / f"{sid}_metadata.json").write_text(json.dumps({"session_id": sid}))
     for p in audio.iterdir():
         _age(p, 45)
@@ -80,7 +84,8 @@ def test_deleting_relocated_audio_marks_the_transcript(tmp_path: Path) -> None:
     """Relocated files are date-named, so the UUID is gone from the filename.
     The session id only survives in the sibling metadata — which is rewritten
     at transcription time and so is usually NOT past the horizon itself."""
-    audio = tmp_path / "audio"; audio.mkdir()
+    audio = tmp_path / "audio"
+    audio.mkdir()
     store = TranscriptStore(tmp_path / "t")
     base = audio / "2026" / "07"
     mic = base / "2026-07-01_1030_mic.wav"
@@ -88,7 +93,8 @@ def test_deleting_relocated_audio_marks_the_transcript(tmp_path: Path) -> None:
     _wav(mic)
     meta.parent.mkdir(parents=True, exist_ok=True)
     meta.write_text(json.dumps({"session_id": "sid-relocated"}), encoding="utf-8")
-    _age(mic, 45); _age(meta, 1)          # metadata rewritten yesterday
+    _age(mic, 45)
+    _age(meta, 1)          # metadata rewritten yesterday
     store.save(_fm("sid-relocated"), "# ok\n\nbody")
 
     report = AudioRetentionManager(
@@ -288,7 +294,8 @@ def test_reconciliation_corrects_a_transcript_whose_audio_is_gone(tmp_path: Path
     retention deletes. Any gap between those leaves the transcript lying —
     nine real transcripts on this machine claimed audio swept months earlier,
     and both the web UI and the MCP server trust that flag."""
-    audio = tmp_path / "audio"; audio.mkdir()
+    audio = tmp_path / "audio"
+    audio.mkdir()
     store = TranscriptStore(tmp_path / "t")
     fm = _fm("ghost")
     fm["audio_files"] = {"mic": "2026/05/gone_mic.wav", "system": None}
@@ -304,7 +311,8 @@ def test_reconciliation_corrects_a_transcript_whose_audio_is_gone(tmp_path: Path
 
 
 def test_reconciliation_leaves_present_audio_alone(tmp_path: Path) -> None:
-    audio = tmp_path / "audio"; audio.mkdir()
+    audio = tmp_path / "audio"
+    audio.mkdir()
     store = TranscriptStore(tmp_path / "t")
     _wav(audio / "2026" / "05" / "here_mic.wav")
     fm = _fm("present")
@@ -319,7 +327,8 @@ def test_reconciliation_leaves_present_audio_alone(tmp_path: Path) -> None:
 
 
 def test_reconciliation_is_idempotent(tmp_path: Path) -> None:
-    audio = tmp_path / "audio"; audio.mkdir()
+    audio = tmp_path / "audio"
+    audio.mkdir()
     store = TranscriptStore(tmp_path / "t")
     fm = _fm("ghost2")
     fm["audio_files"] = {"mic": "2026/05/gone_mic.wav", "system": None}
@@ -333,7 +342,8 @@ def test_reconciliation_is_idempotent(tmp_path: Path) -> None:
 
 def test_a_transcript_with_no_recorded_paths_is_left_alone(tmp_path: Path) -> None:
     """No paths means we cannot prove anything; guessing would be worse."""
-    audio = tmp_path / "audio"; audio.mkdir()
+    audio = tmp_path / "audio"
+    audio.mkdir()
     store = TranscriptStore(tmp_path / "t")
     store.save(_fm("unknown"), "# x\n\nbody")   # audio_files are both None
     assert AudioRetentionManager(

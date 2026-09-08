@@ -99,7 +99,9 @@ def test_transcribe_is_given_the_local_path_not_the_repo_id(hub, tmp_path) -> No
     wav = tmp_path / "clip.wav"
     import wave
     with wave.open(str(wav), "wb") as wf:
-        wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(16000)
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(16000)
         wf.writeframes(b"\x11\x11" * 16000)
 
     engine = WhisperEngine(model_name="medium", transcribe_fn=spy,

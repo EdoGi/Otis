@@ -145,7 +145,7 @@ def test_config_working_days_uses_python_weekday_convention() -> None:
     """Working days must use weekday() (0=Monday) not isoweekday() (1=Monday)."""
     cfg = load_config()
     days = cfg.get("app", "working_days")
-    assert days == [0, 1, 2, 3, 4]  # Mon–Fri, weekday() convention
+    assert days == [0, 1, 2, 3, 4]  # Mon-Fri, weekday() convention
     assert min(days) == 0  # never 1, which would be isoweekday()
     assert 6 not in days  # Sunday excluded under weekday() convention
 

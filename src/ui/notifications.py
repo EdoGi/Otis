@@ -121,7 +121,7 @@ def _default_backend(title: str, subtitle: str, message: str) -> None:
 # Convenience formatters used by the menu bar app -----------------------------
 def format_transcription_complete(meeting_title: str, duration_minutes: float) -> tuple[str, str]:
     """Return the (title, body) pair for a 'transcript ready' notification."""
-    duration = max(0, int(round(duration_minutes)))
+    duration = max(0, round(duration_minutes))
     return "Transcript ready", f"{meeting_title} ({duration} min)"
 
 

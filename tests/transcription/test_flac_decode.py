@@ -40,7 +40,9 @@ def _tone_wav(path: Path, *, seconds: float = 2.0, amp: int = 12000,
         for _ in range(channels):
             frames += struct.pack("<h", v) if width == 2 else struct.pack("<i", v << 16)
     with wave.open(str(path), "wb") as w:
-        w.setnchannels(channels); w.setsampwidth(width); w.setframerate(rate)
+        w.setnchannels(channels)
+        w.setsampwidth(width)
+        w.setframerate(rate)
         w.writeframes(bytes(frames))
 
 
