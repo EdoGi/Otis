@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from enum import Enum, StrEnum
+from enum import StrEnum
 
 from src.audio.devices import DeviceManager
 

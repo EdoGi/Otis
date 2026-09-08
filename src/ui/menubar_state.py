@@ -12,7 +12,7 @@ import logging
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
-from enum import Enum, StrEnum
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 

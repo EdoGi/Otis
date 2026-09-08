@@ -32,7 +32,7 @@ import threading
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from enum import Enum, StrEnum
+from enum import StrEnum
 from typing import Any
 
 from src.detection.calendar_poller import CalendarEvent, GoogleCalendarPoller

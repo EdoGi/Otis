@@ -37,7 +37,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from enum import Enum, StrEnum
+from enum import StrEnum
 
 logger = logging.getLogger(__name__)
 
