@@ -193,3 +193,41 @@ def test_badge_never_overwrites_the_recording_timer(app, registry) -> None:
     registry.report(SYSTEM_AUDIO, label="System audio", state=HealthState.FAIL)
     drain(app)
     assert app._app.title != "⚠"
+
+
+def test_reconnect_calendar_appears_for_a_per_account_row(app, registry) -> None:
+    """The key the pollers actually report.
+
+    The test above reports on the bare "calendar" key, which pollers stopped
+    using when health went per-account — so it kept passing while the real
+    app never showed the item, and the Status panel said "reconnect" above a
+    menu with nothing to click.
+    """
+    from src.health import CALENDAR, HealthState
+
+    registry.report(f"{CALENDAR}:personal", label="Calendar (personal)",
+                    state=HealthState.FAIL, detail="disconnected")
+    app._drain_main_queue(None)
+    assert app._mi["reconnect_calendar"].hidden is False
+
+
+def test_reconnect_calendar_hides_once_every_account_is_back(app, registry) -> None:
+    from src.health import CALENDAR, HealthState
+
+    registry.report(f"{CALENDAR}:personal", label="Calendar (personal)",
+                    state=HealthState.FAIL, detail="disconnected")
+    registry.report(f"{CALENDAR}:work", label="Calendar (work)",
+                    state=HealthState.FAIL, detail="disconnected")
+    app._drain_main_queue(None)
+    assert app._mi["reconnect_calendar"].hidden is False
+
+    registry.report(f"{CALENDAR}:personal", label="Calendar (personal)",
+                    state=HealthState.OK, detail="connected")
+    app._drain_main_queue(None)
+    assert app._mi["reconnect_calendar"].hidden is False, "work is still down"
+
+    registry.report(f"{CALENDAR}:work", label="Calendar (work)",
+                    state=HealthState.OK, detail="connected")
+    app._drain_main_queue(None)
+    assert app._mi["reconnect_calendar"].hidden is True
+

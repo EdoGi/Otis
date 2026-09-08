@@ -907,10 +907,18 @@ class MenuBarApp(SettingsMenuMixin):
         self._set_visible(self._mi["stop"], s in (UiState.RECORDING, UiState.PAUSED))
         self._set_visible(self._mi["transcribe_now"], s == UiState.DEFERRED)
         # The two repair actions only appear when they'd actually do something.
-        cal = self._health.get(CALENDAR)
+        # Pollers report per account — "calendar:personal", "calendar:work" —
+        # since the verification pass. This gate kept asking for the bare
+        # "calendar" key, which nothing reports any more, so the item that
+        # runs the re-auth never appeared while the panel above it said
+        # "reconnect". Any calendar row failing is reason enough to offer it.
         self._set_visible(
             self._mi["reconnect_calendar"],
-            cal is not None and cal.state is HealthState.FAIL,
+            any(
+                rep.state is HealthState.FAIL
+                and (rep.key == CALENDAR or rep.key.startswith(CALENDAR + ":"))
+                for rep in self._health.snapshot()
+            ),
         )
         audio = self._health.get(SYSTEM_AUDIO)
         self._set_visible(
