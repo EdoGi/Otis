@@ -87,7 +87,10 @@ select = ["E", "F", "I", "B", "UP", "RUF"]
 ignore = ["E501"]
 
 [tool.mypy]
-python_version = "3.10"
+# Was 3.10, which does not merely under-check: mypy died on numpy's own stubs
+# ("Type statement is only supported in Python 3.12 and greater") before
+# reaching any Otis source, so type checking has not run at all.
+python_version = "3.12"
 strict = false
 warn_unused_ignores = true
 ignore_missing_imports = true
