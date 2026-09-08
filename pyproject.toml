@@ -40,7 +40,10 @@ dependencies = [
     "pyobjc-framework-Cocoa>=10.0",
     "pyobjc-framework-CoreAudio>=10.0",
     "Pillow>=10.0",
-    "mcp>=1.0.0",
+    # Upper bound is load-bearing: mcp 2.x renamed FastMCP to MCPServer and
+    # deleted mcp.server.fastmcp, which src/mcp/server.py imports. A rebuilt
+    # venv silently pulled 2.x and broke the MCP server.
+    "mcp>=1.0.0,<2",
 ]
 
 [project.optional-dependencies]

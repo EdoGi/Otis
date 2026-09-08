@@ -231,3 +231,36 @@ def test_the_real_source_feeds_the_real_matcher() -> None:
         assert name in running or any(name in r for r in running), (
             f"{name!r} was detected but nothing by that name is running"
         )
+
+
+# ---------------------------------------------------------------------------
+# The suite must not write to the user's operational log
+# ---------------------------------------------------------------------------
+def test_the_suite_does_not_touch_the_real_log() -> None:
+    """A regression from P5: tests that call main() logged into ~/.otis.
+
+    otis.log rotates at 1 MB keeping five backups, so a full run did not just
+    add noise — it evicted real meeting history. 63% of the retained log was
+    pytest fixtures by the time it was noticed.
+    """
+    import src.main as main_mod
+
+    # The autouse fixture in conftest redirects this for every test; if it
+    # stops working, this points at the user's home directory again.
+    assert main_mod.LOG_DIR.expanduser() != Path("~/.otis").expanduser()
+
+
+def test_configure_logging_writes_where_log_dir_points(tmp_path, monkeypatch) -> None:
+    import logging
+
+    import src.main as main_mod
+
+    monkeypatch.setattr(main_mod, "LOG_DIR", tmp_path / "elsewhere")
+    main_mod._configure_logging("INFO")
+    logging.getLogger("src.check").info("hello")
+    for handler in logging.getLogger().handlers:
+        handler.flush()
+
+    written = (tmp_path / "elsewhere" / "otis.log")
+    assert written.exists()
+    assert "hello" in written.read_text(encoding="utf-8")

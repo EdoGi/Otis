@@ -28,9 +28,15 @@ from src.daemon import OtisDaemon
 
 logger = logging.getLogger("otis")
 
+#: Where otis.log lives. A module constant so the test suite can point it
+#: somewhere disposable: tests that call main() or _configure_logging would
+#: otherwise write into the user's real log and, at 1 MB with five rotations,
+#: push their actual meeting history out of it.
+LOG_DIR = Path("~/.otis")
+
 
 def _configure_logging(level: str) -> None:
-    """Set up console + ~/.otis/otis.log file logging.
+    """Set up console + ``LOG_DIR/otis.log`` file logging.
 
     The file handler is critical for the menu-bar app: when launched from a
     Login Item there's no terminal attached, so the log file is the only way
@@ -63,7 +69,7 @@ def _configure_logging(level: str) -> None:
 
     # File — keep five 1 MB rotations under ~/.otis/otis.log.
     try:
-        log_dir = Path("~/.otis").expanduser()
+        log_dir = LOG_DIR.expanduser()
         log_dir.mkdir(parents=True, exist_ok=True)
         log_file = log_dir / "otis.log"
         file_handler = RotatingFileHandler(

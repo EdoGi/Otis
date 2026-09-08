@@ -199,3 +199,20 @@ def fake_sounddevice_no_multi_output(monkeypatch: pytest.MonkeyPatch) -> types.M
     )
     monkeypatch.setitem(sys.modules, "sounddevice", mod)
     return mod
+
+
+@pytest.fixture(autouse=True)
+def _never_write_the_users_log(tmp_path_factory, monkeypatch):
+    """Keep the suite out of ``~/.otis/otis.log``.
+
+    Tests that go through ``main()`` or call ``_configure_logging`` directly
+    used to append to the real file. otis.log rotates at 1 MB keeping five
+    backups, so a full run did not merely add noise — it evicted the user's
+    actual meeting history. Measured before this fixture: 63% of the retained
+    log was pytest fixtures.
+    """
+    import src.main as main_mod
+
+    monkeypatch.setattr(
+        main_mod, "LOG_DIR", tmp_path_factory.mktemp("otis-log"), raising=True
+    )

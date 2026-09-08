@@ -61,6 +61,19 @@ info "Installing Otis in editable mode (this can take a minute on first run)..."
 pip install --quiet -e ".[dev]"
 ok "Dependencies installed."
 
+# ------------------------------------------------------- rumps notifications
+# rumps looks for an Info.plist next to sys.executable to register with the
+# macOS notification centre. A framework Python (Homebrew) supplies one; a
+# standalone build (uv / python-build-standalone) does not, and every
+# notification then fails with "Failed to setup the notification center".
+PLIST=".venv/bin/Info.plist"
+if [[ -f "${PLIST}" ]]; then
+    ok "rumps Info.plist already present."
+else
+    /usr/libexec/PlistBuddy -c 'Add :CFBundleIdentifier string "rumps"' "${PLIST}" >/dev/null
+    ok "Wrote ${PLIST} (notification centre registration)."
+fi
+
 # -------------------------------------------------------------- icon priming
 info "Generating menu-bar icons under ~/.otis/icons/ ..."
 python - <<'PY'
