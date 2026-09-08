@@ -9,7 +9,7 @@ crashed). These are the rest.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -118,7 +118,7 @@ def test_the_same_meeting_on_two_calendars_is_one_meeting() -> None:
     event invited to two calendars has two ids and one iCalUID — and that is
     exactly when comparing on id gets it wrong.
     """
-    when = datetime.now(timezone.utc) + timedelta(minutes=5)
+    when = datetime.now(UTC) + timedelta(minutes=5)
     mine = _event("meeting@google.com", eid="cal-a-123", when=when)
     theirs = _event("meeting@google.com", eid="cal-b-987", when=when)
 
@@ -127,7 +127,7 @@ def test_the_same_meeting_on_two_calendars_is_one_meeting() -> None:
 
 
 def test_two_different_meetings_stay_different() -> None:
-    when = datetime.now(timezone.utc) + timedelta(minutes=5)
+    when = datetime.now(UTC) + timedelta(minutes=5)
     a = _event("standup@google.com", eid="e1", when=when)
     b = _event("retro@google.com", eid="e1", when=when)
     assert a.canonical_key != b.canonical_key, "same id, different meetings"
@@ -135,7 +135,7 @@ def test_two_different_meetings_stay_different() -> None:
 
 def test_an_event_with_no_ical_uid_still_has_a_key() -> None:
     """Some providers omit it; falling back to the id is correct there."""
-    when = datetime.now(timezone.utc)
+    when = datetime.now(UTC)
     evt = _event(None, eid="only-an-id", when=when)
     assert evt.canonical_key
 

@@ -38,7 +38,7 @@ import shutil
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -325,7 +325,7 @@ class TranscriptProcessor:
         merged = interleave_with_overlaps(labelled_mic + labelled_sys)
 
         # Phase 5 — frontmatter + body.
-        wall_start = session.start_wall_clock or datetime.now(timezone.utc)
+        wall_start = session.start_wall_clock or datetime.now(UTC)
         local_start = wall_start.astimezone()
         # End time = start + the larger of the two transcription extents.
         last_t = max((s.segment.end for s in labelled_mic), default=0.0)

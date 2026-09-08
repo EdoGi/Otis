@@ -15,7 +15,7 @@ import math
 import shutil
 import struct
 import wave
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -62,7 +62,7 @@ def _session(tmp_path: Path, sid: str = "s1") -> RecordingSession:
     return RecordingSession(
         session_id=sid, audio_dir=audio, mic_wav=mic, system_wav=sysw,
         metadata_path=meta, mic_start_monotonic=0.0, system_start_monotonic=0.0,
-        start_wall_clock=datetime(2026, 5, 9, 14, 0, tzinfo=timezone.utc),
+        start_wall_clock=datetime(2026, 5, 9, 14, 0, tzinfo=UTC),
         sample_rate=16000,
     )
 

@@ -8,7 +8,7 @@ through the right lifecycle, and that shutdown is clean.
 from __future__ import annotations
 
 import threading
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from src.config import Config
@@ -112,7 +112,7 @@ def test_meeting_detected_starts_recorder() -> None:
     detector = MeetingDetector(
         process_monitor=pm,  # type: ignore[arg-type]
         calendar_pollers=[],
-        clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc),
+        clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=UTC),
     )
     _daemon, notes, rec = _make_daemon(detector)
 
@@ -128,7 +128,7 @@ def test_user_stop_via_meeting_ended_stops_recorder() -> None:
     detector = MeetingDetector(
         process_monitor=pm,  # type: ignore[arg-type]
         calendar_pollers=[],
-        clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc),
+        clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=UTC),
     )
     _daemon, notes, rec = _make_daemon(detector)
 
@@ -144,7 +144,7 @@ def test_process_disappearing_keeps_recording_but_warns() -> None:
     detector = MeetingDetector(
         process_monitor=pm,  # type: ignore[arg-type]
         calendar_pollers=[],
-        clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc),
+        clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=UTC),
     )
     _daemon, notes, rec = _make_daemon(detector)
 
@@ -165,7 +165,7 @@ def test_request_stop_unblocks_run_and_cleans_up() -> None:
     detector = MeetingDetector(
         process_monitor=pm,  # type: ignore[arg-type]
         calendar_pollers=[],
-        clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc),
+        clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=UTC),
     )
     daemon, _notes, rec = _make_daemon(detector)
 
@@ -189,7 +189,7 @@ def test_double_detection_does_not_start_two_recorders() -> None:
     detector = MeetingDetector(
         process_monitor=pm,  # type: ignore[arg-type]
         calendar_pollers=[],
-        clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc),
+        clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=UTC),
     )
     daemon, _notes, rec = _make_daemon(detector)
 
@@ -208,7 +208,7 @@ def test_calendar_approaching_does_not_start_recording() -> None:
     detector = MeetingDetector(
         process_monitor=None,
         calendar_pollers=[],
-        clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc),
+        clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=UTC),
     )
     _daemon, notes, rec = _make_daemon(detector)
 
@@ -216,8 +216,8 @@ def test_calendar_approaching_does_not_start_recording() -> None:
     ev = CalendarEvent(
         id="evt-1",
         title="Future meeting",
-        start=datetime(2026, 5, 9, 12, 1, tzinfo=timezone.utc),
-        end=datetime(2026, 5, 9, 12, 31, tzinfo=timezone.utc),
+        start=datetime(2026, 5, 9, 12, 1, tzinfo=UTC),
+        end=datetime(2026, 5, 9, 12, 31, tzinfo=UTC),
         meeting_link="https://meet.google.com/abc",
     )
     detector._handle_calendar_upcoming(ev)  # type: ignore[attr-defined]
@@ -233,7 +233,7 @@ def test_recorder_factory_failure_is_reported_not_crashed() -> None:
     detector = MeetingDetector(
         process_monitor=pm,  # type: ignore[arg-type]
         calendar_pollers=[],
-        clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc),
+        clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=UTC),
     )
 
     notes: list[str] = []
@@ -304,7 +304,7 @@ def test_meeting_end_triggers_transcription_with_meeting_context(tmp_path) -> No
     detector = MeetingDetector(
         process_monitor=pm,  # type: ignore[arg-type]
         calendar_pollers=[],
-        clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc),
+        clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=UTC),
     )
     processor = _RecordingProcessor()
     daemon, notes, rec, _pipeline = _make_daemon_with_pipeline(detector, tmp_path, processor)
@@ -328,7 +328,7 @@ def test_transcription_failure_saves_placeholder_and_daemon_survives(tmp_path) -
     detector = MeetingDetector(
         process_monitor=pm,  # type: ignore[arg-type]
         calendar_pollers=[],
-        clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc),
+        clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=UTC),
     )
 
     class _Boom:
@@ -355,7 +355,7 @@ def test_no_pipeline_means_record_only(tmp_path) -> None:
     detector = MeetingDetector(
         process_monitor=pm,  # type: ignore[arg-type]
         calendar_pollers=[],
-        clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc),
+        clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=UTC),
     )
     daemon, _notes, rec = _make_daemon(detector)
     pm.fire_detected("zoom.us")
@@ -372,7 +372,7 @@ def _daemon_with_clock(now: datetime):
     detector = MeetingDetector(
         process_monitor=pm,  # type: ignore[arg-type]
         calendar_pollers=[],
-        clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc),
+        clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=UTC),
     )
     notes: list[str] = []
     clock = {"now": now}
@@ -439,7 +439,7 @@ def test_transcription_worker_registered_before_stop_returns(tmp_path) -> None:
     detector = MeetingDetector(
         process_monitor=pm,  # type: ignore[arg-type]
         calendar_pollers=[],
-        clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc),
+        clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=UTC),
     )
 
     gate = threading_mod.Event()
@@ -464,7 +464,7 @@ def test_shutdown_waits_for_all_queued_transcriptions(tmp_path) -> None:
     detector = MeetingDetector(
         process_monitor=pm,  # type: ignore[arg-type]
         calendar_pollers=[],
-        clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc),
+        clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=UTC),
     )
     processor = _RecordingProcessor()
     daemon, _notes, _rec, _pipeline = _make_daemon_with_pipeline(
@@ -488,7 +488,7 @@ def test_worker_leaves_detector_alone_while_new_recording_active(tmp_path) -> No
     detector = MeetingDetector(
         process_monitor=pm,  # type: ignore[arg-type]
         calendar_pollers=[],
-        clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc),
+        clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=UTC),
     )
     processor = _RecordingProcessor()
     daemon, _notes, _rec, _pipeline = _make_daemon_with_pipeline(
@@ -514,7 +514,7 @@ def test_daemon_transcription_defers_while_next_recording_active(tmp_path, monke
     detector = MeetingDetector(
         process_monitor=pm,  # type: ignore[arg-type]
         calendar_pollers=[],
-        clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc),
+        clock=lambda: datetime(2026, 5, 9, 12, 0, tzinfo=UTC),
     )
     processor = _RecordingProcessor()
     daemon, notes, _rec, _pipeline = _make_daemon_with_pipeline(

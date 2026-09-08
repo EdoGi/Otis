@@ -36,7 +36,7 @@ import uuid
 import wave
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -301,7 +301,7 @@ class DualStreamRecorder:
             )
 
             self._active.set()
-            self._start_wall_clock = datetime.now(timezone.utc)
+            self._start_wall_clock = datetime.now(UTC)
             self._start_monotonic = time.monotonic()
 
             try:

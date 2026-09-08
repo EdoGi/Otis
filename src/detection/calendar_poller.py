@@ -26,7 +26,7 @@ import re
 import threading
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -658,7 +658,7 @@ def _parse_dt(value: str) -> datetime:
         value = value[:-1] + "+00:00"
     dt = datetime.fromisoformat(value)
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.replace(tzinfo=UTC)
     return dt
 
 
@@ -756,7 +756,7 @@ def _token_is_permanently_dead(exc: BaseException) -> bool:
 
 
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _safe_call_each(callbacks: list[Callable[..., None]], *args: Any) -> None:

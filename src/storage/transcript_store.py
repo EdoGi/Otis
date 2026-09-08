@@ -43,7 +43,7 @@ import re
 import shutil
 import threading
 from collections.abc import Callable, Iterable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -490,7 +490,7 @@ class TranscriptStore:
         and a tag of ``failed`` so the user can find / filter / retry. The
         body explains the error and tells them how to retry.
         """
-        when = (start_wall_clock or datetime.now(timezone.utc)).astimezone()
+        when = (start_wall_clock or datetime.now(UTC)).astimezone()
         clean_title = (title or "").strip() or "Recording"
         fm: dict[str, Any] = {
             "id": session_id,

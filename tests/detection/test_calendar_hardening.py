@@ -15,7 +15,7 @@ Three separate ways the poller misbehaved:
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -35,7 +35,7 @@ from src.detection.calendar_poller import (
 def test_day_bounds_start_at_local_midnight() -> None:
     # 00:30 UTC on 8 Aug — in any positive-offset zone that is already the 8th
     # locally, and the window must begin at local midnight, not UTC midnight.
-    now = datetime(2026, 8, 8, 0, 30, tzinfo=timezone.utc)
+    now = datetime(2026, 8, 8, 0, 30, tzinfo=UTC)
     start, end = local_day_bounds(now)
 
     assert (start.hour, start.minute, start.second) == (0, 0, 0)
@@ -46,7 +46,7 @@ def test_day_bounds_start_at_local_midnight() -> None:
 
 
 def test_day_bounds_cover_the_whole_local_day() -> None:
-    now = datetime(2026, 8, 8, 15, 45, tzinfo=timezone.utc)
+    now = datetime(2026, 8, 8, 15, 45, tzinfo=UTC)
     start, end = local_day_bounds(now)
     local_now = now.astimezone()
     assert start <= local_now < end
@@ -54,7 +54,7 @@ def test_day_bounds_cover_the_whole_local_day() -> None:
 
 def test_an_early_morning_local_meeting_is_inside_the_window() -> None:
     """A 00:30 local meeting used to fall outside a UTC-anchored window."""
-    now = datetime(2026, 8, 8, 9, 0, tzinfo=timezone.utc).astimezone()
+    now = datetime(2026, 8, 8, 9, 0, tzinfo=UTC).astimezone()
     start, end = local_day_bounds(now)
     early = now.replace(hour=0, minute=30, second=0, microsecond=0)
     assert start <= early < end
@@ -111,7 +111,7 @@ def poller(tmp_path) -> GoogleCalendarPoller:
 
 
 def test_all_pages_are_followed(poller) -> None:
-    base = datetime.now(timezone.utc).astimezone().replace(hour=9, minute=0, second=0,
+    base = datetime.now(UTC).astimezone().replace(hour=9, minute=0, second=0,
                                                            microsecond=0)
     pages = [
         [_event(i, base + timedelta(minutes=i)) for i in range(0, 3)],
@@ -128,7 +128,7 @@ def test_all_pages_are_followed(poller) -> None:
 
 
 def test_single_page_makes_one_request(poller) -> None:
-    base = datetime.now(timezone.utc).astimezone().replace(hour=9, minute=0, second=0,
+    base = datetime.now(UTC).astimezone().replace(hour=9, minute=0, second=0,
                                                            microsecond=0)
     service = PagedService([[_event(0, base)]])
     poller._service = service
@@ -155,7 +155,7 @@ def test_pagination_is_bounded(poller) -> None:
 
 
 def test_requests_ask_the_client_library_to_retry(poller) -> None:
-    base = datetime.now(timezone.utc).astimezone().replace(hour=9, minute=0)
+    base = datetime.now(UTC).astimezone().replace(hour=9, minute=0)
     service = PagedService([[_event(0, base)]])
     poller._service = service
     poller.fetch_today_events()

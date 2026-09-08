@@ -76,11 +76,7 @@ filterwarnings = [
 
 [tool.ruff]
 line-length = 100
-# Deliberately behind requires-python. Raising this to py312 turns on ruff's
-# 3.12 modernisation rules and lights up ~200 findings across the tree — all
-# style, none behaviour. Worth doing as its own sweep, not inside an unrelated
-# change.
-target-version = "py310"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "RUF"]

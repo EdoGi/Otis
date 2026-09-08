@@ -8,7 +8,7 @@ methods that production code reaches via callbacks.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from src.detection.calendar_poller import CalendarEvent
 from src.detection.detector import (
@@ -105,13 +105,13 @@ def _make(
 # State transitions
 # ============================================================================
 def test_initial_state_is_idle() -> None:
-    detector, _, _ = _make(now=datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc))
+    detector, _, _ = _make(now=datetime(2026, 5, 9, 12, 0, tzinfo=UTC))
     assert detector.get_state() == MeetingState.IDLE
     assert detector.get_current_meeting() is None
 
 
 def test_calendar_alert_drives_idle_to_approaching() -> None:
-    now = datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 9, 12, 0, tzinfo=UTC)
     detector, _, cp = _make(now=now)
     captured: list[MeetingContext] = []
     detector.on_meeting_approaching(captured.append)
@@ -128,7 +128,7 @@ def test_calendar_alert_drives_idle_to_approaching() -> None:
 
 def test_get_current_meeting_for_adhoc_has_now_as_start_time() -> None:
     """get_current_meeting() during an ad-hoc DETECTED meeting matches the spec."""
-    now = datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 9, 12, 0, tzinfo=UTC)
     detector, pm, _ = _make(now=now)
     pm.fire_detected("zoom.us")
     ctx = detector.get_current_meeting()
@@ -140,7 +140,7 @@ def test_get_current_meeting_for_adhoc_has_now_as_start_time() -> None:
 
 
 def test_process_alone_drives_idle_to_detected() -> None:
-    now = datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 9, 12, 0, tzinfo=UTC)
     detector, pm, _ = _make(now=now)
     captured: list[MeetingContext] = []
     detector.on_meeting_detected(captured.append)
@@ -157,7 +157,7 @@ def test_process_alone_drives_idle_to_detected() -> None:
 
 def test_calendar_then_correlated_process_is_one_meeting() -> None:
     """An approaching event + a process within ±correlation should NOT fire two events."""
-    now = datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 9, 12, 0, tzinfo=UTC)
     detector, pm, cp = _make(now=now)
     approach: list[MeetingContext] = []
     detected: list[MeetingContext] = []
@@ -180,7 +180,7 @@ def test_calendar_then_correlated_process_is_one_meeting() -> None:
 
 def test_uncorrelated_process_replaces_distant_calendar_context() -> None:
     """When the process arrives too far from the calendar event, treat as ad-hoc."""
-    now = datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 9, 12, 0, tzinfo=UTC)
     detector, pm, cp = _make(now=now, correlation_minutes=2.0)
 
     cp.fire_upcoming(_evt(now + timedelta(minutes=30), title="Later"))
@@ -196,7 +196,7 @@ def test_uncorrelated_process_replaces_distant_calendar_context() -> None:
 
 
 def test_user_starts_and_stops_recording_drives_state() -> None:
-    now = datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 9, 12, 0, tzinfo=UTC)
     detector, pm, _ = _make(now=now)
 
     pm.fire_detected("zoom.us")
@@ -213,7 +213,7 @@ def test_user_starts_and_stops_recording_drives_state() -> None:
 
 
 def test_manual_start_from_idle_creates_minimal_context() -> None:
-    now = datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 9, 12, 0, tzinfo=UTC)
     detector, _, _ = _make(now=now)
     detector.user_started_recording()
     assert detector.get_state() == MeetingState.RECORDING
@@ -229,7 +229,7 @@ def test_process_exit_during_recording_is_advisory_only() -> None:
     so the UI can warn the user, but state stays RECORDING. The user decides
     when to actually stop.
     """
-    now = datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 9, 12, 0, tzinfo=UTC)
     detector, pm, _ = _make(now=now)
 
     pm.fire_detected("zoom.us")
@@ -256,7 +256,7 @@ def test_process_exit_during_recording_is_advisory_only() -> None:
 
 
 def test_process_exit_during_detected_returns_to_idle_silently() -> None:
-    now = datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 9, 12, 0, tzinfo=UTC)
     detector, pm, _ = _make(now=now)
 
     detected_calls: list[MeetingContext] = []
@@ -282,7 +282,7 @@ def test_concurrent_calendar_alert_fires_heads_up_during_recording() -> None:
     ``ctx = None`` for any non-IDLE/APPROACHING state, silently dropping the
     notification for back-to-back meetings.
     """
-    now = datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 9, 12, 0, tzinfo=UTC)
     detector, _, cp = _make(now=now)
 
     # First meeting is already underway (manual start, no calendar correlation).
@@ -306,7 +306,7 @@ def test_concurrent_calendar_alert_during_detected_still_fires() -> None:
     """Same protection for DETECTED: a new meeting alert while we're tracking
     a process-detected meeting should still produce a heads-up event.
     """
-    now = datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 9, 12, 0, tzinfo=UTC)
     detector, pm, cp = _make(now=now)
 
     pm.fire_detected("zoom.us")
@@ -328,7 +328,7 @@ def test_back_to_back_meeting_correlates_after_transcription() -> None:
     transcription finishes, B's process detection must still correlate to
     B's calendar entry (title/attendees), not become an ad-hoc recording.
     """
-    clock = {"now": datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc)}
+    clock = {"now": datetime(2026, 5, 9, 12, 0, tzinfo=UTC)}
     pm = _FakeProcessMonitor()
     cp = _FakeCalendarPoller()
     detector = MeetingDetector(
@@ -359,7 +359,7 @@ def test_back_to_back_meeting_correlates_after_transcription() -> None:
 
 def test_transcription_finished_still_drops_expired_events() -> None:
     """Events already past their end ARE forgotten when transcription ends."""
-    clock = {"now": datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc)}
+    clock = {"now": datetime(2026, 5, 9, 12, 0, tzinfo=UTC)}
     pm = _FakeProcessMonitor()
     cp = _FakeCalendarPoller()
     detector = MeetingDetector(
@@ -391,7 +391,7 @@ def test_concurrent_calendar_alert_for_same_meeting_is_suppressed() -> None:
     calendar's own 2-min alert for the meeting we're already tracking — not a
     new back-to-back meeting. Don't double-notify.
     """
-    now = datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 9, 12, 0, tzinfo=UTC)
     detector, pm, cp = _make(now=now)
 
     # Detected through calendar+process correlation (so the context carries
@@ -419,7 +419,7 @@ def test_concurrent_calendar_alert_during_processing_is_suppressed() -> None:
     they'd be misleading mid-transcription, and the user has explicitly
     delayed scheduling-driven notifications.
     """
-    now = datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 9, 12, 0, tzinfo=UTC)
     detector, _, cp = _make(now=now)
 
     detector.user_started_recording()
@@ -444,7 +444,7 @@ def test_calendar_alert_during_recording_does_not_demote_state() -> None:
     when a calendar event correlated, silently losing the recording state while
     the recorder thread kept writing audio.)
     """
-    now = datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 9, 12, 0, tzinfo=UTC)
     detector, pm, cp = _make(now=now)
 
     # Recording underway via manual start.
@@ -472,7 +472,7 @@ def test_calendar_alert_during_recording_does_not_demote_state() -> None:
 
 
 def test_calendar_ended_clears_approaching_when_no_process_came() -> None:
-    now = datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 9, 12, 0, tzinfo=UTC)
     detector, _, cp = _make(now=now)
     ev = _evt(now + timedelta(minutes=1))
     cp.fire_upcoming(ev)
@@ -482,7 +482,7 @@ def test_calendar_ended_clears_approaching_when_no_process_came() -> None:
 
 
 def test_transcription_lifecycle() -> None:
-    now = datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 9, 12, 0, tzinfo=UTC)
     detector, pm, _ = _make(now=now)
     pm.fire_detected("zoom.us")
     detector.user_started_recording()
@@ -498,7 +498,7 @@ def test_transcription_lifecycle() -> None:
 # Lifecycle wiring
 # ============================================================================
 def test_start_stop_propagates_to_components() -> None:
-    now = datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 9, 12, 0, tzinfo=UTC)
     detector, pm, cp = _make(now=now)
     detector.start()
     assert pm.started and cp.started
@@ -507,7 +507,7 @@ def test_start_stop_propagates_to_components() -> None:
 
 
 def test_callback_exception_does_not_break_others() -> None:
-    now = datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 9, 12, 0, tzinfo=UTC)
     detector, _, cp = _make(now=now)
     fine: list[MeetingContext] = []
 
@@ -521,7 +521,7 @@ def test_callback_exception_does_not_break_others() -> None:
 
 def test_get_current_meeting_returns_a_copy() -> None:
     """Mutating the snapshot must not change internal state."""
-    now = datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 9, 12, 0, tzinfo=UTC)
     detector, pm, _ = _make(now=now)
     pm.fire_detected("zoom.us")
     snap = detector.get_current_meeting()
@@ -533,7 +533,7 @@ def test_get_current_meeting_returns_a_copy() -> None:
 
 def test_multiple_calendar_pollers_share_same_callbacks() -> None:
     """Both pollers should drive the same MeetingDetector state."""
-    now = datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 9, 12, 0, tzinfo=UTC)
     pm = _FakeProcessMonitor()
     personal = _FakeCalendarPoller()
     work = _FakeCalendarPoller()
@@ -561,7 +561,7 @@ def test_multiple_calendar_pollers_share_same_callbacks() -> None:
 
 def test_cross_invited_meeting_only_fires_once() -> None:
     """The same iCalUID arriving from two pollers must not double-notify."""
-    now = datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 9, 12, 0, tzinfo=UTC)
     pm = _FakeProcessMonitor()
     personal = _FakeCalendarPoller()
     work = _FakeCalendarPoller()
@@ -589,7 +589,7 @@ def test_cross_invited_meeting_only_fires_once() -> None:
 
 
 def test_distinct_meetings_from_two_accounts_both_fire() -> None:
-    now = datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 9, 12, 0, tzinfo=UTC)
     personal = _FakeCalendarPoller()
     work = _FakeCalendarPoller()
     detector = MeetingDetector(
@@ -613,7 +613,7 @@ def test_distinct_meetings_from_two_accounts_both_fire() -> None:
 
 
 def test_detector_start_stop_propagates_to_all_pollers() -> None:
-    now = datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 9, 12, 0, tzinfo=UTC)
     pm = _FakeProcessMonitor()
     a = _FakeCalendarPoller()
     b = _FakeCalendarPoller()
@@ -630,7 +630,7 @@ def test_detector_start_stop_propagates_to_all_pollers() -> None:
 
 def test_calendar_poller_singular_and_plural_can_combine() -> None:
     """Back-compat: ``calendar_poller=`` and ``calendar_pollers=`` can coexist."""
-    now = datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 9, 12, 0, tzinfo=UTC)
     a = _FakeCalendarPoller()
     b = _FakeCalendarPoller()
     detector = MeetingDetector(
@@ -644,7 +644,7 @@ def test_calendar_poller_singular_and_plural_can_combine() -> None:
 
 def test_real_process_monitor_can_attach() -> None:
     """Detector must accept a real ProcessMonitor instance, not just the fake."""
-    now = datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 9, 12, 0, tzinfo=UTC)
     real_pm = ProcessMonitor(
         whitelisted_apps=["zoom.us"],
         process_iter=lambda: iter([]),

@@ -31,7 +31,7 @@ import logging
 import threading
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import Any
 
@@ -576,7 +576,7 @@ class MeetingDetector:
 # Helpers
 # ============================================================================
 def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _context_from_event(event: CalendarEvent, state: MeetingState) -> MeetingContext:

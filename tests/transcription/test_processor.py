@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import wave
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -189,7 +189,7 @@ def _make_recording_session(
         metadata_path=metadata_path,
         mic_start_monotonic=mic_anchor,
         system_start_monotonic=sys_anchor,
-        start_wall_clock=datetime(2026, 5, 9, 14, 0, 2, tzinfo=timezone.utc),
+        start_wall_clock=datetime(2026, 5, 9, 14, 0, 2, tzinfo=UTC),
         sample_rate=16000,
     )
 

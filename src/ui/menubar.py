@@ -43,7 +43,7 @@ import queue
 import threading
 import time
 from collections.abc import Callable
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -1303,13 +1303,13 @@ class MenuBarApp(SettingsMenuMixin):
             self._config.get("audio", "sample_rate", default=16000)
         ))
         if not meta.get("start_wall_clock"):
-            from datetime import datetime, timezone
+            from datetime import datetime
 
             try:
-                ts = datetime.fromtimestamp(mic_path.stat().st_mtime, tz=timezone.utc)
+                ts = datetime.fromtimestamp(mic_path.stat().st_mtime, tz=UTC)
                 meta["start_wall_clock"] = ts.isoformat()
             except Exception:
-                meta["start_wall_clock"] = datetime.now(timezone.utc).isoformat()
+                meta["start_wall_clock"] = datetime.now(UTC).isoformat()
         meta.setdefault("pauses", [])
         return meta
 

@@ -24,7 +24,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -70,7 +70,7 @@ class TranscriptionQueue:
             path = self._path_for(session_id)
             payload = {
                 "session_id": session_id,
-                "queued_at": datetime.now(timezone.utc).isoformat(),
+                "queued_at": datetime.now(UTC).isoformat(),
                 "metadata": metadata,
             }
             tmp = path.with_suffix(".json.tmp")

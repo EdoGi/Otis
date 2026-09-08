@@ -8,7 +8,7 @@ user's machine.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from src.detection.calendar_poller import (
@@ -77,7 +77,7 @@ def test_parse_event_handles_zulu_time() -> None:
     )
     ev = parse_event(raw)
     assert ev is not None
-    assert ev.start.tzinfo == timezone.utc
+    assert ev.start.tzinfo == UTC
 
 
 def test_meeting_link_from_conference_data() -> None:
@@ -176,7 +176,7 @@ def _make_poller(items, *, now: datetime) -> tuple[GoogleCalendarPoller, _FakeSe
 
 
 def test_fetch_today_events_returns_parsed_events() -> None:
-    now = datetime(2026, 5, 9, 8, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 9, 8, 0, tzinfo=UTC)
     soon = (now + timedelta(minutes=30)).isoformat()
     later = (now + timedelta(minutes=60)).isoformat()
     poller, _ = _make_poller(
@@ -196,7 +196,7 @@ def test_fetch_today_events_returns_parsed_events() -> None:
 
 
 def test_upcoming_within_window() -> None:
-    now = datetime(2026, 5, 9, 8, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 9, 8, 0, tzinfo=UTC)
     items = [
         {
             "id": "in-1",
@@ -217,7 +217,7 @@ def test_upcoming_within_window() -> None:
 
 
 def test_poll_cycle_fires_upcoming_once_then_end_once() -> None:
-    now = datetime(2026, 5, 9, 8, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 9, 8, 0, tzinfo=UTC)
     items = [
         {
             "id": "evt",
@@ -258,7 +258,7 @@ def test_fetch_swallows_api_errors() -> None:
         def execute(self, **_kw: Any) -> dict[str, Any]:
             raise RuntimeError("HTTP 500")
 
-    now = datetime(2026, 5, 9, 8, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 9, 8, 0, tzinfo=UTC)
     poller = GoogleCalendarPoller(
         credentials_path="/nope.json",
         clock=_fixed_clock(now),
@@ -280,7 +280,7 @@ def test_fetch_drops_cached_service_when_all_calendars_fail() -> None:
         def execute(self, **_kw: Any) -> dict[str, Any]:
             raise RuntimeError("invalid_grant")
 
-    now = datetime(2026, 5, 9, 8, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 9, 8, 0, tzinfo=UTC)
     poller = GoogleCalendarPoller(
         credentials_path="/nope.json",
         clock=_fixed_clock(now),
@@ -291,7 +291,7 @@ def test_fetch_drops_cached_service_when_all_calendars_fail() -> None:
 
 
 def test_fetch_keeps_service_when_only_one_calendar_fails() -> None:
-    now = datetime(2026, 5, 9, 8, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 9, 8, 0, tzinfo=UTC)
 
     class _PartialService(_FakeService):
         def execute(self, **_kw: Any) -> dict[str, Any]:
@@ -322,7 +322,7 @@ def test_fetch_keeps_service_when_only_one_calendar_fails() -> None:
 
 
 def test_poll_cycle_resets_alert_bookkeeping_on_date_rollover() -> None:
-    now = datetime(2026, 5, 9, 8, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 9, 8, 0, tzinfo=UTC)
     items = [
         {
             "id": "evt",
@@ -348,7 +348,7 @@ def test_fetch_iterates_multiple_calendars_and_dedupes() -> None:
     """When ``calendar_ids`` lists multiple calendars, each is fetched and
     duplicate ids (the same event present on both) appear only once.
     """
-    now = datetime(2026, 5, 9, 8, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 9, 8, 0, tzinfo=UTC)
 
     common = {
         "id": "shared-1",
@@ -392,7 +392,7 @@ def test_fetch_iterates_multiple_calendars_and_dedupes() -> None:
 
 
 def test_fetch_continues_when_one_calendar_fails() -> None:
-    now = datetime(2026, 5, 9, 8, 0, tzinfo=timezone.utc)
+    now = datetime(2026, 5, 9, 8, 0, tzinfo=UTC)
 
     class _PartiallyBrokenService:
         def __init__(self):
