@@ -12,7 +12,7 @@ import logging
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
-from enum import Enum
+from enum import Enum, StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -117,7 +117,7 @@ def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[st
 # State manager — the part of the app that has no rumps dependency, so it's
 # unit-testable.
 # ============================================================================
-class UiState(str, Enum):
+class UiState(StrEnum):
     """Menu-bar display states.
 
     This was a bare ``class UiState(str)`` of class attributes whose docstring

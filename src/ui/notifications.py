@@ -25,14 +25,14 @@ import logging
 import threading
 import time
 from collections.abc import Callable
-from enum import Enum
+from enum import Enum, StrEnum
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_RATE_LIMIT_SECONDS = 30.0
 
 
-class NotificationType(str, Enum):
+class NotificationType(StrEnum):
     """Stable identifiers used by the rate-limiter."""
 
     MEETING_APPROACHING = "meeting_approaching"

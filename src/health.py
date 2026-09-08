@@ -37,7 +37,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from enum import Enum
+from enum import Enum, StrEnum
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +61,7 @@ CANONICAL_ORDER: tuple[str, ...] = (
 )
 
 
-class HealthState(str, Enum):
+class HealthState(StrEnum):
     """How a component is doing. Ordered by severity via :data:`_SEVERITY`."""
 
     #: Never reported. Distinct from UNKNOWN, which is a component actively

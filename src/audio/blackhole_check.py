@@ -13,7 +13,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import Enum, StrEnum
 
 from src.audio.devices import DeviceManager
 
@@ -108,7 +108,7 @@ def verify_blackhole_setup(device_manager: DeviceManager | None = None) -> Black
 # carry audio into BlackHole?
 
 
-class RoutingState(str, Enum):
+class RoutingState(StrEnum):
     OK = "ok"
     #: Audio reaches BlackHole, but nothing audible — the user hears nothing.
     INAUDIBLE = "inaudible"

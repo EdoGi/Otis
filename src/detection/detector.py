@@ -32,7 +32,7 @@ import threading
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from enum import Enum
+from enum import Enum, StrEnum
 from typing import Any
 
 from src.detection.calendar_poller import CalendarEvent, GoogleCalendarPoller
@@ -53,7 +53,7 @@ APPROACHING_MAX_SECONDS = 2 * 60 * 60
 ENDED_MAX_SECONDS = 3 * 60 * 60
 
 
-class MeetingState(str, Enum):
+class MeetingState(StrEnum):
     IDLE = "idle"
     APPROACHING = "approaching"
     DETECTED = "detected"

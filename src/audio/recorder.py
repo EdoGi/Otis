@@ -37,7 +37,7 @@ import wave
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from enum import Enum
+from enum import Enum, StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -84,7 +84,7 @@ WATCHDOG_INTERVAL_SECONDS = 5.0
 STREAM_STALL_SECONDS = 15.0
 
 
-class RecorderState(str, Enum):
+class RecorderState(StrEnum):
     IDLE = "idle"
     RECORDING = "recording"
     PAUSED = "paused"
