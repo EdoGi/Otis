@@ -605,12 +605,28 @@ class MenuBarApp(HealthPanelMixin, SettingsMenuMixin):
         A menu-bar app has no window to bring forward, and the icon may sit
         behind the menu-bar overflow — the user relaunched precisely because
         they could not see it. So: a notification that says so, then the menu
-        opened as if the icon had been clicked.
+        opened as if the icon had been clicked. If a dialog is open, that
+        dialog is what they need to see: it comes forward instead, and no menu
+        pops open later when it closes.
         """
         path = self._surface_request_path
         if path is None or not single_instance.take_surface_request(path):
             return
         logger.info("Otis.app was opened again; showing the running copy.")
+        modal = self._modal_window()
+        if modal is not None:
+            self._activate_app()
+            try:
+                modal.makeKeyAndOrderFront_(None)
+            except Exception:  # pragma: no cover
+                logger.debug("Could not raise the open dialog", exc_info=True)
+            self._notifications.notify(
+                NotificationType.ALREADY_RUNNING,
+                "Otis is already running",
+                "It has a dialog open — answer it to use the menu.",
+                force=True,
+            )
+            return
         self._notifications.notify(
             NotificationType.ALREADY_RUNNING,
             "Otis is already running",
@@ -628,6 +644,28 @@ class MenuBarApp(HealthPanelMixin, SettingsMenuMixin):
             )
         except Exception:  # headless tests, or rumps internals changed
             logger.debug("Could not open the status menu", exc_info=True)
+
+    @staticmethod
+    def _modal_window() -> Any:
+        try:
+            from AppKit import NSApplication
+
+            return NSApplication.sharedApplication().modalWindow()
+        except Exception:  # pragma: no cover (no AppKit)
+            return None
+
+    @staticmethod
+    def _activate_app() -> None:
+        try:
+            from AppKit import NSApplication
+
+            nsapp = NSApplication.sharedApplication()
+            if hasattr(nsapp, "activate"):
+                nsapp.activate()
+            else:  # pragma: no cover (macOS < 14)
+                nsapp.activateIgnoringOtherApps_(True)
+        except Exception:  # pragma: no cover
+            logger.debug("Could not activate Otis", exc_info=True)
 
     def _sync_recorder_state(self) -> None:
         """Mirror recorder-initiated pause/resume into the UI.

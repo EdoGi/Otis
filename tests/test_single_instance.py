@@ -288,5 +288,74 @@ def test_a_click_during_a_cold_start_is_not_called_a_freeze(
     monkeypatch.setattr(main_mod, "STARTUP_GRACE_SECONDS", 0.4)
     assert main_mod.main(["ui"]) == 0
     assert told and "still starting" in told[-1][0].lower()
-    assert forward == []
+    assert "dialog" in told[-1][1], "a bad-config dialog also looks like a slow start"
+    assert len(forward) == 1, "raise it in case a dialog is what it is stuck on"
     assert (run_dir / SURFACE_NAME).exists(), "keep it: the menu opens once the copy is ready"
+
+
+def _surface_app(tmp_path: Path):
+    from src.config import Config
+    from src.detection.detector import MeetingDetector
+    from src.health import HealthRegistry
+    from src.ui.menubar import MenuBarApp
+    from src.ui.notifications import NotificationManager
+
+    sent: list[tuple[str, str, str]] = []
+    app = MenuBarApp(
+        config=Config({"app": {"working_days": [0, 1, 2, 3, 4, 5, 6]}}),
+        detector=MeetingDetector(process_monitor=None, calendar_pollers=[]),
+        recorder_factory=lambda _c: None,
+        notifications=NotificationManager(backend=lambda t, s, m: sent.append((t, s, m))),
+        icons_dir=tmp_path / "icons", user_config_path=tmp_path / "config.yaml",
+        health=HealthRegistry(), surface_request_path=tmp_path / SURFACE_NAME,
+    )
+    app._sent = sent  # type: ignore[attr-defined]
+    return app
+
+
+def test_with_a_dialog_open_the_running_copy_raises_it_instead(tmp_path: Path, monkeypatch) -> None:
+    """Review round 2: the drain also runs during a modal, so it answered the
+    request and toasted "the menu is open now" — but the scheduled click only
+    fires after the dialog closes. Now the dialog comes forward and the toast
+    says to answer it; no menu pops open later by surprise."""
+    pytest.importorskip("rumps")
+    from types import SimpleNamespace
+
+    app = _surface_app(tmp_path)
+    raised: list[str] = []
+    clicks: list[tuple] = []
+    window = SimpleNamespace(makeKeyAndOrderFront_=lambda _s: raised.append("front"))
+    monkeypatch.setattr(app, "_modal_window", lambda: window)
+    monkeypatch.setattr(app, "_activate_app", lambda: raised.append("activate"))
+    button = SimpleNamespace(performSelector_withObject_afterDelay_=lambda *a: clicks.append(a))
+    app._app._nsapp = SimpleNamespace(nsstatusitem=SimpleNamespace(button=lambda: button))
+
+    single_instance.request_surface(tmp_path / SURFACE_NAME)
+    app._drain_main_queue(None)
+    assert raised == ["activate", "front"]
+    assert clicks == []
+    assert any("dialog" in m for _t, _s, m in app._sent)
+
+
+def test_a_stale_surface_request_is_dropped_when_the_lock_is_taken(run_dir: Path, monkeypatch) -> None:
+    """Review round 2: a request left by a launch whose target died before
+    answering made the *next* fresh start pop its menu open and toast
+    "already running". Any request present when a copy takes the lock was
+    written for an earlier holder."""
+    (run_dir / SURFACE_NAME).write_text("1234\n")
+    seen: list[bool] = []
+    monkeypatch.setattr(main_mod, "_run_menubar",
+                        lambda cfg, **kw: seen.append((run_dir / SURFACE_NAME).exists()) or 0)
+    assert main_mod.main(["ui"]) == 0
+    assert seen == [False]
+
+
+def test_the_bad_config_dialog_comes_to_the_front(monkeypatch) -> None:
+    """Review round 2: rumps.alert does not activate the app, so the dialog
+    could open behind other windows while holding the lock."""
+    import src.ui.rumps_support as rs
+
+    shown: list[dict] = []
+    monkeypatch.setattr(rs, "_alert", lambda **kw: shown.append(kw) or 1)
+    assert main_mod._report_bad_config(ValueError("bad model"), gui=True) == 2
+    assert shown and "bad model" in shown[0]["message"]

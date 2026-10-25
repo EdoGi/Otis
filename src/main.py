@@ -435,9 +435,11 @@ def _report_bad_config(exc: BaseException, *, gui: bool = False) -> int:
     # worse than the traceback it replaces.
     if gui:
         try:
-            import rumps
+            # _alert brings Otis to the front first: plain rumps.alert can open
+            # behind other windows, invisible, while this copy holds the lock.
+            from src.ui.rumps_support import _alert
 
-            rumps.alert(
+            _alert(
                 title="Otis could not start",
                 message=f"{message}\n\nEdit ~/.otis/config.yaml, or delete it "
                         f"to use the bundled defaults.",
@@ -510,14 +512,18 @@ def _defer_to_running_instance(command: str, run_dir: Path) -> int:
         time.sleep(0.05)
 
     if starting:
-        # Still in its first seconds: not frozen, just not drawing yet. Leave
-        # the request in place — its first drain tick opens the menu.
+        # Still in its first seconds: usually not frozen, just not drawing
+        # yet, so leave the request in place — its first drain tick opens the
+        # menu. But a bad-config dialog looks exactly like this (shown while
+        # holding the lock), so raise the copy and mention it.
         logger.info("The running copy (%s) is still starting; its menu will "
                     "open when it is ready.", who)
+        if holder.pid:
+            _bring_forward(holder.pid)
         _notify_from_second_launch(
             "Otis is still starting",
-            "Its icon will appear in the menu bar in a moment, and the menu will "
-            "open by itself.",
+            "Its icon will appear in the menu bar in a moment. If an Otis "
+            "dialog is open, answer it first.",
         )
         return 0
 
@@ -569,6 +575,11 @@ def main(argv: list[str] | None = None) -> int:
     lock = single_instance.acquire(run_dir / single_instance.LOCK_NAME, command=command)
     if lock is None:
         return _defer_to_running_instance(command, run_dir)
+    # A second launch only writes a request after failing to take the lock,
+    # so one present now was meant for an earlier holder that never answered
+    # it (it died while starting). Left in place it would pop this fresh
+    # copy's menu open and claim "already running".
+    single_instance.take_surface_request(run_dir / single_instance.SURFACE_NAME)
     try:
         return _dispatch(args, command, surface_request_path=run_dir / single_instance.SURFACE_NAME)
     except Exception as exc:
