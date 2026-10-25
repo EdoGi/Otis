@@ -256,6 +256,7 @@ class MenuBarApp(HealthPanelMixin, SettingsMenuMixin):
         self._user_check_in_progress = False
         # (state, output name) of the last routing check that was reported.
         self._last_route: tuple[Any, str] | None = None
+        self._quit_requested = False
         self._health_rows_shown: list[str] = []
         self._health_items: list[Any] = []
         self._meter_items: dict[str, Any] = {}
@@ -356,11 +357,18 @@ class MenuBarApp(HealthPanelMixin, SettingsMenuMixin):
         *,
         grace: float = QUIT_GRACE_SECONDS,
         exit_fn: Callable[[int], Any] = os._exit,
+        call_on_main: Callable[[Callable[[], None]], Any] | None = None,
     ) -> None:
-        """Force the exit if a terminate signal is not acted on within ``grace``.
+        """Quit on a terminate signal even when the Python handler cannot run.
 
-        A healthy quit ends the process long before (stopping a recording takes
-        up to ~14 s, hence the margin), taking this thread with it.
+        The handler needs the main thread to execute Python, which it does not
+        while a menu is open (timers do not fire in event-tracking mode) — seen
+        live: a `kill` after the second-launch menu opened waited until this
+        watchdog forced it. So first ask the main thread to quit through
+        performSelectorOnMainThread, which runs in common modes, menu tracking
+        included. If that cannot run either (frozen in native code), force the
+        exit after ``grace``; a healthy quit ends the process long before
+        (stopping a recording takes up to ~14 s, hence the margin).
         """
         import faulthandler
         import signal
@@ -375,6 +383,14 @@ class MenuBarApp(HealthPanelMixin, SettingsMenuMixin):
                 return
             if any(b in wanted for b in data):
                 break
+        try:
+            if call_on_main is None:
+                from PyObjCTools import AppHelper
+
+                call_on_main = AppHelper.callAfter
+            call_on_main(self._quit_once)
+        except Exception:  # pragma: no cover (no AppKit)
+            logger.debug("Could not ask the main thread to quit", exc_info=True)
         time.sleep(grace)
         logger.error(
             "The main thread did not quit within %.0fs of a terminate signal; "
@@ -389,9 +405,17 @@ class MenuBarApp(HealthPanelMixin, SettingsMenuMixin):
     def _on_terminate_signal(self, signum: int, _frame: Any) -> None:
         import signal
 
+        logger.warning("Otis received %s; quitting.", signal.Signals(signum).name)
+        self._quit_once()
+
+    def _quit_once(self) -> None:
+        """rumps.quit_application(), once — the signal handler and the watchdog
+        can both get here for one signal."""
+        if self._quit_requested:
+            return
+        self._quit_requested = True
         import rumps
 
-        logger.warning("Otis received %s; quitting.", signal.Signals(signum).name)
         rumps.quit_application()
 
     def notify_transcription_progress(self, pct: int) -> None:

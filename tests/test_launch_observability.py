@@ -245,15 +245,30 @@ def test_a_frozen_main_thread_cannot_make_kill_a_no_op(tmp_path: Path, log_dir: 
     app = _headless_app(tmp_path, _Detector())
     main_mod._configure_logging("INFO")
     exits: list[int] = []
+    asked: list[object] = []
     r, w = os.pipe()
     t = threading.Thread(target=app._escalate_unhandled_quit, args=(r,),
-                         kwargs={"grace": 0.05, "exit_fn": exits.append})
+                         kwargs={"grace": 0.05, "exit_fn": exits.append,
+                                 "call_on_main": asked.append})
     t.start()
     os.write(w, bytes([signal.SIGCHLD]))  # not a quit signal: ignored
     os.write(w, bytes([signal.SIGTERM]))
     t.join(5)
+    # First the graceful request (runs even while a menu is open), then force.
+    assert asked == [app._quit_once]
     assert exits == [143]
     assert "forcing exit" in _log_text(log_dir)
+
+
+def test_one_signal_quits_once(tmp_path: Path, log_dir: Path, monkeypatch) -> None:
+    import rumps
+
+    quits: list[bool] = []
+    monkeypatch.setattr(rumps, "quit_application", lambda *a: quits.append(True))
+    app = _headless_app(tmp_path, _Detector())
+    app._quit_once()  # the watchdog's request
+    app._quit_once()  # the Python handler, running late
+    assert quits == [True]
 
 
 def test_the_not_responding_toast_suggests_force_quit(tmp_path: Path, monkeypatch) -> None:
