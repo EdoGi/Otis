@@ -238,6 +238,8 @@ class MenuBarApp(SettingsMenuMixin):
         self._icons = ensure_icons(self._icons_dir)
         self._app = self._build_app(rumps_app_factory)
         self._wire_detector_callbacks()
+        for poller in getattr(self._detector, "calendar_pollers", ()) or ():
+            poller.is_active = self._calendar_should_poll
         # Health transitions become notifications and a menu refresh. The
         # registry only fires on an actual state change, so a subsystem can
         # report on every poll tick without producing a single extra toast.
@@ -841,6 +843,19 @@ class MenuBarApp(SettingsMenuMixin):
         if self._live_meters:
             self._live_meters = {}
             self._refresh_health_menu()
+
+    def _calendar_should_poll(self) -> bool:
+        """The pollers' own working-hours gate (called on their threads).
+
+        The schedule tick below is what normally stops them, but it skips four
+        states and stops with a stuck main loop. A recording that runs past the
+        window keeps its calendar, for the meeting-ended signal.
+        """
+        if self._snapshot.state in (UiState.RECORDING, UiState.PAUSED):
+            return True
+        return is_within_working_hours(
+            datetime.now(), **working_hours_from_config(self._config)
+        )
 
     def _on_schedule_tick(self, _timer: Any) -> None:
         """Move into / out of OFF_HOURS based on the working-hours window.

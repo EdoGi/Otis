@@ -131,6 +131,10 @@ class OtisDaemon:
 
         self._detector = detector or self._build_detector()
         self._wire_callbacks()
+        # Belt and braces with _apply_schedule: the pollers check the window
+        # themselves before touching the network.
+        for poller in getattr(self._detector, "calendar_pollers", ()) or ():
+            poller.is_active = self._calendar_should_poll
 
     # =====================================================================
     # Public API
@@ -474,6 +478,13 @@ class OtisDaemon:
                 self._apply_schedule()
             except Exception:  # pragma: no cover (defensive)
                 logger.exception("Schedule check failed; will retry next tick.")
+
+    def _calendar_should_poll(self) -> bool:
+        if self._recorder is not None:
+            return True
+        return is_within_working_hours(
+            self._clock(), **working_hours_from_config(self._config)
+        )
 
     def _apply_schedule(self) -> None:
         """Start/stop the detector based on the working-hours window.

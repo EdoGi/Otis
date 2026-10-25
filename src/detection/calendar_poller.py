@@ -105,6 +105,9 @@ API_RETRIES = 3
 #: Ceiling for the poll-loop backoff when the calendar is unreachable.
 MAX_BACKOFF_SECONDS = 600.0
 
+#: How often a poller outside working hours looks again (no network involved).
+OFF_HOURS_RECHECK_SECONDS = 60.0
+
 #: Safety valve on nextPageToken following, so a pathological calendar can't
 #: spin the poll thread indefinitely. 250 events/page.
 MAX_EVENT_PAGES = 8
@@ -177,6 +180,11 @@ class GoogleCalendarPoller:
         self._auth_failure_announced = False
         # Set by fetch_today_events so the poll loop can actually back off.
         self._last_cycle_failed = False
+        #: Optional "should I be polling now?" — the app's working-hours
+        #: window. The UI's schedule timer stops the poller off-hours, but
+        #: that timer skips four states and dies with a stuck main loop; a
+        #: frozen copy kept polling Google through Sunday 2026-09-13.
+        self.is_active: Callable[[], bool] | None = None
         # Threads that outlived their stop() join. Tracked so a wedged
         # poller can't be silently duplicated on the next start().
         self._lingering: list[threading.Thread] = []
@@ -583,7 +591,15 @@ class GoogleCalendarPoller:
     # =====================================================================
     def _run(self, stop_event: threading.Event) -> None:
         backoff = self._poll_interval
+        idle_logged = False
         while not stop_event.is_set():
+            if not self._window_open():
+                if not idle_logged:
+                    logger.info("%s: outside working hours; not polling.", self._health_label())
+                    idle_logged = True
+                stop_event.wait(min(self._poll_interval, OFF_HOURS_RECHECK_SECONDS))
+                continue
+            idle_logged = False
             try:
                 self._poll_cycle()
                 # The backoff used to grow only when _poll_cycle *raised* — but
@@ -602,6 +618,17 @@ class GoogleCalendarPoller:
                 backoff = min(max(backoff * 2, self._poll_interval), MAX_BACKOFF_SECONDS)
             stop_event.wait(backoff)
         logger.info("GoogleCalendarPoller stopped.")
+
+    def _window_open(self) -> bool:
+        gate = self.is_active
+        if gate is None:
+            return True
+        try:
+            return bool(gate())
+        except Exception:
+            # Fail open: a broken schedule must not cost the user a meeting.
+            logger.exception("Working-hours check raised; polling anyway.")
+            return True
 
     def _poll_cycle(self) -> None:
         now = self._now()
