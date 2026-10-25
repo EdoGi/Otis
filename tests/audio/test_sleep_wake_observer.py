@@ -113,3 +113,19 @@ def test_sleep_pauses_synchronously(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(rec, "pause", lambda *, source="user": ran_on.append(threading.current_thread()))
     rec._handle_system_sleep()
     assert ran_on == [threading.current_thread()]
+
+
+def test_a_wake_resume_waits_for_a_stop_in_progress(tmp_path: Path, monkeypatch) -> None:
+    """Review finding: moving the wake resume off the main thread let a Stop
+    click overlap the stream rebuild. stop() skipped the stream the revive had
+    set to None, finished, and the revive then started a new InputStream that
+    nothing owned — mic left open, its queue filling with no writer. The
+    resume now holds the same lock stop() does."""
+    rec = DualStreamRecorder(audio_dir=tmp_path, observe_sleep_wake=False)
+    ran = threading.Event()
+    monkeypatch.setattr(rec, "resume", lambda *, source="user": ran.set())
+
+    with rec._stop_lock:  # a stop() in progress
+        rec._handle_system_wake()
+        assert not ran.wait(0.3), "resume ran while stop() held its lock"
+    assert ran.wait(5.0)

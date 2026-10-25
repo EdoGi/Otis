@@ -1000,10 +1000,17 @@ class DualStreamRecorder:
         ).start()
 
     def _resume_after_wake(self) -> None:
-        try:
-            self.resume(source="wake")
-        except Exception:  # pragma: no cover
-            logger.exception("Failed to resume on system wake")
+        # Serialised with stop(): resume() can rebuild a dead stream outside
+        # _state_lock, and a Stop overlapping that rebuild used to skip the
+        # stream being replaced, finish, and leave the new InputStream running
+        # with no owner (mic open, queue filling). Same lock order as stop():
+        # _stop_lock, then _state_lock inside resume(). If stop() won, resume()
+        # sees STOPPED and does nothing.
+        with self._stop_lock:
+            try:
+                self.resume(source="wake")
+            except Exception:  # pragma: no cover
+                logger.exception("Failed to resume on system wake")
 
 
 # ============================================================================
