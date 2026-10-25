@@ -27,12 +27,14 @@ parameter so unit tests can run without the framework installed.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import logging
 import sys
 import threading
 import time
 import wave
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -286,7 +288,8 @@ class WhisperEngine:
                     self._inflight += 1
                     self._reset_idle_timer()
 
-                raw = self._call_transcribe(path, language)
+                with _window_progress(progress.window_done if progress else None):
+                    raw = self._call_transcribe(path, language)
             except _MlxImportFailure as exc:
                 raise ModelDownloadError(
                     "mlx-whisper isn't installed; run `pip install mlx-whisper`."
@@ -551,12 +554,16 @@ class WhisperEngine:
 # Progress estimator — runs in its own daemon thread
 # ---------------------------------------------------------------------------
 class _ProgressEstimator:
-    """Approximate progress (0-99 %) by wall-clock vs estimated total time.
+    """Progress (0-99 %) from finished windows, interpolated by speed.
 
-    Whisper's runtime depends on the model, audio length, and Mac model. For
-    the small model on M1 Pro, real-time factor is roughly 8x — i.e. a 5-min
-    audio file takes ~40 s. We estimate total = ``duration / RTF`` and tick
-    every 0.5 s.
+    It used to be pure wall-clock — elapsed / (duration / RTF), capped at 99 %
+    — with one per-model RTF that real streams miss by 0.6-2.9x. A stream
+    slower than the average hit the cap and sat there: on 2026-10-21 the menu
+    read "44%" for 16.7 minutes and "89%" for 7.9, healthy but frozen-looking.
+
+    Now windowed transcription reports each finished 10-minute window
+    (window_done), inside a window the estimate uses the speed this run has
+    actually shown, and it never runs past the end of the current window.
     """
 
     REAL_TIME_FACTOR = 8.0  # default until the engine has measured this machine
@@ -567,34 +574,89 @@ class _ProgressEstimator:
         callback: ProgressCallback,
         *,
         rtf: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._duration = max(1.0, duration_seconds)
         self._callback = callback
         self._rtf = float(rtf) if rtf else self.REAL_TIME_FACTOR
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._window_fraction = min(1.0, CHUNK_SECONDS / self._duration)
+        self._done = 0.0            # fraction of the audio finished, per windows
+        self._mark: float | None = None  # when the current window started
+        self._last = 0.0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
+        self.start_clock()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
+
+    def start_clock(self) -> None:
+        with self._lock:
+            self._mark = self._clock()
 
     def stop(self) -> None:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=1.0)
 
+    def window_done(self, fraction: float) -> None:
+        """A window finished; ``fraction`` of the audio is now transcribed."""
+        now = self._clock()
+        with self._lock:
+            if self._mark is not None and fraction > self._done and now > self._mark:
+                # This run's own speed beats the cross-run average.
+                self._rtf = (fraction - self._done) * self._duration / (now - self._mark)
+            self._done = max(self._done, min(1.0, fraction))
+            self._mark = now
+
+    def percent(self) -> float:
+        now = self._clock()
+        with self._lock:
+            mark = self._mark if self._mark is not None else now
+            guess = self._done + (now - mark) * self._rtf / self._duration
+            ceiling = min(self._done + 0.98 * self._window_fraction, 0.99)
+            pct = max(self._last, 100.0 * min(guess, ceiling))
+            self._last = pct
+            return pct
+
     def _loop(self) -> None:
-        start = time.monotonic()
-        estimated_total = self._duration / self._rtf
         while not self._stop.is_set():
-            elapsed = time.monotonic() - start
-            pct = min(99.0, 100.0 * elapsed / estimated_total)
             try:
-                self._callback(pct)
+                self._callback(self.percent())
             except Exception:  # pragma: no cover (defensive)
                 logger.exception("progress callback raised")
             if self._stop.wait(0.5):
                 break
+
+
+#: Where _transcribe_windowed reports finished windows. A context variable,
+#: not a kwarg, because it crosses the injectable transcribe_fn boundary whose
+#: kwargs go straight to mlx_whisper.transcribe.
+_WINDOW_PROGRESS: contextvars.ContextVar[Callable[[float], None] | None] = (
+    contextvars.ContextVar("otis_window_progress", default=None)
+)
+
+
+@contextlib.contextmanager
+def _window_progress(listener: Callable[[float], None] | None) -> Iterator[None]:
+    token = _WINDOW_PROGRESS.set(listener)
+    try:
+        yield
+    finally:
+        _WINDOW_PROGRESS.reset(token)
+
+
+def _report_window(fraction: float) -> None:
+    listener = _WINDOW_PROGRESS.get()
+    if listener is None:
+        return
+    try:
+        listener(fraction)
+    except Exception:  # pragma: no cover (defensive)
+        logger.exception("window progress listener raised")
 
 
 def _infer_stream_label(path: Path) -> str | None:
@@ -804,6 +866,7 @@ def _transcribe_windowed(
 
         _flush_mlx_buffers()
         if is_last:
+            _report_window(1.0)
             break
         # Resume where the kept text ended. A window that recognised nothing
         # advances by its whole length — there is nothing there to re-read.
@@ -812,6 +875,7 @@ def _transcribe_windowed(
         else:
             advance = window
         pos += max(advance, floor)
+        _report_window(min(1.0, pos / total))
 
     logger.info(
         "Transcribed %.1f min in %d windows of %.0f s.",
