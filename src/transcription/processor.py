@@ -313,6 +313,8 @@ class TranscriptProcessor:
         scale = compute_drift_scale(
             merged_meta.get("mic_bytes"), merged_meta.get("system_bytes"),
             offset, bytes_per_second,
+            end_delta=float(merged_meta["mic_last_capture_monotonic"])
+            - float(merged_meta["system_last_capture_monotonic"]),
         ) if drift_is_measurable(merged_meta) else 1.0
         if scale != 1.0:
             logger.info(
@@ -735,10 +737,14 @@ def drift_is_measurable(meta: dict[str, Any]) -> bool:
 
 def compute_drift_scale(
     mic_bytes: Any, system_bytes: Any, offset: float, bytes_per_second: float,
+    end_delta: float = 0.0,
 ) -> float:
     """Factor that maps system-file time onto the mic timeline (1.0 = none).
 
-    See DRIFT_MIN_SECONDS for the measurements and the limits.
+    ``end_delta`` is mic_last_capture - system_last_capture: without drift,
+    L_sys = L_mic - offset - end_delta, so a measured difference in where the
+    two streams stopped (block phase, the gap between their stop() calls) is
+    not mistaken for drift. See DRIFT_MIN_SECONDS for the limits.
     """
     if not isinstance(mic_bytes, (int, float)) or not isinstance(system_bytes, (int, float)):
         return 1.0
@@ -746,7 +752,7 @@ def compute_drift_scale(
         return 1.0
     mic_seconds = mic_bytes / bytes_per_second
     system_seconds = system_bytes / bytes_per_second
-    expected = mic_seconds - offset
+    expected = mic_seconds - offset - end_delta
     if expected <= 0 or abs(expected - system_seconds) < DRIFT_MIN_SECONDS:
         return 1.0
     scale = expected / system_seconds

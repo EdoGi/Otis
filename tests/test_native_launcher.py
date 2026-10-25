@@ -59,16 +59,21 @@ def test_it_starts_the_script_detached_and_returns_at_once(tmp_path: Path) -> No
     # The script blocks until the test releases it, so a launcher that waits
     # for its child cannot return in time (review: a sleep-based version let a
     # waitpid() launcher pass).
+    # Bounded (20 s), so a failing run cannot leave the loop spinning forever.
     script.write_text(
-        f'#!/bin/bash\nwhile [ ! -e "{release}" ]; do sleep 0.05; done\n'
+        f'#!/bin/bash\nfor i in $(seq 400); do [ -e "{release}" ] && break; sleep 0.05; done\n'
         f'echo "$OTIS_LAUNCHED_BY_APP $$" > "{marker}"\n'
     )
     exe = _build(tmp_path, script)
-    proc, took = _run(exe, tmp_path)
-    assert proc.returncode == 0
-    assert not marker.exists(), "the launcher returned only after its child finished"
-    assert took < 2.0, f"launcher took {took:.2f}s (the applet took 4-14 s)"
-    release.touch()
+    try:
+        try:
+            proc, took = _run(exe, tmp_path)
+        except subprocess.TimeoutExpired:
+            pytest.fail("the launcher waited for its child instead of returning")
+        assert proc.returncode == 0
+        assert took < 2.0, f"launcher took {took:.2f}s (the applet took 4-14 s)"
+    finally:
+        release.touch()
     assert _wait_for(marker), "the script never ran"
     flag, _pid = marker.read_text().split()
     assert flag == "1", "run.sh must know the app started it"
@@ -145,7 +150,7 @@ def test_closed_stdio_does_not_lose_the_launch_log(tmp_path: Path) -> None:
     assert "run.sh" in log.read_text()
 
 
-@pytest.mark.parametrize("bad", ['Ot"is', "Ot\\nis"])
+@pytest.mark.parametrize("bad", ['Ot"is', "Ot\\nis", "Ot\nis"])
 def test_build_app_refuses_a_path_it_cannot_compile_in(tmp_path: Path, bad: str) -> None:
     """A backslash in the project path was compiled as a C escape (a different
     path; every launch then failed) and a quote broke the build after the old
@@ -164,3 +169,21 @@ def test_build_app_refuses_a_path_it_cannot_compile_in(tmp_path: Path, bad: str)
                           capture_output=True, text=True, timeout=120)
     assert proc.returncode != 0
     assert keep.exists(), "the previous build must survive a refused path"
+
+
+@pytest.mark.skipif(shutil.which("iconutil") is None, reason="needs macOS iconutil")
+def test_a_trigraph_in_the_path_still_builds(tmp_path: Path) -> None:
+    """Review: clang -Werror rejected '??!'-style sequences in the compiled-in
+    path — after the previous app had been deleted. The launcher now compiles
+    before anything is removed, without the trigraph warning."""
+    import shutil as sh
+
+    root = tmp_path / "What??!" / "Otis"
+    (root / "scripts" / "launcher").mkdir(parents=True)
+    for rel in ("scripts/build_app.sh", "scripts/run.sh", "scripts/launcher/otis_launcher.c",
+                "OtisIcon.png"):
+        sh.copy2(REPO / rel, root / rel)
+    subprocess.run(["bash", str(root / "scripts" / "build_app.sh")], check=True,
+                   capture_output=True, text=True, timeout=180)
+    exe = root / "dist" / "Otis.app" / "Contents" / "MacOS" / "Otis"
+    assert str(root / "scripts" / "run.sh").encode() in exe.read_bytes()

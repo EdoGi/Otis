@@ -958,6 +958,10 @@ class MenuBarApp(HealthPanelMixin, SettingsMenuMixin):
         transition only happens from neutral states (IDLE / APPROACHING /
         DETECTED).
         """
+        try:
+            self._refresh_microphone_permission()
+        except Exception:  # pragma: no cover (defensive)
+            logger.exception("Microphone permission refresh raised")
         in_window = is_within_working_hours(
             datetime.now(), **working_hours_from_config(self._config)
         )

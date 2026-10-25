@@ -115,7 +115,9 @@ class HealthPanelMixin:
         from src.audio import mic_permission as mp
 
         status = mp.microphone_authorization()
-        if status == mp.NOT_DETERMINED and not at_recording_start:
+        if status == mp.AUTHORIZED:
+            self._clear_microphone_permission_failure()
+        elif status == mp.NOT_DETERMINED and not at_recording_start:
             logger.info("Microphone permission is undecided (a new app signature?); asking now.")
             if not mp.request_microphone_access(self._on_microphone_answer):
                 logger.warning("Could not ask for microphone access.")
@@ -126,10 +128,32 @@ class HealthPanelMixin:
         """Called by AVFoundation on an arbitrary thread."""
         if granted:
             logger.info("Microphone access granted.")
+            self._clear_microphone_permission_failure()
         else:
             from src.audio import mic_permission as mp
 
             self._report_microphone_denied(mp.DENIED)
+
+    def _refresh_microphone_permission(self) -> None:
+        """Clear a permission failure once the user has fixed it in Settings.
+
+        Cheap (a TCC query), so it rides the 60 s schedule tick; without it the
+        "access denied" row and the ⚠ badge stayed until a recording heard the
+        mic, although the setting had been turned back on.
+        """
+        rep = self._health.get(MICROPHONE)
+        if rep is None or not _is_permission_failure(rep):
+            return
+        from src.audio import mic_permission as mp
+
+        if mp.microphone_authorization() == mp.AUTHORIZED:
+            self._clear_microphone_permission_failure()
+
+    def _clear_microphone_permission_failure(self) -> None:
+        rep = self._health.get(MICROPHONE)
+        if rep is not None and _is_permission_failure(rep):
+            self._health.report(MICROPHONE, label="Microphone", state=HealthState.OK,
+                                detail="access granted")
 
     def _report_microphone_denied(self, status: str, *, force: bool = False) -> None:
         from src.audio import mic_permission as mp
@@ -460,3 +484,8 @@ class HealthPanelMixin:
                 detail=f"not routed (output: {status.default_output_name})",
                 hint=status.message(),
             )
+
+
+def _is_permission_failure(rep: HealthReport) -> bool:
+    return rep.state is HealthState.FAIL and rep.detail.startswith("access ")
+

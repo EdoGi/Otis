@@ -109,3 +109,51 @@ def test_run_checks_the_permission(tmp_path, registry, monkeypatch) -> None:
     finally:
         rumps.events.before_quit.unregister(app._on_before_quit)
     assert asked == [True]
+
+
+def test_a_denial_is_restated_when_a_recording_starts(tmp_path, registry, monkeypatch) -> None:
+    """Forced: the launch toast may be hours old when the call starts."""
+    _status(monkeypatch, mic_permission.DENIED)
+    app = _app(tmp_path, registry)
+    app._check_microphone_permission()
+    app._drain_main_queue(None)
+    before = [t for t, _s, _m in app._sent].count("Microphone problem")
+    app._check_microphone_permission(at_recording_start=True)
+    app._drain_main_queue(None)
+    assert [t for t, _s, _m in app._sent].count("Microphone problem") == before + 1
+
+
+def test_an_undecided_permission_is_not_asked_mid_call(tmp_path, registry, monkeypatch) -> None:
+    requests = _status(monkeypatch, mic_permission.NOT_DETERMINED)
+    app = _app(tmp_path, registry)
+    app._check_microphone_permission(at_recording_start=True)
+    assert requests == []
+
+
+def test_turning_access_back_on_clears_the_failure(tmp_path, registry, monkeypatch) -> None:
+    """Review: the 'access denied' row and ⚠ stayed until a recording heard
+    the mic, although the user had already fixed the setting."""
+    _status(monkeypatch, mic_permission.DENIED)
+    app = _app(tmp_path, registry)
+    app._check_microphone_permission()
+    assert registry.get(MICROPHONE).state is HealthState.FAIL
+    _status(monkeypatch, mic_permission.AUTHORIZED)  # fixed in System Settings
+    app._on_schedule_tick(None)
+    assert registry.get(MICROPHONE).state is HealthState.OK
+
+
+def test_a_silence_warning_never_replaces_the_denial(tmp_path, registry, monkeypatch) -> None:
+    """Review: a denied mic delivers zeros, and 60 s in the recorder's generic
+    'no signal' WARN replaced the 'access denied' FAIL — with two more toasts."""
+    from src.health import report_stream_health
+
+    _status(monkeypatch, mic_permission.DENIED)
+    app = _app(tmp_path, registry)
+    app._check_microphone_permission()
+    app._drain_main_queue(None)
+    sent = len(app._sent)
+    report_stream_health("mic", silent=True, detail="no signal for 60s", registry=registry,
+                         force_notify=True)
+    app._drain_main_queue(None)
+    assert registry.get(MICROPHONE).detail.startswith("access denied")
+    assert len(app._sent) == sent

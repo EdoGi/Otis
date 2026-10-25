@@ -167,3 +167,25 @@ def test_a_stream_that_ended_early_is_not_stretched(tmp_path: Path) -> None:
     result = processor.process(session, meeting=MeetingSnapshot(), language="fr")
     # Uncorrected: 1000 s + the 0.04 s start offset, i.e. [16:40].
     assert "[16:40]" in result.body and "[16:38]" not in result.body
+
+
+@pytest.mark.parametrize("meta", [
+    {"mic_last_capture_monotonic": 100.0, "system_last_capture_monotonic": 95.0,
+     "mic_gaps": 0, "system_gaps": 0},                       # system ended early
+    {"mic_last_capture_monotonic": 100.0, "system_last_capture_monotonic": 100.0,
+     "mic_gaps": 0, "system_gaps": 2},                       # system had a gap
+    {"mic_last_capture_monotonic": 100.0, "system_last_capture_monotonic": 100.0},  # no gap keys
+])
+def test_the_system_side_is_checked_too(meta) -> None:
+    from src.transcription.processor import drift_is_measurable
+
+    assert drift_is_measurable(meta) is False
+
+
+def test_a_measured_end_difference_is_not_mistaken_for_drift() -> None:
+    """Review: 0.4 s between the two streams' last blocks (block phase, the gap
+    between their stop() calls) passed the 0.5 s gate and was stretched as
+    drift. It is subtracted from the mismatch now."""
+    mic_s, offset, end_delta = 1800.0, 0.04, -0.4  # mic's last block 0.4 s earlier
+    sys_s = mic_s - offset - end_delta              # exactly what no drift produces
+    assert compute_drift_scale(mic_s * BPS, sys_s * BPS, offset, BPS, end_delta=end_delta) == 1.0

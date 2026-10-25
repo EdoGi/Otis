@@ -297,6 +297,12 @@ def report_stream_health(
     reg = registry if registry is not None else get_health()
     if silent:
         state = HealthState.FAIL if stream == "system" else HealthState.WARN
+        current = reg.get(key)
+        if state is HealthState.WARN and current is not None and current.state is HealthState.FAIL:
+            # A silence warning never replaces a failure that already says
+            # more — "access denied" for a mic macOS will not open, or a dead
+            # writer — and must not re-toast it.
+            return
         reg.report(key, label=label, state=state, detail=detail,
                    hint=STREAM_HINTS.get(stream), force_notify=force_notify)
     else:

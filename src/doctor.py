@@ -39,7 +39,8 @@ MIN_PYTHON = (3, 12)
 
 #: Imported by the app at runtime. mlx_whisper is only *located*, never
 #: imported: importing it pulls in scipy and numba (~2 s).
-REQUIRED_MODULES = ("sounddevice", "numpy", "yaml", "rumps", "flask", "mlx_whisper", "mcp")
+REQUIRED_MODULES = ("sounddevice", "numpy", "yaml", "rumps", "flask", "mlx_whisper", "mcp",
+                    "AVFoundation")  # the launch-time microphone permission check
 
 AFCONVERT = Path("/usr/bin/afconvert")
 

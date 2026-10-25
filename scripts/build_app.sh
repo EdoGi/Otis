@@ -63,7 +63,7 @@ command -v clang      >/dev/null 2>&1   || fatal "clang not in PATH — install 
 # would become an escape (a different path, every launch failing) and a quote
 # would break the build — after the old app was deleted. Refuse both here.
 case "${RUN_SH}" in
-    *\\*|*\"*) fatal "The project path contains a backslash or a double quote; move it to a plain path: ${RUN_SH}" ;;
+    *\\*|*\"*|*$'\n'*) fatal "The project path contains a backslash, a double quote or a newline; move it to a plain path: ${RUN_SH}" ;;
 esac
 command -v sips       >/dev/null 2>&1   || fatal "sips not in PATH (ships with macOS)."
 command -v iconutil   >/dev/null 2>&1   || fatal "iconutil not in PATH (ships with macOS)."
@@ -74,21 +74,27 @@ if [[ ! -d "${PROJECT_ROOT}/.venv" ]]; then
     warn "The app will fail to start Otis until you run scripts/setup.sh once."
 fi
 
+# ---------------------------------------------------------------- launcher
+# Compiled before anything is deleted, so a failed build leaves the previous
+# app in place. -Wno-trigraphs: GNU C ignores "??!"-style trigraphs anyway, but
+# warns about them, and -Werror would turn a folder name into a failed build.
+info "Compiling the launcher ..."
+BUILD_TMP="$(mktemp -d)"
+trap 'rm -rf "${BUILD_TMP}"' EXIT
+clang -O2 -Wall -Werror -Wno-trigraphs -arch arm64 -arch x86_64 -mmacosx-version-min=13.0 \
+    -DOTIS_RUN_SH="\"${RUN_SH}\"" \
+    -o "${BUILD_TMP}/Otis" "${LAUNCHER_SRC}"
+ok "Launcher compiled (runs ${RUN_SH})."
+
 # ---------------------------------------------------------------- clean
 info "Building Otis.app at ${APP_DIR} ..."
 rm -rf "${APP_DIR}"
 mkdir -p "${CONTENTS}/MacOS" "${RES_DIR}"
-
-# ---------------------------------------------------------------- launcher
-info "Compiling the launcher ..."
-clang -O2 -Wall -Werror -arch arm64 -arch x86_64 -mmacosx-version-min=13.0 \
-    -DOTIS_RUN_SH="\"${RUN_SH}\"" \
-    -o "${CONTENTS}/MacOS/Otis" "${LAUNCHER_SRC}"
-ok "Launcher compiled (runs ${RUN_SH})."
+mv "${BUILD_TMP}/Otis" "${CONTENTS}/MacOS/Otis"
 
 # ---------------------------------------------------------------- iconset → icns
 info "Generating multi-resolution icon (.icns) from OtisIcon.png ..."
-ICONSET="$(mktemp -d)/Otis.iconset"
+ICONSET="${BUILD_TMP}/Otis.iconset"
 mkdir -p "${ICONSET}"
 for entry in \
     "16  icon_16x16.png" \
@@ -106,7 +112,6 @@ for entry in \
     sips -z "${size}" "${size}" "${SOURCE_PNG}" --out "${ICONSET}/${name}" >/dev/null
 done
 iconutil -c icns "${ICONSET}" -o "${RES_DIR}/Otis.icns"
-rm -rf "$(dirname "${ICONSET}")"
 ok "Wrote ${RES_DIR}/Otis.icns"
 
 # ---------------------------------------------------------------- Info.plist

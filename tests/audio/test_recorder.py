@@ -314,3 +314,21 @@ def test_streams_open_with_low_power_capture_settings(
     finally:
         rec.stop()
     assert CAPTURE_BLOCKSIZE_FRAMES >= 2048  # ≥128 ms at 16 kHz
+
+
+def test_metadata_carries_what_the_drift_gate_needs(fake_sounddevice, tmp_path: Path) -> None:
+    """The drift correction depends on these keys; only hand-built metadata
+    exercised the gate before (review)."""
+    from src.transcription.processor import drift_is_measurable
+
+    rec = _make_recorder(tmp_path)
+    rec.start()
+    time.sleep(0.1)
+    meta = rec.stop()
+    for key in ("mic_last_capture_monotonic", "system_last_capture_monotonic",
+                "mic_gaps", "system_gaps"):
+        assert key in meta
+    assert meta["mic_last_capture_monotonic"] is not None
+    assert meta["system_last_capture_monotonic"] is not None
+    assert meta["mic_gaps"] == 0 and meta["system_gaps"] == 0
+    assert drift_is_measurable(meta)

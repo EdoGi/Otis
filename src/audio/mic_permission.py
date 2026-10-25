@@ -33,14 +33,23 @@ _STATUS_NAMES = {0: NOT_DETERMINED, 1: RESTRICTED, 2: DENIED, 3: AUTHORIZED}
 SETTINGS_URL = "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
 
 
+_warned_unavailable = False
+
+
 def microphone_authorization() -> str:
     """This app's microphone authorization, as one of the constants above."""
+    global _warned_unavailable
     try:
         import AVFoundation as av
 
         status = av.AVCaptureDevice.authorizationStatusForMediaType_(av.AVMediaTypeAudio)
-    except Exception:  # pragma: no cover (not macOS, or bindings missing)
-        logger.debug("Could not read microphone authorization", exc_info=True)
+    except Exception as exc:  # not macOS, or a venv set up before the dependency
+        if not _warned_unavailable:
+            _warned_unavailable = True
+            logger.warning(
+                "Cannot check microphone permission (%s); after a rebuild the "
+                "prompt will appear at the first recording. Run scripts/setup.sh.", exc,
+            )
         return UNKNOWN
     return _STATUS_NAMES.get(int(status), UNKNOWN)
 

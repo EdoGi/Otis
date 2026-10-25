@@ -301,6 +301,10 @@ def test_an_interrupted_download_does_not_count_as_cached(tmp_path: Path) -> Non
 
     hub = tmp_path / "hub"
     (hub / "models--mlx-community--whisper-large-v3-mlx" / "blobs").mkdir(parents=True)
+    # The likely shape: small files land first, the weights never do.
+    half = hub / "models--mlx-community--whisper-small-mlx" / "snapshots" / "abc"
+    half.mkdir(parents=True)
+    (half / "config.json").write_text("{}")
     _complete_model(hub, "medium")
     assert cached_model_names(hub) == {"medium"}
 
@@ -329,3 +333,28 @@ def test_the_labels_refresh_after_a_transcription(tmp_path: Path, monkeypatch) -
     bar._events.put(("refresh_model_menu", None))
     bar._drain_main_queue(None)
     assert bar._model_items["large-v3"].title == "large-v3"
+
+
+def test_a_finished_transcription_asks_for_a_label_refresh(tmp_path: Path) -> None:
+    """The producer side of the refresh (review: only the handler was tested)."""
+    pytest.importorskip("rumps")
+    from src.config import Config
+    from src.detection.detector import MeetingDetector
+    from src.ui.menubar import MenuBarApp
+    from src.ui.notifications import NotificationManager
+
+    bar = MenuBarApp(
+        config=Config({"transcription": {"defer_while_in_call": False}}),
+        detector=MeetingDetector(process_monitor=None, calendar_pollers=[]),
+        recorder_factory=lambda _c: None,
+        notifications=NotificationManager(backend=lambda t, s, m: None),
+        transcription_handler=lambda meta: None,
+        icons_dir=tmp_path / "icons", user_config_path=tmp_path / "config.yaml",
+        audio_dir=tmp_path / "audio",
+    )
+    bar._run_transcription({"session_id": "s1", "mic_wav": "s1_mic.wav",
+                            "_meeting": {"title": None}, "_language": None})
+    kinds = []
+    while not bar._events.empty():
+        kinds.append(bar._events.get_nowait()[0])
+    assert "refresh_model_menu" in kinds
