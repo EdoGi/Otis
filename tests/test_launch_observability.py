@@ -216,3 +216,45 @@ def test_sigterm_quits_through_the_normal_quit_path(tmp_path: Path, log_dir: Pat
             signal.signal(sig, handler)
     assert quits == [True]
     assert "SIGTERM" in _log_text(log_dir)
+
+
+def test_a_frozen_main_thread_cannot_make_kill_a_no_op(tmp_path: Path, log_dir: Path) -> None:
+    """Review finding: the SIGTERM handler runs only when the main thread runs
+    Python. Frozen in native code — the case where the second launch says "not
+    responding" and suggests killing it — `kill PID` then did nothing at all,
+    where before the handler existed it ended the process. A watchdog thread
+    now sees the signal through the wakeup fd and forces the exit if the normal
+    quit has not finished within the grace period."""
+    import os
+    import signal
+
+    app = _headless_app(tmp_path, _Detector())
+    main_mod._configure_logging("INFO")
+    exits: list[int] = []
+    r, w = os.pipe()
+    t = threading.Thread(target=app._escalate_unhandled_quit, args=(r,),
+                         kwargs={"grace": 0.05, "exit_fn": exits.append})
+    t.start()
+    os.write(w, bytes([signal.SIGCHLD]))  # not a quit signal: ignored
+    os.write(w, bytes([signal.SIGTERM]))
+    t.join(5)
+    assert exits == [143]
+    assert "forcing exit" in _log_text(log_dir)
+
+
+def test_the_not_responding_toast_suggests_force_quit(tmp_path: Path, monkeypatch) -> None:
+    told: list[tuple] = []
+    monkeypatch.setattr(main_mod, "_notify_from_second_launch", lambda *a: told.append(a))
+    monkeypatch.setattr(main_mod, "_bring_forward", lambda pid: None)
+    monkeypatch.setattr(main_mod, "SURFACE_WAIT_SECONDS", 0.05)
+    from src import single_instance
+
+    lock_path = tmp_path / single_instance.LOCK_NAME
+    lock_path.write_text("99999\nui\n", encoding="utf-8")
+    import os
+    import time as _time
+
+    old = _time.time() - 3600  # an old lock: not a copy that is still starting
+    os.utime(lock_path, (old, old))
+    main_mod._defer_to_running_instance("ui", tmp_path)
+    assert told and "Force Quit" in told[-1][1]

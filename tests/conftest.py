@@ -223,3 +223,21 @@ def _never_write_the_users_log(tmp_path_factory, monkeypatch):
 
     monkeypatch.setattr(sys, "excepthook", sys.excepthook)
     monkeypatch.setattr(threading, "excepthook", threading.excepthook)
+
+
+@pytest.fixture(autouse=True)
+def _restore_signal_handling():
+    """MenuBarApp.run() (and OtisDaemon.run()) install SIGTERM/SIGHUP/SIGINT
+    handlers and a wakeup fd for the whole process. Left behind, a later
+    SIGTERM to the pytest run would call a dead app's quit — NSApp.terminate_,
+    exit status 0, no summary — and a cancelled gate would read green."""
+    import signal
+
+    sigs = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+    saved = {s: signal.getsignal(s) for s in sigs}
+    wakeup = signal.set_wakeup_fd(-1)
+    signal.set_wakeup_fd(wakeup)
+    yield
+    for s, handler in saved.items():
+        signal.signal(s, handler)
+    signal.set_wakeup_fd(wakeup)

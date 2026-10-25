@@ -105,6 +105,11 @@ from src.ui.rumps_support import (
 
 logger = logging.getLogger(__name__)
 
+#: How long a terminate signal may take to end the process before the
+#: watchdog forces it (see _escalate_unhandled_quit). Stopping a recording
+#: can take ~14 s (two writer joins of up to 5 s, plus metadata).
+QUIT_GRACE_SECONDS = 20.0
+
 TranscriptionHandler = Callable[[dict[str, Any]], None]
 
 #: Re-exported so ``src.ui.menubar`` stays the one public name for the menu
@@ -327,6 +332,59 @@ class MenuBarApp(HealthPanelMixin, SettingsMenuMixin):
                 signal.signal(sig, self._on_terminate_signal)
             except (ValueError, OSError):  # not the main thread (tests)
                 logger.debug("Could not install a handler for %s", sig)
+                return
+        # The handler above needs the main thread to run Python. Frozen in
+        # native code, it never would — and `kill PID`, which used to end the
+        # process outright, would do nothing. The C-level handler still writes
+        # the signal number to a wakeup fd; a watchdog thread reads it and
+        # forces the exit if the normal quit has not finished in time.
+        try:
+            read_fd, write_fd = os.pipe()
+            os.set_blocking(write_fd, False)
+            signal.set_wakeup_fd(write_fd, warn_on_full_buffer=False)
+        except (ValueError, OSError):
+            logger.debug("No wakeup fd; a frozen copy needs kill -9", exc_info=True)
+            return
+        threading.Thread(
+            target=self._escalate_unhandled_quit, args=(read_fd,),
+            name="otis-quit-watchdog", daemon=True,
+        ).start()
+
+    def _escalate_unhandled_quit(
+        self,
+        read_fd: int,
+        *,
+        grace: float = QUIT_GRACE_SECONDS,
+        exit_fn: Callable[[int], Any] = os._exit,
+    ) -> None:
+        """Force the exit if a terminate signal is not acted on within ``grace``.
+
+        A healthy quit ends the process long before (stopping a recording takes
+        up to ~14 s, hence the margin), taking this thread with it.
+        """
+        import faulthandler
+        import signal
+
+        wanted = {int(signal.SIGTERM), int(signal.SIGHUP)}
+        while True:
+            try:
+                data = os.read(read_fd, 64)
+            except OSError:
+                return
+            if not data:
+                return
+            if any(b in wanted for b in data):
+                break
+        time.sleep(grace)
+        logger.error(
+            "The main thread did not quit within %.0fs of a terminate signal; "
+            "forcing exit. All thread stacks follow on stderr (launch.log).", grace,
+        )
+        try:
+            faulthandler.dump_traceback(all_threads=True)
+        except Exception:  # pragma: no cover (closed stderr)
+            pass
+        exit_fn(143)  # 128 + SIGTERM
 
     def _on_terminate_signal(self, signum: int, _frame: Any) -> None:
         import signal

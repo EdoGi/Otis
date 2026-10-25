@@ -506,8 +506,8 @@ def _defer_to_running_instance(command: str, run_dir: Path) -> int:
     _notify_from_second_launch(
         "Otis is running but not responding",
         f"The copy already running ({who}) did not answer. If a dialog is open, "
-        f"answer it; otherwise quit it (Activity Monitor, or `kill {holder.pid or 'PID'}`) "
-        f"and open Otis again.",
+        f"answer it; otherwise Force Quit it in Activity Monitor (or "
+        f"`kill -9 {holder.pid or 'PID'}`) and open Otis again.",
     )
     return 0
 
