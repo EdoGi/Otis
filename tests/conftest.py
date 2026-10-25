@@ -217,3 +217,9 @@ def _never_write_the_users_log(tmp_path_factory, monkeypatch):
     monkeypatch.setattr(
         main_mod, "LOG_DIR", tmp_path_factory.mktemp("otis-log"), raising=True
     )
+    # main() installs process-wide excepthooks that log into LOG_DIR; put the
+    # originals back so one test's hooks never outlive it.
+    import threading
+
+    monkeypatch.setattr(sys, "excepthook", sys.excepthook)
+    monkeypatch.setattr(threading, "excepthook", threading.excepthook)

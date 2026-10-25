@@ -270,6 +270,12 @@ class MenuBarApp(SettingsMenuMixin):
             logger.info("Launched outside working hours; detection paused.")
             self._set_state(UiState.OFF_HOURS)
 
+        # A menu Quit (and a logout) ends in NSApp.terminate_, which calls
+        # exit(): the finally below never runs. applicationWillTerminate_
+        # does fire first, and rumps relays it as before_quit.
+        import rumps
+
+        rumps.events.before_quit.register(self._on_before_quit)
         try:
             self._app.run()
         finally:
@@ -720,6 +726,8 @@ class MenuBarApp(SettingsMenuMixin):
 
     def _on_quit_clicked(self, _sender: Any) -> None:
         import rumps
+
+        logger.info("Quit chosen from the menu.")
 
         # If a transcription is mid-flight, the worker is a daemon thread —
         # it will be killed the moment we exit, losing the transcript. Warn
@@ -1802,6 +1810,23 @@ class MenuBarApp(SettingsMenuMixin):
             subprocess.Popen(["open", str(path)])
         except Exception:
             logger.exception("Could not open %s in Finder", path)
+
+    def _on_before_quit(self) -> None:
+        """Last words before exit: say so in the log, save any recording.
+
+        Without this a Quit, a crash and a hang all looked the same in
+        otis.log. Each step is guarded — rumps prints a raising handler to
+        stderr and carries on — and nothing here joins long-running workers,
+        because macOS does not wait long at logout.
+        """
+        logger.info("Otis quitting (pid %d).", os.getpid())
+        # A logout or restart reaches here without _on_quit_clicked, with the
+        # recording still running; stopping it flushes the WAVs to disk.
+        for step in (self._do_stop_if_recording, self._detector.stop):
+            try:
+                step()
+            except Exception:
+                logger.exception("Quit step %s raised", getattr(step, "__name__", step))
 
     def _teardown(self) -> None:
         self._do_stop_if_recording()

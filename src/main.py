@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -28,7 +29,15 @@ from src.config import Config, load_user_config
 from src.config_schema import ConfigError, validate
 from src.daemon import OtisDaemon
 
-logger = logging.getLogger("otis")
+# Inside the ``src`` hierarchy on purpose: _configure_logging sets the level on
+# ``src`` alone, and under the old name "otis" every INFO line from here —
+# "Logging to", "Loaded config", "Web UI listening" — was dropped (0 of each
+# across 36 real launches).
+logger = logging.getLogger("src.main")
+
+#: Kept open for the life of the process so faulthandler can write a Python
+#: stack for a native crash (a segfault in CoreAudio/PortAudio/MLX).
+_crash_log: Any = None
 
 #: Where otis.log lives. A module constant so the test suite can point it
 #: somewhere disposable: tests that call main() or _configure_logging would
@@ -58,8 +67,11 @@ def _configure_logging(level: str) -> None:
     from logging.handlers import RotatingFileHandler
 
     numeric = getattr(logging, level.upper(), logging.INFO)
+    # Milliseconds so a slow launch step can be attributed (the 8 s gap at the
+    # 2026-10-20 login launch could not be), and the pid because copies of
+    # Otis used to run concurrently and interleave in this one file.
     fmt = logging.Formatter(
-        "%(asctime)s [%(levelname)-7s] %(name)s: %(message)s",
+        "%(asctime)s.%(msecs)03d [%(levelname)-7s] %(process)d %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
@@ -75,9 +87,15 @@ def _configure_logging(level: str) -> None:
     for h in list(root.handlers):
         root.removeHandler(h)
 
-    # Console
+    # Console. Launched from Otis.app, stderr is run.sh's launch.log, which
+    # exists for what happens before or outside this logging (a missing venv,
+    # an import error, a native crash). Copying every INFO line there too would
+    # grow it without bound next to the rotated otis.log, so off a terminal
+    # only warnings and worse reach it.
     console = logging.StreamHandler()
     console.setFormatter(fmt)
+    if not _stderr_is_terminal():
+        console.setLevel(logging.WARNING)
     root.addHandler(console)
 
     # File — keep five 1 MB rotations under ~/.otis/otis.log.
@@ -93,6 +111,58 @@ def _configure_logging(level: str) -> None:
         logger.info("Logging to %s (level=%s).", log_file, level.upper())
     except Exception as exc:  # pragma: no cover (e.g. read-only HOME)
         logger.warning("Could not enable file logging: %s", exc)
+
+
+def _stderr_is_terminal() -> bool:
+    try:
+        return sys.stderr.isatty()
+    except Exception:  # pragma: no cover (closed or replaced stderr)
+        return False
+
+
+def _install_crash_logging() -> None:
+    """Route anything uncaught into otis.log instead of the discarded stderr.
+
+    Errors that escape a rumps callback are still printed by rumps itself;
+    since run.sh now keeps a launch.log, those land there.
+    """
+    global _crash_log
+
+    def log_uncaught(exc_type, exc, tb) -> None:
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc, tb)
+            return
+        if getattr(exc, "_otis_logged", False):
+            return
+        logger.critical("Uncaught exception", exc_info=(exc_type, exc, tb))
+
+    def log_uncaught_thread(args: Any) -> None:
+        if args.exc_type is SystemExit:
+            return
+        name = args.thread.name if args.thread is not None else "?"
+        logger.critical(
+            "Uncaught exception in thread %s", name,
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+
+    sys.excepthook = log_uncaught
+    import threading
+
+    threading.excepthook = log_uncaught_thread
+
+    # A native crash takes the Python logging down with it; faulthandler
+    # writes the Python stack straight to a file descriptor. Leave an
+    # existing destination alone (pytest installs its own).
+    import faulthandler
+
+    if not faulthandler.is_enabled():
+        try:
+            log_dir = LOG_DIR.expanduser()
+            log_dir.mkdir(parents=True, exist_ok=True)
+            _crash_log = open(log_dir / "crash.log", "a", encoding="utf-8")
+            faulthandler.enable(file=_crash_log, all_threads=True)
+        except Exception:  # pragma: no cover
+            logger.debug("Could not enable faulthandler", exc_info=True)
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -414,11 +484,16 @@ def _defer_to_running_instance(command: str, run_dir: Path) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     _configure_logging(args.log_level)
+    _install_crash_logging()
 
     # Every mode honours ~/.otis/config.yaml — the settings toggled in the
     # menu bar (model, whitelist, working hours) apply to the headless
     # daemon too, instead of silently reverting to bundled defaults.
     command = args.command or ("check-audio" if args.check_audio else "ui")
+    logger.info(
+        "Otis starting: pid=%d ppid=%d command=%s python=%s cwd=%s",
+        os.getpid(), os.getppid(), command, sys.executable, os.getcwd(),
+    )
 
     if command not in _EXCLUSIVE_COMMANDS:
         return _dispatch(args, command)
@@ -431,6 +506,12 @@ def main(argv: list[str] | None = None) -> int:
         return _defer_to_running_instance(command, run_dir)
     try:
         return _dispatch(args, command, surface_request_path=run_dir / single_instance.SURFACE_NAME)
+    except Exception as exc:
+        # Launched from Otis.app nothing reads stderr, so this line is the
+        # only record of why the menu bar never appeared.
+        logger.critical("Otis failed to start or crashed (%s)", command, exc_info=True)
+        exc._otis_logged = True  # type: ignore[attr-defined]  # excepthook: don't log it twice
+        raise
     finally:
         lock.release()
 

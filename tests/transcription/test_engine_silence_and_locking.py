@@ -203,6 +203,7 @@ def test_release_logs_when_mlx_internals_move(caplog, monkeypatch) -> None:
         raise AttributeError("ModelHolder moved upstream")
 
     monkeypatch.setattr(we, "_import_model_holder", broken_import)
+    monkeypatch.setattr(we, "_mlx_whisper_loaded", lambda: True)
     with caplog.at_level("WARNING"):
         we._release_mlx_model_cache()
 

@@ -1,0 +1,189 @@
+"""Regression: a launch that failed, a crash and a Quit all left no trace.
+
+Otis.app runs ``run.sh`` with stdout/stderr sent to /dev/null, main() had no
+excepthook, and the entry-point logger was named ``otis`` — outside the
+``src`` hierarchy that _configure_logging sets to INFO — so "Logging to",
+"Loaded config" and "Web UI listening" appeared 0 times across 36 real
+launches. A menu Quit runs NSApp.terminate_, which calls exit() without
+running ``finally`` blocks or atexit, so nothing marked it either. On
+2026-10-21 the process simply stopped logging at 13:42; whether the user quit
+or it died could not be told from the log.
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import threading
+from pathlib import Path
+
+import pytest
+
+import src.main as main_mod
+
+REPO = Path(__file__).resolve().parent.parent
+
+
+@pytest.fixture
+def log_dir(tmp_path: Path, monkeypatch) -> Path:
+    monkeypatch.setattr(main_mod, "LOG_DIR", tmp_path)
+    # main() installs process-wide hooks; put the originals back afterwards.
+    monkeypatch.setattr(sys, "excepthook", sys.excepthook)
+    monkeypatch.setattr(threading, "excepthook", threading.excepthook)
+    return tmp_path
+
+
+def _log_text(log_dir: Path) -> str:
+    return (log_dir / "otis.log").read_text(encoding="utf-8")
+
+
+def test_entrypoint_info_lines_reach_the_log_file(log_dir: Path) -> None:
+    main_mod._configure_logging("INFO")
+    main_mod.logger.info("entrypoint marker")
+    assert "entrypoint marker" in _log_text(log_dir)
+
+
+def test_every_line_carries_the_pid(log_dir: Path) -> None:
+    """Concurrent copies interleave in one file; only a pid separates them."""
+    main_mod._configure_logging("INFO")
+    main_mod.logger.warning("pid marker")
+    line = next(ln for ln in _log_text(log_dir).splitlines() if "pid marker" in ln)
+    assert f" {os.getpid()} " in line
+
+
+def test_a_launch_is_marked_with_pid_and_command(log_dir: Path, monkeypatch) -> None:
+    monkeypatch.setattr(main_mod, "_run_menubar", lambda cfg, **kw: 0)
+    assert main_mod.main(["ui"]) == 0
+    text = _log_text(log_dir)
+    assert "Otis starting" in text
+    assert f"pid={os.getpid()}" in text
+    assert "command=ui" in text
+
+
+def test_an_exception_escaping_startup_is_logged(log_dir: Path, monkeypatch) -> None:
+    def boom(cfg, **kw):
+        raise RuntimeError("menu bar construction exploded")
+
+    monkeypatch.setattr(main_mod, "_run_menubar", boom)
+    with pytest.raises(RuntimeError):
+        main_mod.main(["ui"])
+    text = _log_text(log_dir)
+    assert "failed to start" in text
+    assert "menu bar construction exploded" in text
+    assert "Traceback" in text
+
+
+def test_an_uncaught_thread_exception_is_logged(log_dir: Path, monkeypatch) -> None:
+    monkeypatch.setattr(main_mod, "_run_menubar", lambda cfg, **kw: 0)
+    main_mod.main(["ui"])
+
+    def worker() -> None:
+        raise ValueError("worker thread died")
+
+    t = threading.Thread(target=worker, name="otis-test-worker")
+    t.start()
+    t.join()
+    text = _log_text(log_dir)
+    assert "worker thread died" in text
+    assert "otis-test-worker" in text
+
+
+def test_releasing_model_memory_never_imports_mlx_whisper(monkeypatch) -> None:
+    """Quit/shutdown called the release path, which imported mlx-whisper
+    (with scipy and numba) just to clear a model that was never loaded:
+    2.6 s measured, on every shutdown of a session with no transcription."""
+    import src.transcription.whisper_engine as we
+
+    imported: list[bool] = []
+    monkeypatch.delitem(sys.modules, "mlx_whisper.transcribe", raising=False)
+    monkeypatch.setattr(we, "_import_model_holder", lambda: imported.append(True))
+    we._release_mlx_model_cache()
+    assert imported == []
+
+
+# ---------------------------------------------------------------------------
+# Quit
+# ---------------------------------------------------------------------------
+def _headless_app(tmp_path: Path, detector):
+    rumps = pytest.importorskip("rumps")
+    from src.config import Config
+    from src.health import HealthRegistry
+    from src.ui.menubar import MenuBarApp
+    from src.ui.notifications import NotificationManager
+
+    class NoLoopApp(rumps.App):
+        def run(self, **kwargs):  # the real one blocks until Quit
+            return None
+
+    return MenuBarApp(
+        config=Config({"app": {"working_days": []}}),
+        detector=detector,
+        recorder_factory=lambda _c: None,
+        notifications=NotificationManager(backend=lambda t, s, m: None),
+        icons_dir=tmp_path / "icons",
+        user_config_path=tmp_path / "config.yaml",
+        health=HealthRegistry(),
+        rumps_app_factory=NoLoopApp,
+    )
+
+
+class _Detector:
+    def __init__(self) -> None:
+        self.calendar_pollers: list = []
+        self.stopped = 0
+
+    def __getattr__(self, name):  # on_meeting_* registration etc.
+        return lambda *a, **k: None
+
+    def stop(self) -> None:
+        self.stopped += 1
+
+
+def test_quit_is_logged_and_stops_detection(tmp_path: Path, log_dir: Path) -> None:
+    import rumps
+
+    detector = _Detector()
+    app = _headless_app(tmp_path, detector)
+    main_mod._configure_logging("INFO")
+    app.run()
+    try:
+        assert app._on_before_quit in rumps.events.before_quit.callbacks
+        app._on_before_quit()
+    finally:
+        rumps.events.before_quit.unregister(app._on_before_quit)
+    assert detector.stopped >= 1
+    assert "Otis quitting" in _log_text(log_dir)
+
+
+def test_quit_handler_survives_a_failing_step(tmp_path: Path, log_dir: Path) -> None:
+    """rumps swallows handler exceptions to stderr (/dev/null); a raise
+    must neither escape nor skip the log line."""
+    detector = _Detector()
+
+    def bad_stop() -> None:
+        raise RuntimeError("detector stop failed")
+
+    detector.stop = bad_stop  # type: ignore[method-assign]
+    app = _headless_app(tmp_path, detector)
+    main_mod._configure_logging("INFO")
+    app._on_before_quit()
+    assert "Otis quitting" in _log_text(log_dir)
+
+
+# ---------------------------------------------------------------------------
+# run.sh: what happens before Python logging exists
+# ---------------------------------------------------------------------------
+def test_run_sh_keeps_a_launch_log_when_not_on_a_terminal(tmp_path: Path) -> None:
+    env = {**os.environ, "HOME": str(tmp_path)}
+    proc = subprocess.run(
+        ["bash", str(REPO / "scripts" / "run.sh"), "--help"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        env=env, timeout=60,
+    )
+    assert proc.returncode == 0
+    launch_log = tmp_path / ".otis" / "launch.log"
+    assert launch_log.exists(), "the applet discards output; run.sh must keep it"
+    text = launch_log.read_text(encoding="utf-8")
+    assert "Otis launching" in text
+    assert "usage: otis" in text  # python's own output lands there too

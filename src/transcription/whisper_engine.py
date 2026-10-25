@@ -28,6 +28,7 @@ parameter so unit tests can run without the framework installed.
 from __future__ import annotations
 
 import logging
+import sys
 import threading
 import time
 import wave
@@ -620,7 +621,13 @@ def _release_mlx_model_cache() -> None:
 
     Only call while no transcription is in flight: an active run keeps its
     own reference to the model (safe), but the next run would reload it.
+
+    If mlx-whisper was never imported, no model was ever loaded and there is
+    nothing to release. Importing it anyway (it pulls in scipy and numba) cost
+    2.6 s on every shutdown of a session that transcribed nothing.
     """
+    if not _mlx_whisper_loaded():
+        return
     try:
         holder = _import_model_holder()
     except Exception:
@@ -643,6 +650,10 @@ def _release_mlx_model_cache() -> None:
         mx.clear_cache()
     except Exception:  # pragma: no cover (older mlx / mlx absent)
         logger.debug("mx.clear_cache unavailable", exc_info=True)
+
+
+def _mlx_whisper_loaded() -> bool:
+    return "mlx_whisper.transcribe" in sys.modules
 
 
 def _import_model_holder() -> Any:

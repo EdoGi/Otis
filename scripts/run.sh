@@ -9,6 +9,20 @@
 
 set -euo pipefail
 
+# Otis.app runs this script with stdout and stderr sent to /dev/null, so a
+# launch that dies before Python logging starts — no venv, an import error, a
+# native crash — used to leave nothing anywhere. Off a terminal, keep that
+# output in ~/.otis/launch.log (rotated at 1 MB); on a terminal, leave it be.
+if [[ ! -t 2 ]]; then
+    LAUNCH_LOG="${HOME}/.otis/launch.log"
+    mkdir -p "${HOME}/.otis"
+    if [[ -f "${LAUNCH_LOG}" ]] && (( $(stat -f %z "${LAUNCH_LOG}") > 1000000 )); then
+        mv -f "${LAUNCH_LOG}" "${LAUNCH_LOG}.1"
+    fi
+    exec >>"${LAUNCH_LOG}" 2>&1
+    echo "------ Otis launching $(date '+%Y-%m-%d %H:%M:%S') pid=$$ args: $* ------"
+fi
+
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "${PROJECT_ROOT}"
 
