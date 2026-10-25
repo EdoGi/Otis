@@ -147,6 +147,12 @@ class _StreamState:
     stalled: bool = False
     #: Rebuilds the capture callback when the input stream has to be recreated.
     make_callback: Any = None
+    #: Capture time of the most recent block, on the same clock as
+    #: start_monotonic. Two streams that ran to the end stop within a block
+    #: of each other; one that died early (a headset off before Stop) does not.
+    last_capture_monotonic: float | None = None
+    #: Stalls and rebuilds — gaps in this stream the byte count cannot place.
+    interruptions: int = 0
 
 
 class DualStreamRecorder:
@@ -618,8 +624,10 @@ class DualStreamRecorder:
                 return  # paused — drop frames
             # Stamp the alignment anchor here, from the hardware capture time
             # of this block's first sample. See _capture_timestamp.
+            stamp = _capture_timestamp(time_info)
             if st.start_monotonic is None:
-                st.start_monotonic = _capture_timestamp(time_info)
+                st.start_monotonic = stamp
+            st.last_capture_monotonic = stamp
             # Measure before queueing: this is the only place the samples are
             # seen live, and it's how a dead stream gets caught during the call
             # instead of after transcription two months later.
@@ -732,6 +740,7 @@ class DualStreamRecorder:
             if stalled_for < STREAM_STALL_SECONDS or st.stalled:
                 continue
             st.stalled = True
+            st.interruptions += 1
             logger.error(
                 "[%s] no audio for %.0fs — the capture device has stopped "
                 "delivering.", st.label, stalled_for,
@@ -827,6 +836,7 @@ class DualStreamRecorder:
                     pass
             return False
         st.last_progress_monotonic = time.monotonic()
+        st.interruptions += 1
         logger.info("[%s] capture stream rebuilt.", st.label)
         return True
 
@@ -976,6 +986,12 @@ class DualStreamRecorder:
             "system_wav": sys_st.wav_path.name if sys_st else None,
             "mic_bytes": self._mic_state.bytes_written,
             "system_bytes": sys_st.bytes_written if sys_st else 0,
+            # What the processor needs to tell clock drift from a stream that
+            # ended early or had a gap (see processor.drift_is_measurable).
+            "mic_last_capture_monotonic": self._mic_state.last_capture_monotonic,
+            "system_last_capture_monotonic": sys_st.last_capture_monotonic if sys_st else None,
+            "mic_gaps": self._mic_state.interruptions + self._mic_state.dropped_blocks,
+            "system_gaps": (sys_st.interruptions + sys_st.dropped_blocks) if sys_st else 0,
         }
         meta_path = self._audio_dir / f"{self._session_id}_metadata.json"
         meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")

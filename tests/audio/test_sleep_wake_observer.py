@@ -148,7 +148,8 @@ class _FakeStream:
 def _stream_state(stream):
     from types import SimpleNamespace
 
-    return SimpleNamespace(label="mic", stream=stream, last_progress_monotonic=0.0)
+    return SimpleNamespace(label="mic", stream=stream, last_progress_monotonic=0.0,
+                           interruptions=0)
 
 
 def test_a_rebuild_overlapping_stop_closes_the_stream_it_opened(tmp_path: Path, monkeypatch) -> None:
@@ -197,3 +198,32 @@ def test_no_rebuild_once_the_recording_has_stopped(tmp_path: Path, monkeypatch) 
     st = _stream_state(None)
     assert rec._revive_stream(st) is False
     assert opened == []
+
+
+
+def test_the_attach_waits_for_a_stop_holding_the_state_lock(tmp_path: Path, monkeypatch) -> None:
+    """Threaded: a stop() that holds _state_lock across the attach must win.
+    The single-threaded tests above pass even with the lock removed (review)."""
+    from src.audio.recorder import RecorderState
+
+    rec = DualStreamRecorder(audio_dir=tmp_path, observe_sleep_wake=False)
+    rec._state = RecorderState.RECORDING
+    new = _FakeStream()
+    st = _stream_state(_FakeStream())
+    holding = threading.Event()
+
+    def stop_in_progress() -> None:
+        with rec._state_lock:
+            holding.set()
+            time.sleep(0.2)
+            rec._state = RecorderState.STOPPING
+
+    def open_slowly(_st, sd=None):
+        threading.Thread(target=stop_in_progress).start()
+        holding.wait(2.0)
+        return new
+
+    monkeypatch.setattr(rec, "_open_input_stream", open_slowly)
+    assert rec._revive_stream(st) is False
+    assert new.calls == ["stop", "close"]
+    assert st.stream is None

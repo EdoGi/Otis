@@ -84,7 +84,9 @@ def _make_wav(path: Path) -> None:
         wf.writeframes(frames)
 
 
-def _session(tmp_path: Path, *, mic_seconds: float, sys_seconds: float) -> RecordingSession:
+def _session(tmp_path: Path, *, mic_seconds: float, sys_seconds: float,
+             mic_end: float | None = 5520.0, sys_end: float | None = 5520.1,
+             gaps: int = 0) -> RecordingSession:
     sid = "d41f0000-0000-0000-0000-000000000000"
     audio = tmp_path / "audio"
     audio.mkdir()
@@ -96,6 +98,8 @@ def _session(tmp_path: Path, *, mic_seconds: float, sys_seconds: float) -> Recor
         "start_wall_clock": "2026-10-21T08:09:56+00:00", "pauses": [], "sample_rate": 16000,
         "channels": 1, "mic_wav": mic.name, "system_wav": sysw.name,
         "mic_bytes": int(mic_seconds * BPS), "system_bytes": int(sys_seconds * BPS),
+        "mic_last_capture_monotonic": mic_end, "system_last_capture_monotonic": sys_end,
+        "mic_gaps": gaps, "system_gaps": 0,
     }))
     return RecordingSession(
         session_id=sid, audio_dir=audio, mic_wav=mic, system_wav=sysw, metadata_path=meta,
@@ -128,3 +132,38 @@ def test_an_echo_late_in_a_drifting_meeting_is_still_deduplicated(tmp_path: Path
     result = processor.process(session, meeting=MeetingSnapshot(), language="fr")
     assert result.echo_dropped == 1, "uncorrected, the copies sat 1.9 s apart"
     assert f"Me: {words}" not in result.body
+
+
+
+# ---------------------------------------------------------------------------
+# Not every length mismatch is drift (review of 8859102)
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("meta, measurable", [
+    ({"mic_last_capture_monotonic": 100.0, "system_last_capture_monotonic": 100.2,
+      "mic_gaps": 0, "system_gaps": 0}, True),
+    # A headset that died 5 s before Stop: the mic ended early, not drifted.
+    ({"mic_last_capture_monotonic": 95.0, "system_last_capture_monotonic": 100.0,
+      "mic_gaps": 0, "system_gaps": 0}, False),
+    # A stall, a rebuild or dropped blocks: a gap the totals cannot place.
+    ({"mic_last_capture_monotonic": 100.0, "system_last_capture_monotonic": 100.0,
+      "mic_gaps": 1, "system_gaps": 0}, False),
+    # Older recordings carry none of this: leave them alone.
+    ({}, False),
+])
+def test_drift_is_only_measured_when_both_streams_ran_to_the_end(meta, measurable) -> None:
+    from src.transcription.processor import drift_is_measurable
+
+    assert drift_is_measurable(meta) is measurable
+
+
+def test_a_stream_that_ended_early_is_not_stretched(tmp_path: Path) -> None:
+    words = "on se retrouve jeudi pour valider le planning"
+    session = _session(tmp_path, mic_seconds=4515.0, sys_seconds=4519.96,
+                       mic_end=5515.0, sys_end=5520.0)  # mic stopped 5 s early
+    processor = TranscriptProcessor(
+        engine=_engine(mic=[(1000.0, 1002.0, "bonjour")], system=[(1000.0, 1002.0, words)]),
+        store=TranscriptStore(tmp_path / "transcripts"), audio_dir=session.audio_dir,
+    )
+    result = processor.process(session, meeting=MeetingSnapshot(), language="fr")
+    # Uncorrected: 1000 s + the 0.04 s start offset, i.e. [16:40].
+    assert "[16:40]" in result.body and "[16:38]" not in result.body

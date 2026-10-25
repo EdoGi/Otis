@@ -68,6 +68,12 @@ ECHO_TIME_WINDOW_SECONDS = 1.0
 #: and stretching across it would misalign more than it fixes.
 DRIFT_MIN_SECONDS = 0.25
 DRIFT_MAX_RATIO = 0.002
+
+#: The byte totals only measure drift if both streams captured until the
+#: teardown barrier: their last blocks within this of each other, and no
+#: stall, rebuild or dropped block in either. A headset that died 5 s before
+#: Stop reads, from the totals alone, as -1400 ppm of "drift".
+DRIFT_END_TOLERANCE_SECONDS = 0.5
 ECHO_WORD_OVERLAP_THRESHOLD = 0.80
 
 #: Ceiling on one afconvert compression. A 2-hour stream encodes in ~1 s.
@@ -307,7 +313,7 @@ class TranscriptProcessor:
         scale = compute_drift_scale(
             merged_meta.get("mic_bytes"), merged_meta.get("system_bytes"),
             offset, bytes_per_second,
-        )
+        ) if drift_is_measurable(merged_meta) else 1.0
         if scale != 1.0:
             logger.info(
                 "Session %s: correcting %+.0f ppm of mic/system clock drift "
@@ -711,6 +717,22 @@ def _compute_offset(mic_anchor: float | None, sys_anchor: float | None) -> float
     return float(sys_anchor) - float(mic_anchor)
 
 
+def drift_is_measurable(meta: dict[str, Any]) -> bool:
+    """True only when the recorder says both streams ran to the end, gap-free.
+
+    Recordings made before these fields existed are left uncorrected.
+    """
+    mic_end = meta.get("mic_last_capture_monotonic")
+    sys_end = meta.get("system_last_capture_monotonic")
+    if not isinstance(mic_end, (int, float)) or not isinstance(sys_end, (int, float)):
+        return False
+    if abs(mic_end - sys_end) > DRIFT_END_TOLERANCE_SECONDS:
+        return False
+    if "mic_gaps" not in meta or "system_gaps" not in meta:
+        return False
+    return not (meta.get("mic_gaps") or meta.get("system_gaps"))
+
+
 def compute_drift_scale(
     mic_bytes: Any, system_bytes: Any, offset: float, bytes_per_second: float,
 ) -> float:
@@ -994,6 +1016,7 @@ __all__ = [
     "apply_offset",
     "compute_drift_scale",
     "deduplicate_echo",
+    "drift_is_measurable",
     "interleave_with_overlaps",
     "render_markdown_body",
     "slugify",
