@@ -82,7 +82,6 @@ def ensure_icons(
     )
 
     if src is not None and src.exists():
-        logger.info("Generating icons from %s", src)
         return _ensure_from_source(src, icons_dir, force=force)
 
     logger.info("OtisIcon.png not found; using programmatic icons.")
@@ -111,27 +110,35 @@ def _ensure_from_source(
     *,
     force: bool,
 ) -> dict[str, Path]:
+    out = {state: icons_dir / f"{state}.png" for state in _STATE_BADGE_COLORS}
+    todo = [
+        (state, badge, size)
+        for state, badge in _STATE_BADGE_COLORS.items()
+        for size in ICON_SIZES
+        if force or not (icons_dir / _icon_filename(state, size)).exists()
+    ]
+    if not todo:
+        # The usual launch: every icon is on disk. This used to decode the
+        # 512 KB source anyway and log "Generating icons" on all 36 launches,
+        # although the files had not been rewritten since May.
+        return out
+
     from PIL import Image
 
+    logger.info("Generating %d icon(s) from %s", len(todo), source_path)
     base = Image.open(source_path).convert("RGBA")
-    out: dict[str, Path] = {}
-
-    for state, badge in _STATE_BADGE_COLORS.items():
-        for size in ICON_SIZES:
-            target = icons_dir / _icon_filename(state, size)
-            if target.exists() and not force:
-                continue
-            icon = base.resize((size, size), Image.Resampling.LANCZOS)
-            if badge is not None:
-                _draw_corner_badge(icon, badge, size)
-            elif state == "idle":
-                # Slightly fade the idle icon so an active state's full-saturation
-                # version visibly pops.
-                icon = _fade(icon, alpha_scale=0.85)
-            elif state == "off_hours":
-                icon = _grayscale(icon, alpha_scale=0.55)
-            icon.save(target, "PNG")
-        out[state] = icons_dir / f"{state}.png"
+    for state, badge, size in todo:
+        target = icons_dir / _icon_filename(state, size)
+        icon = base.resize((size, size), Image.Resampling.LANCZOS)
+        if badge is not None:
+            _draw_corner_badge(icon, badge, size)
+        elif state == "idle":
+            # Slightly fade the idle icon so an active state's full-saturation
+            # version visibly pops.
+            icon = _fade(icon, alpha_scale=0.85)
+        elif state == "off_hours":
+            icon = _grayscale(icon, alpha_scale=0.55)
+        icon.save(target, "PNG")
 
     logger.debug("Avatar icons ready: %s", sorted(out.keys()))
     return out

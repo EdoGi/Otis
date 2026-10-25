@@ -604,12 +604,14 @@ class TranscriptProcessor:
         try:
             dst.parent.mkdir(parents=True, exist_ok=True)
             if dst.suffix.lower() != src.suffix.lower():
+                # Measured before the encode: the source is deleted below, and
+                # reading it afterwards logged every archive as "0.0 MB ->".
+                src_mb = _size_mb(src)
                 if encode_audio(src, dst):
                     src.unlink(missing_ok=True)
                     logger.info(
                         "Archived %s -> %s (%.1f MB -> %.1f MB)",
-                        src.name, dst.name,
-                        _size_mb(src), _size_mb(dst),
+                        src.name, dst.name, src_mb, _size_mb(dst),
                     )
                     return str(dst.relative_to(self._audio_dir))
                 # Compression failed: keep the audio as-is under its own name.
