@@ -191,7 +191,11 @@ def test_start_periodic_double_call_does_not_leak_timers(tmp_path: Path) -> None
     second_timer = rm._timer
     try:
         assert first_timer is not second_timer, "second start should create a fresh timer"
-        # The first timer must be cancelled (not is_alive) so it doesn't leak.
+        # The first timer must be cancelled so it doesn't leak. cancel() only
+        # sets its event; the thread needs a moment to wake and exit, and on a
+        # loaded machine an immediate is_alive() check failed (seen in a full
+        # gate run, 2026-10-25). Waiting for it is the actual claim.
+        first_timer.join(timeout=2.0)
         assert not first_timer.is_alive(), "first timer should have been cancelled"
         assert second_timer.is_alive()
     finally:
