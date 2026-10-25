@@ -426,6 +426,21 @@ class GoogleCalendarPoller:
             detail="offline — will retry",
         )
 
+    def report_credentials_offline(self) -> bool:
+        """Say whether this account can poll, without asking Google anything.
+
+        Calendar health used to come only from the poll loop, which runs only
+        in working hours — so a launch on a Sunday or before 08:00 showed no
+        calendar row and no 'Reconnect Calendar…', even with the token gone.
+        A missing token file is reported exactly as the poll loop would report
+        it. A present one is left unreported: whether it still works needs a
+        request, and that waits for the window to open.
+        """
+        if self._token_path.exists():
+            return True
+        self._announce_auth_failure(f"No OAuth token at {self._token_path}")
+        return False
+
     def notify_auth_recovered(self) -> None:
         """Clear the failure streak so a future break is announced again."""
         from src.health import HealthState, get_health

@@ -285,6 +285,13 @@ class MenuBarApp(SettingsMenuMixin):
         else:
             logger.info("Launched outside working hours; detection paused.")
             self._set_state(UiState.OFF_HOURS)
+            # The pollers stay stopped, but a missing token is still news: say
+            # so now rather than at the first working-hours poll.
+            for poller in getattr(self._detector, "calendar_pollers", ()) or ():
+                try:
+                    poller.report_credentials_offline()
+                except Exception:
+                    logger.exception("Offline calendar credential check raised")
 
         # A menu Quit (and a logout) ends in NSApp.terminate_, which calls
         # exit(): the finally below never runs. applicationWillTerminate_
