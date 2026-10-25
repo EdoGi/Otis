@@ -244,6 +244,11 @@ class MenuBarApp(HealthPanelMixin, SettingsMenuMixin):
         # they never overwrite a row's reason (see _refresh_level_meters).
         self._live_meters: dict[str, str] = {}
         self._begin_recording_toasts()
+        # The routing verdict when the current recording started (set by the
+        # start worker), and whether a user-initiated check is running; both
+        # read by the per-recording toast cap.
+        self._route_at_recording_start: Any = None
+        self._user_check_in_progress = False
         self._health_rows_shown: list[str] = []
         self._health_items: list[Any] = []
         self._meter_items: dict[str, Any] = {}
@@ -1328,8 +1333,11 @@ class MenuBarApp(HealthPanelMixin, SettingsMenuMixin):
         # the moment they connect — and it used to be checked only at launch.
         # Re-check now, *before* capture, so the stream's first audible block
         # (which reports the row OK) always has the last word.
+        self._route_at_recording_start = None
         try:
-            self._report_audio_routing(self._check_routing())
+            status = self._check_routing()
+            self._route_at_recording_start = status.state
+            self._report_audio_routing(status)
         except Exception:
             logger.exception("Routing check at recording start raised")
         try:

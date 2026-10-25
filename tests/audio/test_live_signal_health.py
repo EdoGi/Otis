@@ -102,3 +102,34 @@ def test_force_notify_fires_on_an_unchanged_state() -> None:
     assert seen == [HealthState.FAIL]
     reg.report("x", label="X", state=HealthState.FAIL, force_notify=True)
     assert seen == [HealthState.FAIL, HealthState.FAIL]
+
+
+def test_ten_minutes_of_silence_is_reported_again_and_forced(tmp_path: Path) -> None:
+    """The first report can be a quiet far side, which the UI caps per
+    recording; a stream silent for ten minutes straight is reported once more
+    and forced through, so a stream that died later in a call still alerts."""
+    from src.audio.levels import LevelMonitor
+
+    clock = [0.0]
+    fired: list[float] = []
+    m = LevelMonitor("system", clock=lambda: clock[0], silence_seconds=60.0,
+                     long_silence_seconds=600.0, on_silence=lambda _l, s: fired.append(s))
+    m.observe(0.05, 0.1)  # it had signal: an ordinary stream
+    for t in range(1, 700):
+        clock[0] = float(t)
+        m.observe(0.0, 1.0)
+    assert len(fired) == 2
+    assert fired[1] >= 600.0
+
+    seen = _notifications()
+    _startup_routing_fail()
+    rec = DualStreamRecorder(audio_dir=tmp_path, observe_sleep_wake=False)
+    meter = rec._make_meter("system")
+    meter.long_silence_seconds = 0.0  # make the second tier immediate
+    rec_seen_before = len(seen)
+    meter.observe(0.05, 0.1)          # heard: row OK
+    rec._silence_alert_seconds = 0.0
+    meter._silence_seconds = 0.0
+    meter.observe(0.0, 0.1)           # first tier: OK -> FAIL (normal)
+    meter.observe(0.0, 0.1)           # second tier: FAIL -> FAIL, forced
+    assert seen[rec_seen_before:][-1] == (HealthState.FAIL, HealthState.FAIL)

@@ -54,6 +54,8 @@ class HealthPanelMixin:
         _events: queue.Queue[tuple[str, Any]]
         _recorder: Any
         _routing_check: Callable[[], Any] | None
+        _route_at_recording_start: Any
+        _user_check_in_progress: bool
         _live_meters: dict[str, str]
         _health_rows_shown: list[str]
         _health_items: list[Any]
@@ -156,7 +158,7 @@ class HealthPanelMixin:
         # perfectly healthy startup had just "recovered".
         if previous is HealthState.UNSET and report.state is HealthState.OK:
             return
-        if self._stream_toast_capped(report):
+        if self._stream_toast_capped(report, previous):
             return
 
         if report.state in (HealthState.WARN, HealthState.FAIL):
@@ -180,19 +182,28 @@ class HealthPanelMixin:
     def _begin_recording_toasts(self) -> None:
         self._stream_toasts: dict[str, set[str]] = {}
 
-    def _stream_toast_capped(self, report: HealthReport) -> bool:
+    def _stream_toast_capped(self, report: HealthReport, previous: HealthState) -> bool:
         """At most one "problem" and one "recovered" toast per stream per recording.
 
         The system stream is flagged after 60 s of digital silence — what a
         muted far side sounds like — and every flip raised a toast with a
         sound: 12 in 21 minutes on 2026-09-24, each time recovering on its own.
-        The panel still shows every change. A silence while the Mac's output
-        no longer feeds BlackHole (earbuds connected mid-call) is real news and
-        is never capped.
+        The panel still shows every change. Never capped:
+
+        * a route lost *during* the recording (OK when it started, not routed
+          now: earbuds connected mid-call). Not a route that was "not routed"
+          all along — this user's default output is the speakers while the
+          meeting app plays into the Otis device, so a live check says
+          NOT_ROUTED in every meeting, and exempting that capped nothing;
+        * a deliberate repeat of the same state (force_notify: silence since
+          the first block, or ten minutes of it);
+        * anything raised while the user is running Fix System Audio….
         """
         if report.key not in (SYSTEM_AUDIO, MICROPHONE):
             return False
         if self._snapshot.state not in (UiState.RECORDING, UiState.PAUSED):
+            return False
+        if self._user_check_in_progress or previous is report.state:
             return False
         if report.state in (HealthState.WARN, HealthState.FAIL):
             kind = "problem"
@@ -200,15 +211,8 @@ class HealthPanelMixin:
             kind = "recovered"
         else:
             return False
-        if kind == "problem" and report.key == SYSTEM_AUDIO:
-            from src.audio.blackhole_check import RoutingState
-
-            try:
-                route = self._check_routing().state
-            except Exception:
-                route = RoutingState.UNKNOWN
-            if route in (RoutingState.NOT_ROUTED, RoutingState.INAUDIBLE):
-                return False
+        if kind == "problem" and report.key == SYSTEM_AUDIO and self._route_lost_mid_recording():
+            return False
         shown = self._stream_toasts.setdefault(report.key, set())
         if kind in shown:
             logger.info("%s %s toast skipped: already shown this recording.",
@@ -216,6 +220,17 @@ class HealthPanelMixin:
             return True
         shown.add(kind)
         return False
+
+    def _route_lost_mid_recording(self) -> bool:
+        from src.audio.blackhole_check import RoutingState
+
+        if self._route_at_recording_start is not RoutingState.OK:
+            return False
+        try:
+            return bool(self._check_routing().state is RoutingState.NOT_ROUTED)
+        except Exception:
+            logger.exception("Routing check for a mid-call silence raised")
+            return False
 
     def _refresh_health_menu(self) -> None:
         """Render the Status submenu: one row per component, then live meters.
@@ -339,11 +354,17 @@ class HealthPanelMixin:
 
         status = self._check_routing()
         before = self._health.get(SYSTEM_AUDIO)
-        self._report_audio_routing(status)
-        after = self._health.get(SYSTEM_AUDIO)
-        # Repaint now rather than on the next 100 ms tick. A state change
-        # also raises its own "problem"/"recovered" toast in the drain.
-        self._drain_main_queue(None)
+        # A click always gets an answer: nothing raised by this check counts
+        # against a recording's toast allowance.
+        self._user_check_in_progress = True
+        try:
+            self._report_audio_routing(status)
+            after = self._health.get(SYSTEM_AUDIO)
+            # Repaint now rather than on the next 100 ms tick. A state change
+            # also raises its own "problem"/"recovered" toast in the drain.
+            self._drain_main_queue(None)
+        finally:
+            self._user_check_in_progress = False
 
         toasted_by_registry = (
             after is not None

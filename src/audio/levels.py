@@ -33,6 +33,11 @@ SILENCE_RMS_THRESHOLD = 1e-4
 #: survive a quiet moment in a meeting, short enough to catch it during the call.
 DEFAULT_SILENCE_SECONDS = 60.0
 
+#: A flagged stream that stays silent this long is reported once more. The
+#: first report (at DEFAULT_SILENCE_SECONDS) can be a quiet far side; ten
+#: minutes of nothing in a meeting rarely is, and the UI caps the first kind.
+LONG_SILENCE_SECONDS = 600.0
+
 #: Exponential smoothing applied to the displayed meter (0 = frozen, 1 = raw).
 _METER_SMOOTHING = 0.3
 
@@ -51,6 +56,7 @@ class LevelMonitor:
         on_signal: Callable[[str], None] | None = None,
         on_first_signal: Callable[[str], None] | None = None,
         gap_tolerance_seconds: float = 2.0,
+        long_silence_seconds: float = LONG_SILENCE_SECONDS,
     ) -> None:
         self.label = label
         self._threshold = float(silence_threshold)
@@ -63,6 +69,8 @@ class LevelMonitor:
         # on the first audible block, so a caller can say the stream works.
         self._on_first_signal = on_first_signal
         self._heard = False
+        self.long_silence_seconds = float(long_silence_seconds)
+        self._long_flagged = False
         # A gap between observations longer than this means capture stopped
         # (pause, sleep) rather than the stream going quiet.
         self._gap_tolerance = float(gap_tolerance_seconds)
@@ -114,12 +122,17 @@ class LevelMonitor:
                     fire_signal = True
                 self._silent_since = None
                 self._flagged = False
+                self._long_flagged = False
             else:
                 if self._silent_since is None:
                     self._silent_since = now
                 silent_for = now - self._silent_since
                 if not self._flagged and silent_for >= self._silence_seconds:
                     self._flagged = True
+                    fire_silence = True
+                elif (self._flagged and not self._long_flagged
+                      and silent_for >= self.long_silence_seconds):
+                    self._long_flagged = True
                     fire_silence = True
 
         # Callbacks fire outside the lock — they end up in the health registry,

@@ -547,15 +547,16 @@ class DualStreamRecorder:
                 stream_label, seconds,
             )
             # Nothing captured since the first block is the lost-far-side
-            # case. If the row is already FAIL (from launch) the registry
-            # would treat this as "no change" and stay silent, so force it.
-            # A pause after real audio is not forced: far-side pauses are
-            # ordinary.
+            # case, and so is ten minutes of nothing (LevelMonitor's second
+            # report in one stretch). If the row is already FAIL the registry
+            # would treat either as "no change" and stay silent, so force it.
+            # An ordinary pause after real audio is not forced.
             report_stream_health(
                 stream_label,
                 silent=True,
                 detail=f"no signal for {int(seconds)}s",
-                force_notify=not meter.has_heard_signal,
+                force_notify=(not meter.has_heard_signal
+                              or seconds >= meter.long_silence_seconds),
             )
 
         def on_signal(stream_label: str) -> None:
