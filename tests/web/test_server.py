@@ -189,3 +189,23 @@ def test_page_title_is_escaped_exactly_once(tmp_path: Path) -> None:
     text = create_app(store).test_client().get("/transcript/amp-1").get_data(as_text=True)
     assert "<title>Q&amp;A — &lt;sync&gt; — Otis</title>" in text
     assert "&amp;amp;" not in text
+
+
+# ---------------------------------------------------------------------------
+# DNS rebinding: localhost binding is not enough on its own
+# ---------------------------------------------------------------------------
+def test_a_foreign_host_header_is_refused(tmp_path) -> None:
+    """Bound to 127.0.0.1, the server still answered any Host — so a web page
+    that re-points its own domain at 127.0.0.1 (DNS rebinding) could read
+    every transcript through the visitor's browser. Measured on a real
+    werkzeug socket: Host: evil.example.com:8765 got 200 and the full body."""
+    client = create_app(TranscriptStore(tmp_path / "t")).test_client()
+    assert client.get("/", headers={"Host": "evil.example.com:8765"}).status_code == 400
+    assert client.get("/", headers={"Host": "127.0.0.1:8765"}).status_code == 200
+    assert client.get("/", headers={"Host": "localhost:8765"}).status_code == 200
+
+
+def test_a_lan_bind_accepts_any_host(tmp_path) -> None:
+    """web.host: 0.0.0.0 is an explicit choice to serve the LAN by address."""
+    client = create_app(TranscriptStore(tmp_path / "t"), trusted_hosts=None).test_client()
+    assert client.get("/", headers={"Host": "192.168.1.20:8765"}).status_code == 200

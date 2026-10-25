@@ -199,13 +199,43 @@ _PLAYABLE_SUFFIXES = {".wav": "audio/wav", ".flac": "audio/flac",
                       ".m4a": "audio/mp4", ".mp3": "audio/mpeg"}
 
 
+#: Host headers the localhost-bound UI answers. Binding to 127.0.0.1 keeps
+#: other machines out but not other web pages: a site that re-points its own
+#: domain at 127.0.0.1 (DNS rebinding) reaches this server through the
+#: visitor's browser with its own name in Host. Checking Host closes that.
+LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+_WILDCARD_BINDS = {"0.0.0.0", "::", ""}
+
+
+def trusted_hosts_for(bind_host: str) -> tuple[str, ...] | None:
+    """Hosts to accept for a bind address; None (accept any) for a LAN bind."""
+    if bind_host in _WILDCARD_BINDS:
+        return None
+    return tuple(dict.fromkeys((*LOCAL_HOSTS, bind_host)))
+
+
 def create_app(
     store: TranscriptStore, audio_dir: str | Path | None = None,
+    *, trusted_hosts: tuple[str, ...] | None = LOCAL_HOSTS,
 ) -> Flask:
     from flask import Flask, abort, render_template_string, request, send_file
 
     app = Flask("otis-web")
     root = Path(audio_dir).expanduser().resolve() if audio_dir else None
+
+    if trusted_hosts is not None:
+        allowed = {h.lower() for h in trusted_hosts}
+
+        @app.before_request
+        def refuse_foreign_hosts() -> None:
+            host = (request.host or "").lower()
+            if host.startswith("["):  # [::1]:8765
+                name = host[1:].split("]", 1)[0]
+            else:
+                name = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+            if name not in allowed:
+                abort(400)
 
     def audio_path(fm: dict[str, Any], stream: str) -> Path | None:
         """Resolve a transcript's audio, refusing anything outside audio_dir."""
@@ -464,8 +494,11 @@ def serve_in_background(
         # threaded=True is essential: the default single-threaded server
         # services one connection at a time, so a browser's idle preconnect
         # socket (no request bytes) would block every real request behind it.
-        server = make_server(host, port, create_app(store, audio_dir),
-                             threaded=True)
+        server = make_server(
+            host, port,
+            create_app(store, audio_dir, trusted_hosts=trusted_hosts_for(host)),
+            threaded=True,
+        )
     except SystemExit as exc:
         # werkzeug calls sys.exit(1) when the port is taken — re-raise as a
         # normal error so a busy port can't take down the menu-bar app.
@@ -490,7 +523,7 @@ def main() -> None:
     )
     host = str(cfg.get("web", "host", default="127.0.0.1"))
     port = int(cfg.get("web", "port", default=8765))
-    app = create_app(store)
+    app = create_app(store, trusted_hosts=trusted_hosts_for(host))
     print(f"Otis web UI: http://{host}:{port}  (Ctrl-C to stop)")
     app.run(host=host, port=port, use_reloader=False)
 
