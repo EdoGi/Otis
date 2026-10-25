@@ -196,15 +196,17 @@ class HealthPanelMixin:
           all along — this user's default output is the speakers while the
           meeting app plays into the Otis device, so a live check says
           NOT_ROUTED in every meeting, and exempting that capped nothing;
-        * a deliberate repeat of the same state (force_notify: silence since
-          the first block, or ten minutes of it);
+        * a forced report (force_notify: silence since the first block, or
+          ten minutes of it) — whatever the row showed before it. Guessing
+          "forced" from an unchanged state missed the case where a Fix click
+          had set the row OK in the middle of the silence (review round 2);
         * anything raised while the user is running Fix System Audio….
         """
         if report.key not in (SYSTEM_AUDIO, MICROPHONE):
             return False
         if self._snapshot.state not in (UiState.RECORDING, UiState.PAUSED):
             return False
-        if self._user_check_in_progress or previous is report.state:
+        if self._user_check_in_progress or report.forced:
             return False
         if report.state in (HealthState.WARN, HealthState.FAIL):
             kind = "problem"

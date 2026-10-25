@@ -102,6 +102,9 @@ class HealthReport:
     detail: str = ""
     hint: str | None = None
     updated_at: float = 0.0
+    #: Reported with force_notify: news even if the state did not change, and
+    #: never something a subscriber should de-duplicate away.
+    forced: bool = False
 
     @property
     def glyph(self) -> str:
@@ -161,6 +164,7 @@ class HealthRegistry:
             detail=detail,
             hint=hint,
             updated_at=self._clock(),
+            forced=force_notify,
         )
         # The dispatch lock wraps recording *and* notifying, so two threads
         # reporting A->B and B->C cannot deliver C before B and leave the panel

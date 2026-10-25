@@ -101,11 +101,13 @@ def test_a_quiet_far_side_toasts_once_each_way(tmp_path, registry, route) -> Non
     _start_recording(app)
     registry.report(SYSTEM_AUDIO, label="System audio", state=HealthState.OK, detail="signal ok")
     app._drain_main_queue(None)
-    sent_before = len(app._sent)
     _flip(app, registry, [HealthState.FAIL, HealthState.OK] * 6)
-    new = app._sent[sent_before:]
-    assert [t for t, _s, _m in new].count("System audio problem") == 1
-    assert [t for t, _s, _m in new].count("System audio recovered") <= 1
+    # Counted from 'Recording started': exactly one of each, whichever report
+    # spent the allowance (the first signal, for a route that started FAIL).
+    titles = [t for t, _s, _m in app._sent]
+    during = titles[titles.index("Recording started"):]
+    assert during.count("System audio problem") == 1
+    assert during.count("System audio recovered") == 1
     assert registry.get(SYSTEM_AUDIO).detail == "step 11", "the panel follows every change"
 
 
@@ -156,3 +158,17 @@ def test_each_recording_gets_its_own_allowance(tmp_path, registry) -> None:
     _start_recording(app)  # a new recorder_started resets the allowance
     _flip(app, registry, [HealthState.OK, HealthState.FAIL])
     assert _problems(app) == 2
+
+
+def test_a_forced_alert_after_a_fix_click_still_toasts(tmp_path, registry, monkeypatch) -> None:
+    """Review round 2: a Fix click set the row OK in the middle of a dead
+    stream, so the forced ten-minute report arrived as OK -> FAIL and was
+    capped like an ordinary second "problem"."""
+    app = _app(tmp_path, registry, [ROUTED])
+    monkeypatch.setattr(app, "_open_url", lambda url: None)
+    _start_recording(app)
+    _flip(app, registry, [HealthState.OK, HealthState.FAIL])  # first-tier: spends "problem"
+    app._on_fix_audio(None)                                    # row -> OK, stream still dead
+    start = _problems(app)
+    _flip(app, registry, [HealthState.FAIL], force=True)       # the ten-minute report
+    assert _problems(app) == start + 1
