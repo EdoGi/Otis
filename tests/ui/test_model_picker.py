@@ -226,3 +226,57 @@ def test_a_front_end_with_no_engine_says_restart(tmp_path: Path) -> None:
     assert bar._engine() is None
     bar._apply_model_live("medium")
     assert any("restart" in str(n).lower() for n in notes)
+
+
+# ---------------------------------------------------------------------------
+# Models that are not downloaded yet
+# ---------------------------------------------------------------------------
+def _hub_with(tmp_path: Path, *names: str) -> Path:
+    hub = tmp_path / "hub"
+    for name in names:
+        (hub / f"models--mlx-community--whisper-{name}-mlx").mkdir(parents=True)
+    return hub
+
+
+def test_cached_model_names_is_a_cheap_listing(tmp_path: Path) -> None:
+    from src.storage.model_cache import cached_model_names, is_model_cached
+
+    hub = _hub_with(tmp_path, "medium", "large-v3")
+    names = cached_model_names(hub)
+    assert names == {"medium", "large-v3"}
+    assert is_model_cached("medium", names)
+    assert is_model_cached("large", names), "'large' resolves to the v3 repo"
+    assert not is_model_cached("base", names)
+
+
+def test_the_picker_marks_models_that_would_download(tmp_path: Path, monkeypatch) -> None:
+    """The picker offered every model as if equal; choosing an uncached one
+    silently downloaded ~145 MB (base) to ~3 GB (large-v3) inside the next
+    transcription, holding up that meeting's transcript."""
+    pytest.importorskip("rumps")
+    import src.storage.model_cache as mc
+    from src.config import Config
+    from src.detection.detector import MeetingDetector
+    from src.ui.menubar import MenuBarApp
+    from src.ui.notifications import NotificationManager
+
+    monkeypatch.setattr(mc, "DEFAULT_HUB_DIR", _hub_with(tmp_path, "medium", "small", "tiny"))
+    sent: list[tuple[str, str, str]] = []
+    bar = MenuBarApp(
+        config=Config({"transcription": {"model": "medium"}}),
+        detector=MeetingDetector(process_monitor=None, calendar_pollers=[]),
+        recorder_factory=lambda _c: None,
+        notifications=NotificationManager(backend=lambda t, s, m: sent.append((t, s, m))),
+        icons_dir=tmp_path / "icons",
+        user_config_path=tmp_path / "config.yaml",
+    )
+    titles = {name: item.title for name, item in bar._model_items.items()}
+    assert titles["medium"] == "medium"
+    assert "download" in titles["large-v3"] and "GB" in titles["large-v3"]
+    assert "download" in titles["base"]
+
+    # Picking a labelled item still selects the model, and says what follows.
+    monkeypatch.setattr(bar, "_apply_model_live", lambda model: None)
+    bar._on_model_picked(bar._model_items["large-v3"])
+    assert bar._config.get("transcription", "model") == "large-v3"
+    assert any("download" in m.lower() for _t, _s, m in sent)

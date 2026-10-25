@@ -785,6 +785,9 @@ class MenuBarApp(HealthPanelMixin, SettingsMenuMixin):
                 "Stop & Transcribe to save what was captured.",
                 force=True,
             )
+        elif event_type == "refresh_model_menu":
+            # A transcription may have just downloaded a model.
+            self._update_model_menu()
         elif event_type == "force_state":
             # Used by background threads (e.g. the transcription worker) to
             # request a state change on the main thread.
@@ -1692,6 +1695,7 @@ class MenuBarApp(HealthPanelMixin, SettingsMenuMixin):
             logger.exception("Detector transcription_finished raised")
         # Back to IDLE on the main thread via the queue (we're in a bg thread).
         self._events.put(("force_state", UiState.IDLE))
+        self._events.put(("refresh_model_menu", None))
         # Whether we succeeded or not, the Recent menu has new content to show.
         self._events.put(("refresh_recent", None))
 

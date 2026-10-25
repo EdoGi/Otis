@@ -64,6 +64,8 @@ class SettingsMenuMixin:
         self._model_items: dict[str, rumps.MenuItem] = {}
         for m in WHISPER_MODELS:
             it = rumps.MenuItem(m, callback=self._on_model_picked)
+            # The title may carry a "download" note; the model name rides here.
+            it._otis_model = m
             self._model_items[m] = it
             model_root.add(it)
         self._mi["settings_model_root"] = model_root
@@ -138,9 +140,20 @@ class SettingsMenuMixin:
         # pipeline picks it up via load_user_config().
         self._persist_setting({"transcription": {"language": code}})
     def _on_model_picked(self, sender: Any) -> None:
-        model = sender.title
+        model = getattr(sender, "_otis_model", sender.title)
         if model not in WHISPER_MODELS:
             return
+        from src.storage.model_cache import DOWNLOAD_MB, cached_model_names, is_model_cached
+
+        if not is_model_cached(model, cached_model_names()):
+            # Not a modal: the menu already said so; this confirms what follows.
+            self._notifications.notify(
+                NotificationType.SETTING_SAVED,
+                f"Whisper model: {model}",
+                f"Not downloaded yet — about {_size_label(DOWNLOAD_MB.get(model))} will "
+                f"download from huggingface.co before the next transcription.",
+                force=True,
+            )
         self._persist_setting({"transcription": {"model": model}})
         self._mi["settings_model_root"].title = f"Whisper Model: {model}"
         self._update_model_menu(active=model)
@@ -231,9 +244,23 @@ class SettingsMenuMixin:
         for label, item in self._lang_items.items():
             item.state = (label == title)
     def _update_model_menu(self, active: str | None = None) -> None:
+        """Tick the active model and mark the ones that would download.
+
+        The picker used to offer every model as if equal; choosing an uncached
+        one silently downloaded ~150 MB (base) to ~3 GB (large-v3) inside the
+        next transcription.
+        """
+        from src.storage.model_cache import DOWNLOAD_MB, cached_model_names, is_model_cached
+
         active = active or self._config.get("transcription", "model", default="small")
+        cached = cached_model_names()
         for name, item in self._model_items.items():
             item.state = (name == active)
+            title = name if is_model_cached(name, cached) else \
+                f"{name}  (download ~{_size_label(DOWNLOAD_MB.get(name))})"
+            if item.title != title:
+                item.title = title
+
     def _working_hours_title(self) -> str:
         start = self._config.get("app", "working_hours", "start", default="08:00")
         end = self._config.get("app", "working_hours", "end", default="20:00")
@@ -259,3 +286,10 @@ class SettingsMenuMixin:
     # =====================================================================
     # Recording lifecycle (called from main thread)
     # =====================================================================
+
+
+def _size_label(mb: float | None) -> str:
+    if not mb:
+        return "an unknown amount"
+    return f"{mb / 1000:.1f} GB" if mb >= 1000 else f"{mb:.0f} MB"
+

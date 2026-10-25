@@ -57,6 +57,40 @@ def _dir_size(path: Path) -> int:
     return total
 
 
+#: Approximate download size per model (MB), for the picker's warning. medium,
+#: small and tiny are measured from this Mac's cache; base and large-v3 are
+#: estimated from their parameter counts against those three.
+DOWNLOAD_MB = {"tiny": 74, "base": 148, "small": 481, "medium": 1525,
+               "large": 3100, "large-v3": 3100}
+
+
+def cached_model_names(hub_dir: Path | None = None) -> set[str]:
+    """Names of the Whisper models on disk — a directory listing, no sizing.
+
+    list_cached_models() walks every file to size it; the picker only needs
+    to know which exist.
+    """
+    hub = Path(hub_dir) if hub_dir is not None else DEFAULT_HUB_DIR
+    try:
+        entries = list(hub.iterdir())
+    except OSError:
+        return set()
+    return {
+        e.name[len(_MODEL_PREFIX):].removesuffix("-mlx")
+        for e in entries
+        if e.is_dir() and e.name.startswith(_MODEL_PREFIX)
+    }
+
+
+def is_model_cached(model: str, cached: set[str]) -> bool:
+    """Whether config model ``model`` is among ``cached`` ("large" is v3)."""
+    from src.transcription.whisper_engine import _MODEL_REPO_MAP
+
+    repo = _MODEL_REPO_MAP.get(model, "")
+    name = repo.removeprefix("mlx-community/whisper-").removesuffix("-mlx") or model
+    return name in cached
+
+
 def list_cached_models(hub_dir: Path | None = None) -> list[CachedModel]:
     """Every Whisper model currently taking up space, largest first."""
     hub = Path(hub_dir) if hub_dir is not None else DEFAULT_HUB_DIR
