@@ -199,14 +199,22 @@ def check_running_instance(run_dir: Path) -> Check:
 
 
 def _fetch_page(host: str, port: int) -> str | None:
-    """GET / from the local web UI (loopback only). None if nothing answers."""
-    import urllib.request
+    """GET / from the local web UI. None if nothing answers.
 
+    http.client, not urllib: urllib honours http_proxy and macOS proxy
+    settings and does not bypass 127.0.0.1, so a proxied shell got a false
+    "not serving" and sent the probe to the proxy host.
+    """
+    import http.client
+
+    conn = http.client.HTTPConnection(host, port, timeout=2)
     try:
-        with urllib.request.urlopen(f"http://{host}:{port}/", timeout=2) as resp:
-            return resp.read(8192).decode("utf-8", "replace")
+        conn.request("GET", "/")
+        return conn.getresponse().read(8192).decode("utf-8", "replace")
     except Exception:
         return None
+    finally:
+        conn.close()
 
 
 def check_port(

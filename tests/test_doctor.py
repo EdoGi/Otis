@@ -249,3 +249,32 @@ def test_check_phase2_runs_tests_with_this_interpreter(monkeypatch) -> None:
     monkeypatch.setattr(mod.subprocess, "run", fake_run)
     assert mod.main(["--with-tests"]) == 0
     assert ran and ran[0][:3] == [sys.executable, "-m", "pytest"]
+
+
+def test_the_web_ui_probe_never_goes_through_a_proxy(monkeypatch) -> None:
+    """Review round 2: urllib honours http_proxy (and macOS proxy settings)
+    and does not bypass 127.0.0.1, so a proxied shell turned a healthy web UI
+    into "not serving" — and sent the probe to the proxy host."""
+    import http.server
+    import threading
+
+    class Page(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b"<html><head><title>Transcripts \\xe2\\x80\\x94 Otis</title></head></html>"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Page)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.setenv("http_proxy", "http://127.0.0.1:9")  # nothing listens there
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
+    try:
+        page = doctor._fetch_page("127.0.0.1", server.server_address[1])
+    finally:
+        server.shutdown()
+    assert page is not None and "Otis</title>" in page
