@@ -95,11 +95,11 @@ def _configure_logging(level: str) -> None:
     # Console. Launched from Otis.app, stderr is run.sh's launch.log, which
     # exists for what happens before or outside this logging (a missing venv,
     # an import error, a native crash). Copying every INFO line there too would
-    # grow it without bound next to the rotated otis.log, so off a terminal
-    # only warnings and worse reach it.
+    # grow it without bound next to the rotated otis.log, so into a file only
+    # warnings and worse go. Terminals and pipes get everything.
     console = logging.StreamHandler()
     console.setFormatter(fmt)
-    if not _stderr_is_terminal():
+    if _stderr_is_a_log_file():
         console.setLevel(logging.WARNING)
     root.addHandler(console)
 
@@ -118,10 +118,13 @@ def _configure_logging(level: str) -> None:
         logger.warning("Could not enable file logging: %s", exc)
 
 
-def _stderr_is_terminal() -> bool:
+def _stderr_is_a_log_file() -> bool:
+    """True when stderr is a regular file — run.sh's launch.log."""
+    import stat
+
     try:
-        return sys.stderr.isatty()
-    except Exception:  # pragma: no cover (closed or replaced stderr)
+        return stat.S_ISREG(os.fstat(sys.stderr.fileno()).st_mode)
+    except Exception:  # pytest's capture, a closed stderr
         return False
 
 

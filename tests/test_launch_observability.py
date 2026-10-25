@@ -258,3 +258,37 @@ def test_the_not_responding_toast_suggests_force_quit(tmp_path: Path, monkeypatc
     os.utime(lock_path, (old, old))
     main_mod._defer_to_running_instance("ui", tmp_path)
     assert told and "Force Quit" in told[-1][1]
+
+
+def test_run_sh_leaves_piped_cli_output_alone(tmp_path: Path) -> None:
+    """Review finding: gating on "stderr is not a TTY" also caught pipes, so
+    `./scripts/run.sh doctor | tee out.txt` (or any tool) printed nothing —
+    everything went to launch.log. Only the applet's case, where output would
+    be thrown away, is redirected now."""
+    env = {**os.environ, "HOME": str(tmp_path)}
+    proc = subprocess.run(
+        ["bash", str(REPO / "scripts" / "run.sh"), "--help"],
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, env=env, timeout=60,
+    )
+    assert proc.returncode == 0
+    assert "usage: otis" in proc.stdout
+    assert not (tmp_path / ".otis" / "launch.log").exists()
+
+
+def test_an_unwritable_launch_log_never_blocks_a_launch(tmp_path: Path) -> None:
+    """Review finding: under `set -e` a failed redirect stopped run.sh before
+    Python started — the no-trace launch failure the log exists to prevent."""
+    (tmp_path / ".otis").mkdir()
+    log = tmp_path / ".otis" / "launch.log"
+    log.write_text("")
+    log.chmod(0o444)
+    env = {**os.environ, "HOME": str(tmp_path)}
+    try:
+        proc = subprocess.run(
+            ["bash", str(REPO / "scripts" / "run.sh"), "--help"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            env=env, timeout=60,
+        )
+    finally:
+        log.chmod(0o644)
+    assert proc.returncode == 0

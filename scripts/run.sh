@@ -11,16 +11,21 @@ set -euo pipefail
 
 # Otis.app runs this script with stdout and stderr sent to /dev/null, so a
 # launch that dies before Python logging starts — no venv, an import error, a
-# native crash — used to leave nothing anywhere. Off a terminal, keep that
-# output in ~/.otis/launch.log (rotated at 1 MB); on a terminal, leave it be.
-if [[ ! -t 2 ]]; then
+# native crash — used to leave nothing anywhere. When stderr is /dev/null (the
+# applet, a Login Item), keep that output in ~/.otis/launch.log, rotated at
+# 1 MB. Terminals, pipes and files keep their output. Every step fails open: a
+# logging problem must never be the thing that stops Otis from starting.
+if [[ /dev/fd/2 -ef /dev/null ]]; then
     LAUNCH_LOG="${HOME}/.otis/launch.log"
-    mkdir -p "${HOME}/.otis"
-    if [[ -f "${LAUNCH_LOG}" ]] && (( $(stat -f %z "${LAUNCH_LOG}") > 1000000 )); then
-        mv -f "${LAUNCH_LOG}" "${LAUNCH_LOG}.1"
+    if mkdir -p "${HOME}/.otis" 2>/dev/null; then
+        if [[ -f "${LAUNCH_LOG}" ]] && (( $(stat -f %z "${LAUNCH_LOG}" 2>/dev/null || echo 0) > 1000000 )); then
+            mv -f "${LAUNCH_LOG}" "${LAUNCH_LOG}.1" 2>/dev/null || true
+        fi
+        if [[ ! -e "${LAUNCH_LOG}" || -w "${LAUNCH_LOG}" ]]; then
+            exec >>"${LAUNCH_LOG}" 2>&1 || true
+            echo "------ Otis launching $(date '+%Y-%m-%d %H:%M:%S') pid=$$ args: $* ------" || true
+        fi
     fi
-    exec >>"${LAUNCH_LOG}" 2>&1
-    echo "------ Otis launching $(date '+%Y-%m-%d %H:%M:%S') pid=$$ args: $* ------"
 fi
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
