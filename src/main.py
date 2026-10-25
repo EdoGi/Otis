@@ -3,8 +3,8 @@
 Two top-level commands:
 
 * ``otis check-audio`` (or ``otis --check-audio`` for back-compat) — print the
-  CoreAudio device list and the BlackHole / multi-output status. Exits 0 if
-  the audio setup is healthy.
+  CoreAudio device list, the BlackHole / multi-output status and whether the
+  current output actually feeds BlackHole. Exits 0 only when it does.
 * ``otis run`` — start the foreground daemon: detection + auto-record on
   meeting detection. Stays in the foreground; Ctrl-C to stop.
 
@@ -23,7 +23,12 @@ from pathlib import Path
 from typing import Any
 
 from src import single_instance
-from src.audio.blackhole_check import format_setup_instructions, verify_blackhole_setup
+from src.audio.blackhole_check import (
+    RoutingState,
+    check_output_routing,
+    format_setup_instructions,
+    verify_blackhole_setup,
+)
 from src.audio.devices import DeviceManager
 from src.config import Config, load_user_config
 from src.config_schema import ConfigError, validate
@@ -245,7 +250,23 @@ def _prune_models(cfg: Config, *, dry_run: bool = False) -> int:
     return 0
 
 
+#: check-audio's exit code per routing verdict. 2 is taken by config errors.
+_ROUTING_EXIT_CODES = {
+    RoutingState.OK: 0,
+    RoutingState.NOT_ROUTED: 1,
+    RoutingState.INAUDIBLE: 3,
+    RoutingState.UNKNOWN: 3,
+}
+
+
 def _print_audio_status(_cfg: Config) -> int:
+    """List devices, then answer both questions: is it installed, is it wired?
+
+    This used to stop at the structural check and exit 0 on it, printing a ✓
+    while the Mac's output bypassed BlackHole (measured 2026-10-25). Exit
+    codes: 0 routed, 1 not installed or not routed, 3 routed with no speakers
+    or not determinable.
+    """
     device_manager = DeviceManager()
     status = verify_blackhole_setup(device_manager)
 
@@ -259,7 +280,13 @@ def _print_audio_status(_cfg: Config) -> int:
         print(f"  [{d.index:>2}] {d.name!r}  ({'/'.join(flags) or '?'})")
     print()
     print(format_setup_instructions(status))
-    return 0 if status.ok else 1
+    if not status.ok:
+        return 1
+
+    routing = check_output_routing()
+    print()
+    print(f"{'✓' if routing.ok else '✗'} Routing: {routing.message()}")
+    return _ROUTING_EXIT_CODES.get(routing.state, 3)
 
 
 def _run_daemon(cfg: Config) -> int:

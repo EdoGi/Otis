@@ -20,7 +20,11 @@ from pathlib import Path
 # Allow running the script from the repo root without installing the package.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.audio.blackhole_check import format_setup_instructions, verify_blackhole_setup
+from src.audio.blackhole_check import (
+    check_output_routing,
+    format_setup_instructions,
+    verify_blackhole_setup,
+)
 from src.audio.devices import DeviceManager
 from src.audio.recorder import DualStreamRecorder
 
@@ -48,6 +52,11 @@ def main() -> int:
     dm = DeviceManager()
     status = verify_blackhole_setup(dm)
     print(format_setup_instructions(status))
+    if status.ok:
+        # Existence is not routing: say whether this recording's system stream
+        # will actually carry audio before spending its duration on it.
+        routing = check_output_routing()
+        print(f"{'✓' if routing.ok else '✗'} Routing: {routing.message()}")
     print()
 
     rec = DualStreamRecorder(

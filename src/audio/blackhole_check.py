@@ -322,7 +322,13 @@ def _suggest_aggregate(probe: RoutingProbe) -> str | None:
 def format_setup_instructions(status: BlackHoleStatus) -> str:
     """Render a user-facing message describing what to do next."""
     if status.ok:
-        return "BlackHole is installed and a Multi-Output device is configured. ✓"
+        # Structural only — no ✓. Whether the current output actually feeds
+        # BlackHole is check_output_routing()'s question, and a ✓ here sat
+        # next to a failing answer to it.
+        return (
+            f"BlackHole is installed ({status.blackhole_device_name}) and a "
+            f"Multi-Output device exists ({status.multi_output_device_name})."
+        )
     lines = ["Otis needs BlackHole to capture system audio.", ""]
     lines.extend(f"• {issue}" for issue in status.issues)
     lines.append("")

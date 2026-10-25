@@ -38,7 +38,9 @@ def test_status_reports_missing_multi_output(fake_sounddevice_no_multi_output) -
 def test_format_setup_instructions_when_ok(fake_sounddevice) -> None:
     status = verify_blackhole_setup(DeviceManager())
     msg = format_setup_instructions(status)
-    assert "✓" in msg or "configured" in msg.lower()
+    assert "installed" in msg.lower() and "multi-output" in msg.lower()
+    # Structural only: the routing check owns the verdict (see test_check_audio).
+    assert "✓" not in msg
 
 
 def test_format_setup_instructions_when_missing(fake_sounddevice_no_blackhole) -> None:
