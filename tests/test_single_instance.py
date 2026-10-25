@@ -8,6 +8,7 @@ ran its own detector, pollers and startup toasts, and drained the same queue.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import threading
@@ -94,6 +95,7 @@ def test_release_lets_the_same_process_take_it_again(tmp_path: Path) -> None:
 def run_dir(tmp_path: Path, monkeypatch) -> Path:
     monkeypatch.setattr(main_mod, "LOG_DIR", tmp_path)
     monkeypatch.setattr(main_mod, "SURFACE_WAIT_SECONDS", 0.3)
+    monkeypatch.setattr(main_mod, "STARTUP_GRACE_SECONDS", 0.0)  # tests opt in
     return tmp_path
 
 
@@ -146,6 +148,8 @@ def test_an_unresponsive_running_copy_is_reported_not_ignored(
     run_dir: Path, holder, no_start, monkeypatch
 ) -> None:
     proc = holder(run_dir / LOCK_NAME)
+    old = time.time() - 3600  # taken an hour ago: past any startup grace
+    os.utime(run_dir / LOCK_NAME, (old, old))
     told: list[tuple] = []
     monkeypatch.setattr(main_mod, "_notify_from_second_launch", lambda *a: told.append(a))
     monkeypatch.setattr(main_mod, "_bring_forward", lambda pid: None)
@@ -223,3 +227,62 @@ def test_the_menu_bar_consumes_a_surface_request(tmp_path: Path) -> None:
     app._drain_main_queue(None)
     assert not surface.exists()
     assert any("already running" in t.lower() for t, _s, _m in sent)
+
+
+def test_the_menu_opens_after_the_drain_returns(tmp_path: Path) -> None:
+    """Review finding: performClick_ ran menu tracking inside the drain timer's
+    own callout. A timer never re-fires while its callout is on the stack, so
+    an alert picked from that menu (About, the quit confirmation) froze the
+    drain again — the very freeze 49f951f removed. The click is now scheduled
+    for a later run-loop pass."""
+    pytest.importorskip("rumps")
+    from types import SimpleNamespace
+
+    from src.config import Config
+    from src.detection.detector import MeetingDetector
+    from src.health import HealthRegistry
+    from src.ui.menubar import MenuBarApp
+    from src.ui.notifications import NotificationManager
+
+    calls: list[tuple] = []
+
+    class Button:
+        def performClick_(self, sender):
+            calls.append(("performClick_", sender))
+
+        def performSelector_withObject_afterDelay_(self, sel, obj, delay):
+            calls.append(("later", sel, obj, delay))
+
+    surface = tmp_path / SURFACE_NAME
+    app = MenuBarApp(
+        config=Config({"app": {"working_days": [0, 1, 2, 3, 4, 5, 6]}}),
+        detector=MeetingDetector(process_monitor=None, calendar_pollers=[]),
+        recorder_factory=lambda _c: None,
+        notifications=NotificationManager(backend=lambda t, s, m: None),
+        icons_dir=tmp_path / "icons", user_config_path=tmp_path / "config.yaml",
+        health=HealthRegistry(), surface_request_path=surface,
+    )
+    button = Button()
+    app._app._nsapp = SimpleNamespace(nsstatusitem=SimpleNamespace(button=lambda: button))
+    single_instance.request_surface(surface)
+    app._drain_main_queue(None)
+    assert calls == [("later", "performClick:", None, 0.0)]
+
+
+def test_a_click_during_a_cold_start_is_not_called_a_freeze(
+    run_dir: Path, holder, no_start, monkeypatch
+) -> None:
+    """Review finding: the lock is taken before config, pipeline, web bind and
+    menu construction, and requests are only answered once the run loop turns.
+    A second click in that window waited 2.5 s and was told the healthy,
+    still-starting copy was frozen and should be killed."""
+    holder(run_dir / LOCK_NAME)  # just taken: the lock file is seconds old
+    told: list[tuple] = []
+    forward: list[int] = []
+    monkeypatch.setattr(main_mod, "_notify_from_second_launch", lambda *a: told.append(a))
+    monkeypatch.setattr(main_mod, "_bring_forward", forward.append)
+    monkeypatch.setattr(main_mod, "STARTUP_GRACE_SECONDS", 0.4)
+    assert main_mod.main(["ui"]) == 0
+    assert told and "still starting" in told[-1][0].lower()
+    assert forward == []
+    assert (run_dir / SURFACE_NAME).exists(), "keep it: the menu opens once the copy is ready"

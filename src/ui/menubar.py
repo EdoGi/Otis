@@ -595,7 +595,13 @@ class MenuBarApp(HealthPanelMixin, SettingsMenuMixin):
             force=True,
         )
         try:
-            self._app._nsapp.nsstatusitem.button().performClick_(None)
+            # Scheduled, not called: performClick_ runs menu tracking right
+            # here, inside the drain timer's callout, and a timer never
+            # re-fires while its callout is on the stack — an alert picked
+            # from that menu would freeze the drain again.
+            self._app._nsapp.nsstatusitem.button().performSelector_withObject_afterDelay_(
+                "performClick:", None, 0.0
+            )
         except Exception:  # headless tests, or rumps internals changed
             logger.debug("Could not open the status menu", exc_info=True)
 

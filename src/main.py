@@ -56,6 +56,12 @@ LOG_DIR = Path("~/.otis")
 #: is not servicing its run loop (an unanswered modal did this twice).
 SURFACE_WAIT_SECONDS = 2.5
 
+#: A lock younger than this belongs to a copy that may still be starting: the
+#: lock is taken before config, pipeline, web bind and menu construction, and
+#: requests are only answered once the run loop turns (9 s at a cold login on
+#: 2026-10-20). A second launch waits up to this long before deciding anything.
+STARTUP_GRACE_SECONDS = 30.0
+
 #: Commands that own the mic, the queue and port 8765, and so must not run
 #: twice. check-audio, prune-models and the MCP server stay lock-free: they are
 #: most useful exactly while Otis is running.
@@ -489,12 +495,31 @@ def _defer_to_running_instance(command: str, run_dir: Path) -> int:
 
     surface = run_dir / single_instance.SURFACE_NAME
     single_instance.request_surface(surface)
-    deadline = time.monotonic() + SURFACE_WAIT_SECONDS
+    try:
+        lock_age = time.time() - (run_dir / single_instance.LOCK_NAME).stat().st_mtime
+    except OSError:
+        lock_age = float("inf")
+    starting = lock_age < STARTUP_GRACE_SECONDS
+    wait = max(SURFACE_WAIT_SECONDS, STARTUP_GRACE_SECONDS - lock_age) if starting \
+        else SURFACE_WAIT_SECONDS
+    deadline = time.monotonic() + wait
     while time.monotonic() < deadline:
         if not surface.exists():
             logger.info("The running copy (%s) answered; it is showing its menu.", who)
             return 0
         time.sleep(0.05)
+
+    if starting:
+        # Still in its first seconds: not frozen, just not drawing yet. Leave
+        # the request in place — its first drain tick opens the menu.
+        logger.info("The running copy (%s) is still starting; its menu will "
+                    "open when it is ready.", who)
+        _notify_from_second_launch(
+            "Otis is still starting",
+            "Its icon will appear in the menu bar in a moment, and the menu will "
+            "open by itself.",
+        )
+        return 0
 
     # Nobody consumed the request: that copy is alive (it holds the lock) but
     # its main run loop is not turning. Say so, and try to raise whatever it is
