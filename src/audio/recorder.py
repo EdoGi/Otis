@@ -1005,7 +1005,9 @@ class DualStreamRecorder:
         # stream being replaced, finish, and leave the new InputStream running
         # with no owner (mic open, queue filling). Same lock order as stop():
         # _stop_lock, then _state_lock inside resume(). If stop() won, resume()
-        # sees STOPPED and does nothing.
+        # sees STOPPED and does nothing. Stop & Transcribe waits on its worker;
+        # a menu Quit or logout waits on the main thread, as it already does
+        # for the writer joins — the process is exiting either way.
         with self._stop_lock:
             try:
                 self.resume(source="wake")

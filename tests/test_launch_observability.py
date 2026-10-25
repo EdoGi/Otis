@@ -223,6 +223,13 @@ def test_sigterm_quits_through_the_normal_quit_path(tmp_path: Path, log_dir: Pat
     try:
         app.run()
         assert signal.getsignal(signal.SIGTERM) == app._on_terminate_signal
+        # The other half: a non-blocking wakeup fd and a live quit watchdog,
+        # which is what makes a kill work while a menu is open or the main
+        # thread is frozen (review round 2: nothing tested this wiring).
+        fd = signal.set_wakeup_fd(-1)
+        signal.set_wakeup_fd(fd)
+        assert fd >= 0 and not os.get_blocking(fd)
+        assert any(t.name == "otis-quit-watchdog" and t.is_alive() for t in threading.enumerate())
         app._on_terminate_signal(signal.SIGTERM, None)
     finally:
         rumps.events.before_quit.unregister(app._on_before_quit)
@@ -359,3 +366,31 @@ def test_console_level_follows_where_stderr_goes(tmp_path: Path, log_dir: Path,
         stream.close()
         if target == "pipe":
             os.close(r)
+
+
+def test_a_signal_during_a_menu_quit_lets_the_save_finish(tmp_path: Path, log_dir: Path,
+                                                          monkeypatch) -> None:
+    """Review round 2: Quit stops the recording on the main thread (up to
+    ~14 s of writer joins). A SIGTERM handled inside that stop called
+    quit_application again — terminate_, exit() — before the WAVs were
+    finalised. A quit already under way now makes the signal a no-op."""
+    import rumps
+
+    from src.audio.recorder import RecorderState
+
+    events: list[str] = []
+    monkeypatch.setattr(rumps, "quit_application", lambda *a: events.append("quit"))
+    app = _headless_app(tmp_path, _Detector())
+
+    class SlowRecorder:
+        state = RecorderState.RECORDING
+
+        def stop(self):
+            events.append("stop-start")
+            app._on_terminate_signal(15, None)  # SIGTERM lands mid-save
+            events.append("stop-end")
+            return {}
+
+    app._recorder = SlowRecorder()
+    app._on_quit_clicked(None)
+    assert events == ["stop-start", "stop-end", "quit"]

@@ -903,6 +903,10 @@ class MenuBarApp(HealthPanelMixin, SettingsMenuMixin):
             if not response:
                 return
 
+        # From here a quit is under way: a SIGTERM landing during the stop
+        # below (it runs on this thread, up to ~14 s) must not terminate before
+        # the WAVs are finalised. The quit watchdog remains the backstop.
+        self._quit_requested = True
         # Stop recording cleanly first; teardown happens in run()'s finally.
         self._do_stop_if_recording()
         rumps.quit_application()
@@ -1826,6 +1830,7 @@ class MenuBarApp(HealthPanelMixin, SettingsMenuMixin):
         stderr and carries on — and nothing here joins long-running workers,
         because macOS does not wait long at logout.
         """
+        self._quit_requested = True  # a late signal must not re-enter terminate_
         logger.info("Otis quitting (pid %d).", os.getpid())
         # A logout or restart reaches here without _on_quit_clicked, with the
         # recording still running; stopping it flushes the WAVs to disk.
