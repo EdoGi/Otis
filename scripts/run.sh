@@ -9,14 +9,14 @@
 
 set -euo pipefail
 
-# Otis.app runs this script with stdout and stderr sent to /dev/null, so a
-# launch that dies before Python logging starts — no venv, an import error, a
-# native crash — used to leave nothing anywhere. When both stdout and stderr
-# are /dev/null (the applet, a Login Item), keep that output in
+# A launch that dies before Python logging starts — no venv, an import error, a
+# native crash — used to leave nothing anywhere. When Otis.app started this
+# (its launcher sets OTIS_LAUNCHED_BY_APP), or when both stdout and stderr are
+# /dev/null (an older applet build, a Login Item), keep that output in
 # ~/.otis/launch.log, rotated at 1 MB. Terminals, pipes, files and a user's own
 # `2>/dev/null` keep their output. Every step fails open: a logging problem
 # must never be the thing that stops Otis from starting.
-if [[ /dev/fd/1 -ef /dev/null && /dev/fd/2 -ef /dev/null ]]; then
+if [[ -n "${OTIS_LAUNCHED_BY_APP:-}" ]] || [[ /dev/fd/1 -ef /dev/null && /dev/fd/2 -ef /dev/null ]]; then
     LAUNCH_LOG="${HOME}/.otis/launch.log"
     if mkdir -p "${HOME}/.otis" 2>/dev/null; then
         if [[ -f "${LAUNCH_LOG}" ]] && (( $(stat -f %z "${LAUNCH_LOG}" 2>/dev/null || echo 0) > 1000000 )); then
@@ -28,6 +28,8 @@ if [[ /dev/fd/1 -ef /dev/null && /dev/fd/2 -ef /dev/null ]]; then
         fi
     fi
 fi
+
+unset OTIS_LAUNCHED_BY_APP  # don't leak the marker to Otis's own children
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "${PROJECT_ROOT}"

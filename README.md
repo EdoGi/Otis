@@ -64,7 +64,17 @@ Developer ID), so macOS blocks `open` by default. You need to right-click the
 2. **Right-click** (or Ctrl-click) on `Otis.app` → **Open**.
 3. Click **Open** in the "unidentified developer" dialog.
 
-After that, double-click and Spotlight work normally.
+After that, double-click and Spotlight work normally. macOS also asks once
+for access to the Documents folder (where the project lives) and, at the
+first recording, to the microphone — and again after a rebuild that changes
+the launcher, since the grants are tied to the app's code signature.
+
+The bundle's executable is a tiny native launcher
+(`scripts/launcher/otis_launcher.c`, path to `run.sh` compiled in) that starts
+Otis and exits; it needs the Command Line Tools (`xcode-select --install`). It
+replaced an AppleScript applet that spent 4-14 s before Otis even started.
+Anything that goes wrong before Otis's own logging starts lands in
+`~/.otis/launch.log`.
 
 Now Otis is a real first-class macOS app:
 

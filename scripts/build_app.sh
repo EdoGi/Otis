@@ -1,38 +1,47 @@
 #!/usr/bin/env bash
-# build_app.sh — produce a Gatekeeper-friendly Otis.app under dist/.
+# build_app.sh — produce Otis.app under dist/.
 #
 # How it works
 # ------------
-# We use ``osacompile`` (ships with macOS) to create the bundle from a tiny
-# AppleScript that ``do shell script``s our launcher. ``osacompile`` produces
-# a real Mach-O stub binary inside Contents/MacOS/, which Gatekeeper accepts
-# for locally-built apps after a single right-click → Open. A previous
-# iteration of this script wrote a bash launcher directly — that approach
-# is *not* Mach-O, so Gatekeeper silently rejected every launch path
-# (double-click, Spotlight, ``open``).
+# Contents/MacOS/Otis is a tiny native launcher (scripts/launcher/
+# otis_launcher.c) with the absolute path to scripts/run.sh compiled in. It
+# spawns run.sh detached — stderr to ~/.otis/launch.log — and exits.
 #
-# We then:
-#   * overwrite the AppleScript bundle's Info.plist with our own (LSUIElement,
-#     CFBundleIdentifier, NSMicrophoneUsageDescription, etc.),
-#   * replace the generic AppleScript droplet icon with Otis.icns,
-#   * ad-hoc re-sign the result so the modified bundle still verifies.
+# It replaces an osacompile AppleScript applet that did the same thing via
+# `do shell script`, but spent 4-14 s in the AppleScript runtime before run.sh
+# even started (measured 2026-10-20..25; a bare applet: 0.7-2.7 s), with
+# nothing on screen meanwhile. The native launcher takes milliseconds. A
+# shell-script CFBundleExecutable is not an option: Gatekeeper rejects
+# non-Mach-O bundle executables on every launch path.
+#
+# We then write our own Info.plist (LSUIElement, bundle id, permission usage
+# strings), build the icon, and ad-hoc sign the bundle.
+#
+# Permissions: macOS pins the Documents-folder and Microphone grants of an
+# ad-hoc-signed app to its code hash. Rebuilding from the same source and
+# path gives the same hash and keeps them; a different launcher, path or
+# Info.plist means macOS asks once more on the next launch (Documents) and at
+# the next recording (Microphone).
 #
 # Day-to-day workflow after a successful build:
-#   1. Drag dist/Otis.app to /Applications.
-#   2. FIRST LAUNCH ONLY:  right-click in Finder → Open → "Open" in dialog.
+#   1. Copy dist/Otis.app to /Applications (replace the old one).
+#   2. FIRST LAUNCH ONLY:  right-click in Finder → Open → "Open" in dialog,
+#      and allow Documents access when asked.
 #   3. After that:  double-click, Spotlight, or Login Items all work.
 #
-# Re-run this script any time you've moved the project or want a fresh build.
+# Re-run this script any time you've moved the project folder.
+# OTIS_DIST_DIR overrides the output directory (the tests use it).
 
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SOURCE_PNG="${PROJECT_ROOT}/OtisIcon.png"
-DIST_DIR="${PROJECT_ROOT}/dist"
+DIST_DIR="${OTIS_DIST_DIR:-${PROJECT_ROOT}/dist}"
 APP_DIR="${DIST_DIR}/Otis.app"
 CONTENTS="${APP_DIR}/Contents"
 RES_DIR="${CONTENTS}/Resources"
 RUN_SH="${PROJECT_ROOT}/scripts/run.sh"
+LAUNCHER_SRC="${PROJECT_ROOT}/scripts/launcher/otis_launcher.c"
 BUNDLE_ID="com.tenderstrike.otis"
 
 color() { local c="$1"; shift; printf '\033[%sm%s\033[0m\n' "$c" "$*"; }
@@ -47,32 +56,28 @@ fatal() { color "1;31" "✗  $*"; exit 1; }
 # ---------------------------------------------------------------- prereqs
 [[ -f "${SOURCE_PNG}" ]]                || fatal "OtisIcon.png missing — expected at ${SOURCE_PNG}."
 [[ -x "${RUN_SH}"     ]]                || fatal "scripts/run.sh missing or not executable."
-command -v osacompile >/dev/null 2>&1   || fatal "osacompile not in PATH (ships with macOS)."
+[[ -f "${LAUNCHER_SRC}" ]]              || fatal "Launcher source missing — expected at ${LAUNCHER_SRC}."
+command -v clang      >/dev/null 2>&1   || fatal "clang not in PATH — install the Command Line Tools: xcode-select --install"
 command -v sips       >/dev/null 2>&1   || fatal "sips not in PATH (ships with macOS)."
 command -v iconutil   >/dev/null 2>&1   || fatal "iconutil not in PATH (ships with macOS)."
 
 # ---------------------------------------------------------------- venv check
 if [[ ! -d "${PROJECT_ROOT}/.venv" ]]; then
     warn ".venv not found at ${PROJECT_ROOT}/.venv."
-    warn "The launcher will fail until you run scripts/setup.sh once."
+    warn "The app will fail to start Otis until you run scripts/setup.sh once."
 fi
 
 # ---------------------------------------------------------------- clean
 info "Building Otis.app at ${APP_DIR} ..."
 rm -rf "${APP_DIR}"
-mkdir -p "${DIST_DIR}"
+mkdir -p "${CONTENTS}/MacOS" "${RES_DIR}"
 
-# ---------------------------------------------------------------- compile .applescript → .app
-# The AppleScript spawns our launcher and exits immediately. The launcher then
-# runs Python in the background. We don't want osascript hanging around.
-TMP_SCPT="$(mktemp -t otis-launcher).applescript"
-cat > "${TMP_SCPT}" <<APPLESCRIPT
-do shell script "exec '${RUN_SH}' >/dev/null 2>&1 &"
-APPLESCRIPT
-
-osacompile -o "${APP_DIR}" "${TMP_SCPT}"
-rm -f "${TMP_SCPT}"
-ok "AppleScript bundle compiled."
+# ---------------------------------------------------------------- launcher
+info "Compiling the launcher ..."
+clang -O2 -Wall -Werror -arch arm64 -arch x86_64 -mmacosx-version-min=13.0 \
+    -DOTIS_RUN_SH="\"${RUN_SH}\"" \
+    -o "${CONTENTS}/MacOS/Otis" "${LAUNCHER_SRC}"
+ok "Launcher compiled (runs ${RUN_SH})."
 
 # ---------------------------------------------------------------- iconset → icns
 info "Generating multi-resolution icon (.icns) from OtisIcon.png ..."
@@ -94,15 +99,10 @@ for entry in \
     sips -z "${size}" "${size}" "${SOURCE_PNG}" --out "${ICONSET}/${name}" >/dev/null
 done
 iconutil -c icns "${ICONSET}" -o "${RES_DIR}/Otis.icns"
-# Replace the default AppleScript droplet icon at its expected name too —
-# the compiled Info.plist still references "applet.icns" by default.
-cp "${RES_DIR}/Otis.icns" "${RES_DIR}/applet.icns"
 rm -rf "$(dirname "${ICONSET}")"
-ok "Wrote ${RES_DIR}/Otis.icns + applet.icns"
+ok "Wrote ${RES_DIR}/Otis.icns"
 
 # ---------------------------------------------------------------- Info.plist
-# Overwrite osacompile's default plist with our own — it doesn't include
-# LSUIElement, our bundle id, or the macOS permission usage strings.
 info "Writing Info.plist ..."
 cat > "${CONTENTS}/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -111,14 +111,14 @@ cat > "${CONTENTS}/Info.plist" <<EOF
 <dict>
     <key>CFBundleDevelopmentRegion</key>     <string>en</string>
     <key>CFBundleDisplayName</key>           <string>Otis</string>
-    <key>CFBundleExecutable</key>            <string>applet</string>
+    <key>CFBundleExecutable</key>            <string>Otis</string>
     <key>CFBundleIconFile</key>              <string>Otis</string>
     <key>CFBundleIdentifier</key>            <string>${BUNDLE_ID}</string>
     <key>CFBundleInfoDictionaryVersion</key> <string>6.0</string>
     <key>CFBundleName</key>                  <string>Otis</string>
     <key>CFBundlePackageType</key>           <string>APPL</string>
-    <key>CFBundleShortVersionString</key>    <string>0.1.0</string>
-    <key>CFBundleVersion</key>               <string>1</string>
+    <key>CFBundleShortVersionString</key>    <string>0.2.0</string>
+    <key>CFBundleVersion</key>               <string>2</string>
     <key>LSMinimumSystemVersion</key>        <string>13.0</string>
 
     <!-- Menu-bar app: don't show in Dock or app switcher. -->
@@ -131,13 +131,6 @@ cat > "${CONTENTS}/Info.plist" <<EOF
     <string>Otis uses Apple Events to detect sleep/wake and pause recording.</string>
     <key>NSCalendarsUsageDescription</key>
     <string>Otis can use your calendar to alert you before a meeting starts.</string>
-
-    <!-- AppleScript stub metadata that osacompile would have emitted. -->
-    <key>LSRequiresCarbon</key>              <true/>
-    <key>OSAAppletStayOpen</key>             <false/>
-    <key>WindowState</key>                   <dict>
-        <key>name</key><string>ScriptWindowState</string>
-    </dict>
 </dict>
 </plist>
 EOF
@@ -153,19 +146,17 @@ info "Stripping locally-built attributes ..."
 ok "xattrs cleaned"
 
 # ---------------------------------------------------------------- ad-hoc signing
-# Re-sign — we modified Resources/, so the existing Apple-tool signature
-# would no longer verify.
 info "Ad-hoc signing the bundle ..."
-if /usr/bin/codesign --force --deep --sign - "${APP_DIR}" >/dev/null 2>&1; then
-    ok "Ad-hoc signed."
-else
-    warn "codesign failed — first launch may show 'unidentified developer'."
-fi
+/usr/bin/codesign --force --deep --sign - "${APP_DIR}" >/dev/null 2>&1 \
+    || fatal "codesign failed."
+# A bundle whose seal does not verify (a file added or removed after signing)
+# fails in confusing ways later; refuse to hand one out.
+/usr/bin/codesign --verify --deep --strict "${APP_DIR}" \
+    || fatal "The signed bundle does not verify."
+ok "Ad-hoc signed and verified."
 
-# Verify the executable inside is a real Mach-O (not a script — that was the
-# old bug). If this fails, Gatekeeper will reject every launch path.
-if /usr/bin/file "${CONTENTS}/MacOS/applet" | grep -q "Mach-O"; then
-    ok "Bundle executable is Mach-O ($(file "${CONTENTS}/MacOS/applet" | awk -F': ' '{print $2}'))"
+if /usr/bin/file "${CONTENTS}/MacOS/Otis" | grep -q "Mach-O"; then
+    ok "Bundle executable is Mach-O ($(file "${CONTENTS}/MacOS/Otis" | awk -F': ' '{print $2}' | head -1))"
 else
     fatal "Bundle executable is NOT Mach-O. Gatekeeper will reject. Aborting."
 fi
@@ -175,20 +166,13 @@ echo
 ok "Otis.app built at: ${APP_DIR}"
 echo
 info "Next steps:"
-echo "  1. mv ${APP_DIR} /Applications/"
+echo "  1. Quit Otis if it is running, then replace the installed copy:"
+echo "       rm -rf /Applications/Otis.app && cp -R \"${APP_DIR}\" /Applications/"
 echo
-echo "  2. FIRST LAUNCH ONLY — bypass Gatekeeper:"
-echo "       In Finder, right-click /Applications/Otis.app → 'Open'."
-echo "       Click 'Open' in the dialog that appears."
-echo "     (One-time per build. After this, double-click and Spotlight work.)"
+echo "  2. FIRST LAUNCH ONLY — in Finder, right-click /Applications/Otis.app → 'Open'."
+echo "     Allow access to the Documents folder when macOS asks, and the"
+echo "     microphone at the first recording."
 echo
-echo "  3. Subsequent launches: ⌘+Space → \"Otis\" → ⏎,  or double-click."
-echo
-echo "  4. (Auto-launch at login) System Settings → General → Login Items"
-echo "     → \"+\" → /Applications/Otis.app"
-echo
-info "First launch will trigger macOS permission prompts:"
-echo "  • Microphone — required for recording"
-echo "  • Apple Events / Notifications — required for menu-bar UI"
+echo "  3. Login Items keep working: they point at /Applications/Otis.app."
 echo
 warn "Re-run scripts/build_app.sh whenever you move the project folder."
