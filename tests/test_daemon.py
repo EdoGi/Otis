@@ -7,8 +7,10 @@ through the right lifecycle, and that shutdown is clean.
 
 from __future__ import annotations
 
+import tempfile
 import threading
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from src.config import Config
@@ -68,6 +70,10 @@ class _FakeProcessMonitor:
 # Fixtures
 # ============================================================================
 def _make_config() -> Config:
+    # queue_dir is explicit because the daemon's default is the real
+    # ~/.otis/queue: these tests used to enqueue and resolve jobs in the
+    # user's actual crash-recovery queue (the same class of leak as the
+    # otis.log one fixed in f620bd3).
     return Config({
         "app": {"name": "Otis"},
         "audio": {
@@ -79,6 +85,7 @@ def _make_config() -> Config:
         "storage": {
             "audio_dir": "/tmp/otis-test-daemon",
             "transcript_dir": "/tmp/otis-test-daemon-transcripts",
+            "queue_dir": tempfile.mkdtemp(prefix="otis-test-queue-"),
         },
         "detection": {
             "process_monitor": {"enabled": False},  # we wire our own
@@ -554,3 +561,11 @@ def test_daemon_transcription_defers_while_next_recording_active(tmp_path, monke
     assert polls["n"] >= 2, "worker should have waited for the recording"
     assert len(processor.calls) == 1  # and then transcribed
     assert any("deferred" in n.lower() for n in notes)
+
+
+def test_the_daemon_tests_never_touch_the_real_queue() -> None:
+    daemon = OtisDaemon(config=_make_config(), notify=lambda _m: None,
+                        recorder_factory=lambda _c: None,
+                        detector=MeetingDetector(process_monitor=None, calendar_pollers=[]))
+    real = (Path.home() / ".otis" / "queue").resolve()
+    assert daemon._queue.directory.resolve() != real
