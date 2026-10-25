@@ -59,6 +59,12 @@ fatal() { color "1;31" "✗  $*"; exit 1; }
 [[ -x "${RUN_SH}"     ]]                || fatal "scripts/run.sh missing or not executable."
 [[ -f "${LAUNCHER_SRC}" ]]              || fatal "Launcher source missing — expected at ${LAUNCHER_SRC}."
 command -v clang      >/dev/null 2>&1   || fatal "clang not in PATH — install the Command Line Tools: xcode-select --install"
+# The path is compiled into the launcher as a C string literal: a backslash
+# would become an escape (a different path, every launch failing) and a quote
+# would break the build — after the old app was deleted. Refuse both here.
+case "${RUN_SH}" in
+    *\\*|*\"*) fatal "The project path contains a backslash or a double quote; move it to a plain path: ${RUN_SH}" ;;
+esac
 command -v sips       >/dev/null 2>&1   || fatal "sips not in PATH (ships with macOS)."
 command -v iconutil   >/dev/null 2>&1   || fatal "iconutil not in PATH (ships with macOS)."
 

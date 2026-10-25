@@ -54,13 +54,21 @@ def _wait_for(path: Path, timeout: float = 5.0) -> bool:
 
 def test_it_starts_the_script_detached_and_returns_at_once(tmp_path: Path) -> None:
     marker = tmp_path / "ran.txt"
+    release = tmp_path / "release"
     script = tmp_path / "run.sh"
-    # Sleeps first: proves the launcher does not wait for Otis to finish.
-    script.write_text(f'#!/bin/bash\nsleep 1\necho "$OTIS_LAUNCHED_BY_APP $$" > "{marker}"\n')
+    # The script blocks until the test releases it, so a launcher that waits
+    # for its child cannot return in time (review: a sleep-based version let a
+    # waitpid() launcher pass).
+    script.write_text(
+        f'#!/bin/bash\nwhile [ ! -e "{release}" ]; do sleep 0.05; done\n'
+        f'echo "$OTIS_LAUNCHED_BY_APP $$" > "{marker}"\n'
+    )
     exe = _build(tmp_path, script)
     proc, took = _run(exe, tmp_path)
     assert proc.returncode == 0
+    assert not marker.exists(), "the launcher returned only after its child finished"
     assert took < 2.0, f"launcher took {took:.2f}s (the applet took 4-14 s)"
+    release.touch()
     assert _wait_for(marker), "the script never ran"
     flag, _pid = marker.read_text().split()
     assert flag == "1", "run.sh must know the app started it"
@@ -121,3 +129,38 @@ def test_build_app_produces_a_signed_native_bundle(tmp_path: Path) -> None:
     subprocess.run(["codesign", "--verify", "--deep", "--strict", str(app)], check=True)
     # The compiled-in path is this checkout's run.sh.
     assert str(REPO / "scripts" / "run.sh").encode() in exe.read_bytes()
+
+
+def test_closed_stdio_does_not_lose_the_launch_log(tmp_path: Path) -> None:
+    """Review: started with fds 0-2 closed (a wrapper, not LaunchServices),
+    /dev/null and the log took fds 0 and 1, the dup2 order clobbered the log,
+    and the child's stderr went to /dev/null. Fds 0-2 are now filled first."""
+    exe = _build(tmp_path, tmp_path / "missing" / "run.sh")
+    env = {"HOME": str(tmp_path), "PATH": "/usr/bin:/bin"}
+    subprocess.run(
+        ["/bin/bash", "-c", f'exec "{exe}" <&- >&- 2>&-'], env=env, timeout=10,
+    )
+    log = tmp_path / ".otis" / "launch.log"
+    assert _wait_for(log), "bash's error must still reach launch.log"
+    assert "run.sh" in log.read_text()
+
+
+@pytest.mark.parametrize("bad", ['Ot"is', "Ot\\nis"])
+def test_build_app_refuses_a_path_it_cannot_compile_in(tmp_path: Path, bad: str) -> None:
+    """A backslash in the project path was compiled as a C escape (a different
+    path; every launch then failed) and a quote broke the build after the old
+    app had been deleted. The script now refuses such paths up front."""
+    import shutil as sh
+
+    weird = tmp_path / bad / "Otis"
+    (weird / "scripts" / "launcher").mkdir(parents=True)
+    for rel in ("scripts/build_app.sh", "scripts/run.sh", "scripts/launcher/otis_launcher.c",
+                "OtisIcon.png"):
+        sh.copy2(REPO / rel, weird / rel)
+    keep = weird / "dist" / "Otis.app" / "keep.txt"
+    keep.parent.mkdir(parents=True)
+    keep.write_text("previous build")
+    proc = subprocess.run(["bash", str(weird / "scripts" / "build_app.sh")],
+                          capture_output=True, text=True, timeout=120)
+    assert proc.returncode != 0
+    assert keep.exists(), "the previous build must survive a refused path"

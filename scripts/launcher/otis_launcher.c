@@ -46,6 +46,20 @@ static int open_launch_log(void) {
 }
 
 int main(void) {
+    /* Started with 0-2 closed (a wrapper rather than LaunchServices), the
+     * descriptors below would land on 0 and 1 and the dup2 order would send
+     * the child's stderr to /dev/null. Fill 0-2 first. */
+    for (;;) {
+        int fd = open("/dev/null", O_RDWR);
+        if (fd < 0) {
+            break;
+        }
+        if (fd > STDERR_FILENO) {
+            close(fd);
+            break;
+        }
+    }
+
     int null_fd = open("/dev/null", O_RDWR | O_CLOEXEC);
     int log_fd = open_launch_log();
     int err_fd = log_fd >= 0 ? log_fd : null_fd;
