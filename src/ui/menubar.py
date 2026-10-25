@@ -298,10 +298,36 @@ class MenuBarApp(HealthPanelMixin, SettingsMenuMixin):
         import rumps
 
         rumps.events.before_quit.register(self._on_before_quit)
+        self._install_terminate_signals()
         try:
             self._app.run()
         finally:
             self._teardown()
+
+    def _install_terminate_signals(self) -> None:
+        """Make `kill` (SIGTERM/SIGHUP) a normal Quit.
+
+        The Python process is not the app LaunchServices tracks (the applet
+        is), so at logout or shutdown it can get a bare SIGTERM — which ended
+        it instantly: no quit line, no before_quit, a running recording's WAV
+        left for wav_repair. Python runs signal handlers on the main thread
+        between bytecodes; the 100 ms drain timer guarantees there are some.
+        """
+        import signal
+
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            try:
+                signal.signal(sig, self._on_terminate_signal)
+            except (ValueError, OSError):  # not the main thread (tests)
+                logger.debug("Could not install a handler for %s", sig)
+
+    def _on_terminate_signal(self, signum: int, _frame: Any) -> None:
+        import signal
+
+        import rumps
+
+        logger.warning("Otis received %s; quitting.", signal.Signals(signum).name)
+        rumps.quit_application()
 
     def notify_transcription_progress(self, pct: int) -> None:
         """Surface transcription progress in the menu-bar title (thread-safe).

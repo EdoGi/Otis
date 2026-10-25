@@ -187,3 +187,32 @@ def test_run_sh_keeps_a_launch_log_when_not_on_a_terminal(tmp_path: Path) -> Non
     text = launch_log.read_text(encoding="utf-8")
     assert "Otis launching" in text
     assert "usage: otis" in text  # python's own output lands there too
+
+
+# ---------------------------------------------------------------------------
+# kill / SIGTERM
+# ---------------------------------------------------------------------------
+def test_sigterm_quits_through_the_normal_quit_path(tmp_path: Path, log_dir: Path, monkeypatch) -> None:
+    """A plain `kill` (or launchd at shutdown — the Python process is not the
+    app LaunchServices knows) ended the menu bar instantly: no quit line, no
+    before_quit, a running recording's WAV left unfinalised. It now asks AppKit
+    to terminate, which runs the same handler a menu Quit does."""
+    import signal
+
+    import rumps
+
+    quits: list[bool] = []
+    monkeypatch.setattr(rumps, "quit_application", lambda *a: quits.append(True))
+    previous = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP)}
+    app = _headless_app(tmp_path, _Detector())
+    main_mod._configure_logging("INFO")
+    try:
+        app.run()
+        assert signal.getsignal(signal.SIGTERM) == app._on_terminate_signal
+        app._on_terminate_signal(signal.SIGTERM, None)
+    finally:
+        rumps.events.before_quit.unregister(app._on_before_quit)
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+    assert quits == [True]
+    assert "SIGTERM" in _log_text(log_dir)
