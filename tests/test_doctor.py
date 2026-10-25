@@ -273,6 +273,9 @@ def test_the_web_ui_probe_never_goes_through_a_proxy(monkeypatch) -> None:
     threading.Thread(target=server.serve_forever, daemon=True).start()
     monkeypatch.setenv("http_proxy", "http://127.0.0.1:9")  # nothing listens there
     monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
+    # A shell's NO_PROXY=127.0.0.1 would let a urllib revert slip through.
+    monkeypatch.delenv("no_proxy", raising=False)
+    monkeypatch.delenv("NO_PROXY", raising=False)
     try:
         page = doctor._fetch_page("127.0.0.1", server.server_address[1])
     finally:

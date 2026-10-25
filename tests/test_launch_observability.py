@@ -357,12 +357,16 @@ def test_console_level_follows_where_stderr_goes(tmp_path: Path, log_dir: Path,
     else:
         stream = open(tmp_path / "stderr.txt", "w")
     monkeypatch.setattr(sys, "stderr", stream)
+    root = logging.getLogger()
     try:
         main_mod._configure_logging("INFO")
-        console = next(h for h in logging.getLogger().handlers
-                       if type(h) is logging.StreamHandler)
+        console = next(h for h in root.handlers if type(h) is logging.StreamHandler)
         assert logging.getLevelName(console.level if console.level else logging.INFO) == level
     finally:
+        # Detach before closing: a root handler left on a closed stream turns
+        # every later warning in the run into "Logging error" noise.
+        for h in [h for h in root.handlers if getattr(h, "stream", None) is stream]:
+            root.removeHandler(h)
         stream.close()
         if target == "pipe":
             os.close(r)
@@ -394,3 +398,30 @@ def test_a_signal_during_a_menu_quit_lets_the_save_finish(tmp_path: Path, log_di
     app._recorder = SlowRecorder()
     app._on_quit_clicked(None)
     assert events == ["stop-start", "stop-end", "quit"]
+
+
+def test_a_signal_during_a_logout_lets_the_save_finish(tmp_path: Path, log_dir: Path,
+                                                       monkeypatch) -> None:
+    """A logout reaches before_quit without _on_quit_clicked and stops the
+    recording there; a SIGTERM from launchd during that stop must not call
+    terminate_ a second time (review round 3: no test covered this half)."""
+    import rumps
+
+    from src.audio.recorder import RecorderState
+
+    events: list[str] = []
+    monkeypatch.setattr(rumps, "quit_application", lambda *a: events.append("quit"))
+    app = _headless_app(tmp_path, _Detector())
+
+    class SlowRecorder:
+        state = RecorderState.RECORDING
+
+        def stop(self):
+            events.append("stop-start")
+            app._on_terminate_signal(15, None)
+            events.append("stop-end")
+            return {}
+
+    app._recorder = SlowRecorder()
+    app._on_before_quit()
+    assert events == ["stop-start", "stop-end"]

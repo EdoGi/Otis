@@ -172,3 +172,19 @@ def test_a_forced_alert_after_a_fix_click_still_toasts(tmp_path, registry, monke
     start = _problems(app)
     _flip(app, registry, [HealthState.FAIL], force=True)       # the ten-minute report
     assert _problems(app) == start + 1
+
+
+@pytest.mark.parametrize("route", [ROUTED, SPEAKERS], ids=["routed", "speakers-with-app-into-otis"])
+def test_a_forced_first_alert_spends_the_allowance(tmp_path, registry, route) -> None:
+    """Review round 3: joining early (nothing heard for 60 s) forces the first
+    "problem" toast; it must still count, or the next ordinary quiet stretch
+    toasts a second time."""
+    app = _app(tmp_path, registry, [route])
+    registry.report(SYSTEM_AUDIO, label="System audio", state=HealthState.OK,
+                    detail="signal ok")  # a previous meeting's live signal
+    app._drain_main_queue(None)
+    _start_recording(app)
+    _flip(app, registry, [HealthState.FAIL], force=True)       # silence since the start
+    _flip(app, registry, [HealthState.OK, HealthState.FAIL, HealthState.OK, HealthState.FAIL])
+    titles = [t for t, _s, _m in app._sent]
+    assert titles[titles.index("Recording started"):].count("System audio problem") == 1

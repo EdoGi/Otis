@@ -206,7 +206,7 @@ class HealthPanelMixin:
             return False
         if self._snapshot.state not in (UiState.RECORDING, UiState.PAUSED):
             return False
-        if self._user_check_in_progress or report.forced:
+        if self._user_check_in_progress:
             return False
         if report.state in (HealthState.WARN, HealthState.FAIL):
             kind = "problem"
@@ -214,9 +214,14 @@ class HealthPanelMixin:
             kind = "recovered"
         else:
             return False
+        shown = self._stream_toasts.setdefault(report.key, set())
+        if report.forced:
+            # Never capped — but it does spend the allowance, or an ordinary
+            # quiet stretch after it would toast again (review round 3).
+            shown.add(kind)
+            return False
         if kind == "problem" and report.key == SYSTEM_AUDIO and self._route_lost_mid_recording():
             return False
-        shown = self._stream_toasts.setdefault(report.key, set())
         if kind in shown:
             logger.info("%s %s toast skipped: already shown this recording.",
                         report.label, kind)
