@@ -27,6 +27,13 @@ REPO = Path(__file__).resolve().parent.parent
 
 @pytest.fixture
 def log_dir(tmp_path: Path, monkeypatch) -> Path:
+    import src.audio.blackhole_check as bc
+
+    # MenuBarApp.run() checks BlackHole at launch; keep real PortAudio out.
+    monkeypatch.setattr(
+        bc, "verify_blackhole_setup",
+        lambda device_manager=None: bc.BlackHoleStatus(installed=True, multi_output_configured=True),
+    )
     monkeypatch.setattr(main_mod, "LOG_DIR", tmp_path)
     # main() installs process-wide hooks; put the originals back afterwards.
     monkeypatch.setattr(sys, "excepthook", sys.excepthook)
@@ -116,6 +123,10 @@ def _headless_app(tmp_path: Path, detector):
         def run(self, **kwargs):  # the real one blocks until Quit
             return None
 
+    from src.audio.blackhole_check import RoutingState, RoutingStatus
+
+    # tmp audio dir and an injected routing check: run() must not scan the
+    # user's ~/Otis/audio or ask this Mac's CoreAudio (review finding).
     return MenuBarApp(
         config=Config({"app": {"working_days": []}}),
         detector=detector,
@@ -123,8 +134,10 @@ def _headless_app(tmp_path: Path, detector):
         notifications=NotificationManager(backend=lambda t, s, m: None),
         icons_dir=tmp_path / "icons",
         user_config_path=tmp_path / "config.yaml",
+        audio_dir=tmp_path / "audio",
         health=HealthRegistry(),
         rumps_app_factory=NoLoopApp,
+        routing_check=lambda: RoutingStatus(state=RoutingState.UNKNOWN),
     )
 
 
@@ -149,10 +162,11 @@ def test_quit_is_logged_and_stops_detection(tmp_path: Path, log_dir: Path) -> No
     app.run()
     try:
         assert app._on_before_quit in rumps.events.before_quit.callbacks
+        before = detector.stopped  # run()'s own teardown already stopped it once
         app._on_before_quit()
     finally:
         rumps.events.before_quit.unregister(app._on_before_quit)
-    assert detector.stopped >= 1
+    assert detector.stopped == before + 1
     assert "Otis quitting" in _log_text(log_dir)
 
 

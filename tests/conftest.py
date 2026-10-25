@@ -226,6 +226,29 @@ def _never_write_the_users_log(tmp_path_factory, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _never_read_the_users_config(tmp_path_factory, monkeypatch):
+    """Keep the suite off ``~/.otis/config.yaml`` (a review finding).
+
+    Tests that go through main() load the user config; an invalid one made
+    every 'ui' test take the bad-config path — and rumps.alert, a modal that
+    blocks the run until someone clicks it. The suite's result depended on
+    the developer's personal settings. Tests that need a config set
+    USER_CONFIG_PATH themselves.
+    """
+    import src.config as config_mod
+
+    monkeypatch.setattr(config_mod, "USER_CONFIG_PATH",
+                        tmp_path_factory.mktemp("otis-cfg") / "config.yaml")
+    try:
+        import rumps
+    except ImportError:  # pragma: no cover (not macOS)
+        return
+    # Never a real modal under test; tests asserting "no modal" install a
+    # raising stub of their own on top of this.
+    monkeypatch.setattr(rumps, "alert", lambda *a, **k: 1)
+
+
+@pytest.fixture(autouse=True)
 def _restore_signal_handling():
     """MenuBarApp.run() (and OtisDaemon.run()) install SIGTERM/SIGHUP/SIGINT
     handlers and a wakeup fd for the whole process. Left behind, a later

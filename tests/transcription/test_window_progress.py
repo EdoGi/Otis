@@ -106,3 +106,39 @@ def test_without_a_listener_nothing_is_reported() -> None:
     # The default: retranscribe.py and the tests call it bare.
     out = we._transcribe_windowed(_FakeMlx(), _Samples(25 * 60), language="fr")
     assert out["segments"]
+
+
+def test_the_engine_feeds_window_reports_to_its_estimator(tmp_path, monkeypatch) -> None:
+    """The one line that wires this into WhisperEngine.transcribe had no test
+    (review finding); drop it and the bar sits at a window ceiling again."""
+    import wave
+
+    import numpy as np
+
+    from src.transcription.whisper_engine import WhisperEngine
+
+    wav = tmp_path / "x_mic.wav"
+    tone = (0.2 * np.sin(np.linspace(0, 2000 * np.pi, 16000 * 6))).astype(np.float32)
+    with wave.open(str(wav), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+        w.writeframes((tone * 32767).astype("<i2").tobytes())
+
+    got: list[float] = []
+    real = we._ProgressEstimator.window_done
+
+    def spy(self, fraction):
+        got.append(fraction)
+        real(self, fraction)
+
+    monkeypatch.setattr(we._ProgressEstimator, "window_done", spy)
+
+    def fake_transcribe(audio, **kw):
+        we._report_window(0.5)
+        return {"text": "hi", "segments": [{"start": 0.0, "end": 1.0, "text": "hi"}]}
+
+    engine = WhisperEngine(transcribe_fn=fake_transcribe, rtf_state_path=tmp_path / "rtf.json",
+                           report_health=False)
+    engine.transcribe(wav, on_progress=lambda _p: None)
+    assert got == [0.5]

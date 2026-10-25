@@ -201,7 +201,10 @@ def test_exit_code_follows_failures_not_warnings(monkeypatch, capsys) -> None:
 
 def test_doctor_runs_beside_a_running_otis(tmp_path: Path, monkeypatch) -> None:
     """Like check-audio, it is most useful while Otis is up: no lock taken."""
-    monkeypatch.setattr(doctor, "run_checks", lambda *a, **k: [])
+    ran: list[bool] = []
+    monkeypatch.setattr(doctor, "run_checks", lambda *a, **k: ran.append(True) or [])
+    monkeypatch.setattr(main_mod, "_defer_to_running_instance",
+                        lambda *a: pytest.fail("doctor deferred to the running copy"))
     from src import single_instance
 
     lock = single_instance.acquire(main_mod.LOG_DIR / single_instance.LOCK_NAME, command="ui")
@@ -210,6 +213,7 @@ def test_doctor_runs_beside_a_running_otis(tmp_path: Path, monkeypatch) -> None:
     finally:
         assert lock is not None
         lock.release()
+    assert ran == [True]
 
 
 # ---------------------------------------------------------------------------

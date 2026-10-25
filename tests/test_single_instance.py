@@ -196,8 +196,12 @@ def test_a_free_lock_is_taken_and_released_around_the_app(run_dir: Path, monkeyp
 def test_check_audio_runs_while_otis_is_running(run_dir: Path, holder, monkeypatch) -> None:
     """Diagnostics must work exactly when Otis is up — never take the lock."""
     holder(run_dir / LOCK_NAME)
-    monkeypatch.setattr(main_mod, "_print_audio_status", lambda cfg: 0)
-    assert main_mod.main(["check-audio"]) == 0
+    monkeypatch.setattr(main_mod, "_print_audio_status", lambda cfg: 42)
+    monkeypatch.setattr(main_mod, "_defer_to_running_instance",
+                        lambda *a: pytest.fail("check-audio deferred to the running copy"))
+    # 42 proves the lock-free path ran: deferring also returns 0 (review finding).
+    assert main_mod.main(["check-audio"]) == 42
+    assert not (run_dir / SURFACE_NAME).exists()
 
 
 # ---------------------------------------------------------------------------

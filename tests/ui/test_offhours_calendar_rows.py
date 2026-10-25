@@ -45,6 +45,7 @@ def _off_hours_app(tmp_path: Path, pollers: list[GoogleCalendarPoller]):
         notifications=NotificationManager(backend=lambda t, s, m: None),
         icons_dir=tmp_path / "icons",
         user_config_path=tmp_path / "config.yaml",
+        audio_dir=tmp_path / "audio",  # run() must not scan the user's ~/Otis/audio
         health=get_health(),
         rumps_app_factory=NoLoopApp,
     )

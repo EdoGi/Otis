@@ -22,3 +22,17 @@ def _routing_is_unknown(monkeypatch):
         lambda probe=None: bc.RoutingStatus(state=bc.RoutingState.UNKNOWN,
                                             error="not checked under test"),
     )
+
+
+@pytest.fixture(autouse=True)
+def _blackhole_is_installed(monkeypatch):
+    """MenuBarApp.run()'s launch check enumerates real PortAudio devices too."""
+    import src.audio.blackhole_check as bc
+
+    monkeypatch.setattr(
+        bc, "verify_blackhole_setup",
+        lambda device_manager=None: bc.BlackHoleStatus(
+            installed=True, multi_output_configured=True,
+            blackhole_device_name="BlackHole 2ch", multi_output_device_name="Otis",
+        ),
+    )
