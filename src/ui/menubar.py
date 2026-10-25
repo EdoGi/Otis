@@ -275,7 +275,9 @@ class MenuBarApp(SettingsMenuMixin):
         # Survives a quit or a crash mid-transcription; drained by run().
         # Sited next to the config so it lands in ~/.otis/queue in real use and
         # inside the tmp dir under test, without a separate knob.
-        self._queue = TranscriptionQueue(self._user_config_path.parent / "queue")
+        self._queue = TranscriptionQueue(
+            self._user_config_path.parent / "queue", audio_dir=self._audio_dir
+        )
         self._icons = ensure_icons(self._icons_dir)
         self._app = self._build_app(rumps_app_factory)
         self._wire_detector_callbacks()

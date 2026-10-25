@@ -47,12 +47,30 @@ class QueuedJob:
         raw = self.metadata.get("mic_wav")
         return Path(str(raw)) if raw else None
 
+    def mic_path_in(self, audio_dir: Path | None) -> Path | None:
+        """Where the mic WAV is. The recorder stores a bare name relative to
+        the audio dir, and the processor resolves it the same way."""
+        path = self.mic_path
+        if path is None or audio_dir is None:
+            return path
+        return audio_dir / path  # an absolute ``path`` wins over audio_dir
+
 
 class TranscriptionQueue:
     """Crash-visible record of transcriptions that have not finished."""
 
-    def __init__(self, queue_dir: str | os.PathLike[str] | None = None) -> None:
+    def __init__(
+        self,
+        queue_dir: str | os.PathLike[str] | None = None,
+        *,
+        audio_dir: str | os.PathLike[str] | None = None,
+    ) -> None:
         self._dir = Path(queue_dir or DEFAULT_QUEUE_DIR).expanduser()
+        # Without it, a relative mic_wav was checked against the process's
+        # working directory (the repo, under run.sh), so every interrupted
+        # menu-bar job looked audio-less and was deleted — including an
+        # 84-minute meeting on 2026-09-03 whose WAVs were still on disk.
+        self._audio_dir = Path(audio_dir).expanduser() if audio_dir else None
 
     @property
     def directory(self) -> Path:
@@ -137,7 +155,7 @@ class TranscriptionQueue:
         """
         keep: list[QueuedJob] = []
         for job in jobs:
-            mic = job.mic_path
+            mic = job.mic_path_in(self._audio_dir)
             if mic is None or not mic.exists():
                 logger.info(
                     "Queued session %s has no audio left; dropping.", job.session_id

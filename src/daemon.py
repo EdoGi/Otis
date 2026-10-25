@@ -125,7 +125,8 @@ class OtisDaemon:
         from src.storage.transcription_queue import TranscriptionQueue
 
         self._queue = TranscriptionQueue(
-            Path(str(config.get("storage", "queue_dir", default="~/.otis/queue")))
+            Path(str(config.get("storage", "queue_dir", default="~/.otis/queue"))),
+            audio_dir=Path(str(config.get("storage", "audio_dir", default="~/Otis/audio"))),
         )
 
         self._detector = detector or self._build_detector()
