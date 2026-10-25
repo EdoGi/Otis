@@ -243,6 +243,7 @@ class MenuBarApp(HealthPanelMixin, SettingsMenuMixin):
         # Live input meters while recording, kept apart from the registry so
         # they never overwrite a row's reason (see _refresh_level_meters).
         self._live_meters: dict[str, str] = {}
+        self._begin_recording_toasts()
         self._health_rows_shown: list[str] = []
         self._health_items: list[Any] = []
         self._meter_items: dict[str, Any] = {}
@@ -1316,6 +1317,7 @@ class MenuBarApp(HealthPanelMixin, SettingsMenuMixin):
         self._events.put(("recorder_started", (recorder, session_id)))
 
     def _handle_recorder_started(self, recorder: Any, session_id: str) -> None:
+        self._begin_recording_toasts()
         with self._lock:
             self._starting = False
             self._recorder = recorder

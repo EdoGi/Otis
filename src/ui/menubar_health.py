@@ -17,6 +17,7 @@ import threading
 from typing import TYPE_CHECKING, Any
 
 from src.health import (
+    MICROPHONE,
     SYSTEM_AUDIO,
     HealthReport,
     HealthState,
@@ -155,6 +156,8 @@ class HealthPanelMixin:
         # perfectly healthy startup had just "recovered".
         if previous is HealthState.UNSET and report.state is HealthState.OK:
             return
+        if self._stream_toast_capped(report):
+            return
 
         if report.state in (HealthState.WARN, HealthState.FAIL):
             body = report.detail or "needs attention"
@@ -173,6 +176,46 @@ class HealthPanelMixin:
                 report.detail or "working again",
                 force=True,
             )
+
+    def _begin_recording_toasts(self) -> None:
+        self._stream_toasts: dict[str, set[str]] = {}
+
+    def _stream_toast_capped(self, report: HealthReport) -> bool:
+        """At most one "problem" and one "recovered" toast per stream per recording.
+
+        The system stream is flagged after 60 s of digital silence — what a
+        muted far side sounds like — and every flip raised a toast with a
+        sound: 12 in 21 minutes on 2026-09-24, each time recovering on its own.
+        The panel still shows every change. A silence while the Mac's output
+        no longer feeds BlackHole (earbuds connected mid-call) is real news and
+        is never capped.
+        """
+        if report.key not in (SYSTEM_AUDIO, MICROPHONE):
+            return False
+        if self._snapshot.state not in (UiState.RECORDING, UiState.PAUSED):
+            return False
+        if report.state in (HealthState.WARN, HealthState.FAIL):
+            kind = "problem"
+        elif report.state is HealthState.OK:
+            kind = "recovered"
+        else:
+            return False
+        if kind == "problem" and report.key == SYSTEM_AUDIO:
+            from src.audio.blackhole_check import RoutingState
+
+            try:
+                route = self._check_routing().state
+            except Exception:
+                route = RoutingState.UNKNOWN
+            if route in (RoutingState.NOT_ROUTED, RoutingState.INAUDIBLE):
+                return False
+        shown = self._stream_toasts.setdefault(report.key, set())
+        if kind in shown:
+            logger.info("%s %s toast skipped: already shown this recording.",
+                        report.label, kind)
+            return True
+        shown.add(kind)
+        return False
 
     def _refresh_health_menu(self) -> None:
         """Render the Status submenu: one row per component, then live meters.
