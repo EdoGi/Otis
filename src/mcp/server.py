@@ -9,8 +9,12 @@ and no port to configure:
 (``-P`` keeps the MCP client's cwd off ``sys.path`` so a foreign ``src``
 package there can't shadow Otis's modules.)
 
-All tools are read-only; nothing leaves the machine. Tool logic lives in
-:mod:`src.mcp.core` so it stays unit-testable without the MCP runtime.
+All tools are read-only and this process opens no network connection. What
+it returns, though, goes into the calling client's model context — for
+Claude Desktop or Claude Code that means Anthropic's servers — so a
+``get_transcript`` call sends that whole transcript off the machine. Tool
+logic lives in :mod:`src.mcp.core` so it stays unit-testable without the MCP
+runtime.
 
 IMPORTANT: stdout belongs to the MCP protocol. Any logging here goes to
 stderr — a stray print() would corrupt the JSON-RPC stream.

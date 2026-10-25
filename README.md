@@ -1,8 +1,9 @@
 # Otis
 
 **Local macOS meeting transcriber.** Records mic + system audio, transcribes
-with Whisper on-device, exposes transcripts to Claude via MCP. Nothing leaves
-your Mac.
+with Whisper on-device, and can expose transcripts to Claude via MCP. Otis
+itself sends nothing off your Mac; an AI client you connect over MCP sends
+whatever it reads to its own provider (see [Privacy](#privacy)).
 
 [![status](https://img.shields.io/badge/phase-6%2F6-blue)](#phases) [![tests](https://img.shields.io/badge/tests-881%20passing-brightgreen)](#tests) [![python](https://img.shields.io/badge/python-3.12-blue)](https://www.python.org) [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
@@ -12,8 +13,9 @@ your Mac.
 
 Meeting transcribers are everywhere, and they all upload your audio somewhere.
 Otis doesn't. The recording, transcription, storage, and search index all live
-on your Mac. The MCP server lets Claude search and summarise your meetings
-without sending the contents to anyone.
+on your Mac. The optional MCP server lets Claude search and summarise your
+meetings — and for that, what Claude reads goes to Anthropic, because that is
+where the model runs.
 
 ## Phases
 
@@ -289,8 +291,16 @@ Everything is on-device:
 - Audio capture runs locally via `sounddevice` + BlackHole.
 - Transcription runs locally via `mlx-whisper` (Apple Silicon GPU).
 - Transcripts are written as Markdown files in `~/Otis/transcripts/`.
-- The web UI binds to `127.0.0.1` only; the MCP server runs over stdio
-  (no network socket at all) and is read-only.
+- The web UI binds to `127.0.0.1` only and refuses requests whose Host is
+  not local (DNS rebinding); the MCP server runs over stdio (no network
+  socket at all) and is read-only.
+- **The one exception you opt into:** an MCP client such as Claude Desktop or
+  Claude Code puts every tool result — titles, search snippets, whole
+  transcripts from `get_transcript` — into its model's context, which is
+  processed by that client's provider (Anthropic, for Claude). To keep
+  meetings strictly on the Mac, don't register the `otis` MCP server (or
+  remove it: the `otis` entry in `claude_desktop_config.json`, and
+  `claude mcp remove otis`).
 - The Google Calendar token is OAuth-2 with the **read-only** scope —
   Otis can't write to or delete your calendars.
 - No telemetry. No analytics. No phone-home. Until recently that last one was
