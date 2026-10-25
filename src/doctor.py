@@ -258,6 +258,27 @@ def check_disk(path: Path) -> Check:
     return Check("Disk", Verdict.OK, detail)
 
 
+def check_unused_models(active: str, cached: list[Any], *, free_bytes: int) -> Check:
+    """Whisper models on disk that the configured one is not — and the fix.
+
+    Read-only: it points at `prune-models` rather than deleting anything.
+    """
+    from src.storage.audio_retention import LOW_DISK_WARN_BYTES
+    from src.storage.model_cache import is_model_cached
+
+    unused = [m for m in cached if not is_model_cached(active, {m.name})]
+    if not unused:
+        return Check("Unused Whisper models", Verdict.OK, "none")
+    total_mb = sum(m.size_mb for m in unused)
+    names = ", ".join(m.name for m in unused)
+    verdict = Verdict.WARN if free_bytes < LOW_DISK_WARN_BYTES else Verdict.OK
+    # The command goes in the detail too: render() only prints fixes for
+    # warnings, and the hint is the point of the row.
+    return Check("Unused Whisper models", verdict,
+                 f"{names}: {total_mb:.0f} MB reclaimable (./scripts/run.sh prune-models)",
+                 "./scripts/run.sh prune-models --dry-run, then without --dry-run")
+
+
 def check_calendar_accounts(cfg: Any) -> list[Check]:
     """Token files only — no OAuth refresh, no request to Google."""
     from src.detection.calendar_poller import build_pollers_from_config
@@ -343,8 +364,15 @@ def run_checks(config_path: Path | None = None, *, run_dir: Path | None = None) 
     checks.append(_guarded(f"Web UI port {port}", check_port,
                            str(cfg.get("web", "host", default="127.0.0.1")), port,
                            otis_command=holder.command if holder else None))
-    checks.append(_guarded("Disk", check_disk, Path(str(cfg.get(
-        "storage", "audio_dir", default="~/Otis/audio"))).expanduser()))
+    audio_dir = Path(str(cfg.get("storage", "audio_dir", default="~/Otis/audio"))).expanduser()
+    checks.append(_guarded("Disk", check_disk, audio_dir))
+    checks.append(_guarded(
+        "Unused Whisper models",
+        lambda: check_unused_models(
+            model, list_cached_models(),
+            free_bytes=shutil.disk_usage(audio_dir if audio_dir.exists() else Path.home()).free,
+        ),
+    ))
     calendar = _guarded("Calendar", check_calendar_accounts, cfg)
     checks += calendar if isinstance(calendar, list) else [calendar]
     return checks

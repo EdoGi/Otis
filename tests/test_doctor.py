@@ -281,3 +281,23 @@ def test_the_web_ui_probe_never_goes_through_a_proxy(monkeypatch) -> None:
     finally:
         server.shutdown()
     assert page is not None and "Otis</title>" in page
+
+
+def test_unused_models_are_reported_with_how_to_reclaim_them(tmp_path) -> None:
+    """The disk was 97% full on 2026-10-25 with small and tiny (555 MB) cached
+    but unused; prune-models existed and nothing pointed at it."""
+    from src.storage.model_cache import CachedModel
+
+    models = [CachedModel("medium", tmp_path, 1_525_000_000),
+              CachedModel("small", tmp_path, 481_000_000),
+              CachedModel("tiny", tmp_path, 74_000_000)]
+    check = doctor.check_unused_models("medium", models, free_bytes=16 * 1000**3)
+    assert check.verdict is Verdict.OK
+    assert "small" in check.detail and "tiny" in check.detail and "555 MB" in check.detail
+    assert "prune-models" in check.fix
+
+    low = doctor.check_unused_models("medium", models, free_bytes=3 * 1000**3)
+    assert low.verdict is Verdict.WARN, "with the disk low, reclaiming is worth a warning"
+
+    none = doctor.check_unused_models("medium", models[:1], free_bytes=16 * 1000**3)
+    assert none.verdict is Verdict.OK and none.detail == "none"
