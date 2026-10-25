@@ -191,6 +191,10 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         help="Print BlackHole status and audio device list.",
     )
     sub.add_parser(
+        "doctor",
+        help="Check everything Otis depends on (read-only, no network).",
+    )
+    sub.add_parser(
         "run",
         help="Start the headless daemon (detection + auto-record on detection).",
     )
@@ -522,6 +526,12 @@ def main(argv: list[str] | None = None) -> int:
         os.getpid(), os.getppid(), command, sys.executable, os.getcwd(),
     )
 
+    if command == "doctor":
+        # Loads and reports the config itself: a broken config is a finding
+        # here, not a reason to stop.
+        from src import doctor
+
+        return doctor.main(args.config, run_dir=LOG_DIR)
     if command not in _EXCLUSIVE_COMMANDS:
         return _dispatch(args, command)
 
@@ -569,6 +579,7 @@ def _dispatch(
     print("  otis                    start the menu-bar app (default)")
     print("  otis ui                 same — explicit")
     print("  otis check-audio        verify BlackHole + audio devices")
+    print("  otis doctor             check everything Otis depends on")
     print("  otis run                headless detection + auto-record daemon")
     print("  otis --help             full options")
     return 0

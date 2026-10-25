@@ -77,7 +77,8 @@ itself is per-machine — not committed to the repo.
 
 ```bash
 ./scripts/run.sh                # menu-bar app (default)
-./scripts/run.sh check-audio    # one-shot: BlackHole + audio device list
+./scripts/run.sh check-audio    # BlackHole + devices + is the output routed? (exit 0 only if so)
+./scripts/run.sh doctor         # every dependency Otis has, read-only, no network
 ./scripts/run.sh prune-models   # reclaim Whisper models nothing uses (--dry-run to look first)
 ./scripts/run.sh run            # headless daemon: auto-records AND transcribes
 ```
@@ -277,7 +278,7 @@ otis/
 │   ├── probe_mic.py
 │   ├── smoke_record.py
 │   ├── smoke_process_monitor.py
-│   └── check_phase2.py
+│   └── check_phase2.py           # old self-check; now just runs `otis doctor`
 └── tests/
 ```
 

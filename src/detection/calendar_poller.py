@@ -257,6 +257,11 @@ class GoogleCalendarPoller:
         return self._thread is not None and self._thread.is_alive()
 
     # ------------------------------------------------------------------ auth
+    @property
+    def token_path(self) -> Path:
+        """Where this account's OAuth token lives (it may not exist)."""
+        return self._token_path
+
     def authenticate(self, *, headless: bool = False) -> Any:
         """Load (or perform first-run) OAuth credentials and return them.
 
