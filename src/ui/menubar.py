@@ -181,11 +181,13 @@ class MenuBarApp(SettingsMenuMixin):
         rumps_app_factory: Callable[..., Any] | None = None,
         health: HealthRegistry | None = None,
         surface_request_path: Path | None = None,
+        routing_check: Callable[[], Any] | None = None,
     ) -> None:
         self._config = config
         # A second launch drops a file here instead of starting another copy
         # (src/single_instance.py); the drain timer answers it.
         self._surface_request_path = surface_request_path
+        self._routing_check = routing_check
         self._health = health if health is not None else get_health()
         self._detector = detector
         self._recorder_factory = recorder_factory
@@ -304,10 +306,7 @@ class MenuBarApp(SettingsMenuMixin):
         silence. Existence is not routing, so we now check both.
         """
         try:
-            from src.audio.blackhole_check import (
-                check_output_routing,
-                verify_blackhole_setup,
-            )
+            from src.audio.blackhole_check import verify_blackhole_setup
 
             status = verify_blackhole_setup()
         except Exception:  # pragma: no cover (defensive)
@@ -330,9 +329,17 @@ class MenuBarApp(SettingsMenuMixin):
 
         # BlackHole exists. Is anything actually being routed into it?
         try:
-            self._report_audio_routing(check_output_routing())
+            self._report_audio_routing(self._check_routing())
         except Exception:  # pragma: no cover (defensive)
             logger.exception("Audio routing check raised on startup")
+
+    def _check_routing(self) -> Any:
+        """check_output_routing(), unless a test injected its own."""
+        if self._routing_check is not None:
+            return self._routing_check()
+        from src.audio import blackhole_check
+
+        return blackhole_check.check_output_routing()
 
     def notify_transcription_progress(self, pct: int) -> None:
         """Surface transcription progress in the menu-bar title (thread-safe).
@@ -1155,9 +1162,9 @@ class MenuBarApp(SettingsMenuMixin):
         at once, one notification carries the explanation, and the settings
         that fix the problem open.
         """
-        from src.audio.blackhole_check import RoutingState, check_output_routing
+        from src.audio.blackhole_check import RoutingState
 
-        status = check_output_routing()
+        status = self._check_routing()
         before = self._health.get(SYSTEM_AUDIO)
         self._report_audio_routing(status)
         after = self._health.get(SYSTEM_AUDIO)
@@ -1194,6 +1201,14 @@ class MenuBarApp(SettingsMenuMixin):
             self._health.report(
                 SYSTEM_AUDIO, label="System audio", state=HealthState.UNKNOWN,
                 detail="could not check routing", hint=status.message(),
+            )
+        elif status.state is RoutingState.INAUDIBLE:
+            # Otis records fine; it is the user who hears nothing. Labelling
+            # this "not routed" told them the opposite of what was wrong.
+            self._health.report(
+                SYSTEM_AUDIO, label="System audio", state=HealthState.WARN,
+                detail=f"recording, but no speakers in {status.default_output_name}",
+                hint=status.message(),
             )
         else:
             self._health.report(
@@ -1548,6 +1563,14 @@ class MenuBarApp(SettingsMenuMixin):
 
     def _start_recorder_worker(self) -> None:
         """Build and start the recorder off the main thread."""
+        # Routing is live state — macOS moves the default output to earbuds
+        # the moment they connect — and it used to be checked only at launch.
+        # Re-check now, *before* capture, so the stream's first audible block
+        # (which reports the row OK) always has the last word.
+        try:
+            self._report_audio_routing(self._check_routing())
+        except Exception:
+            logger.exception("Routing check at recording start raised")
         try:
             recorder = self._recorder_factory(self._config)
             recorder.on_device_error = self._cb_device_error
