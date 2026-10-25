@@ -249,6 +249,8 @@ class MenuBarApp(HealthPanelMixin, SettingsMenuMixin):
         # read by the per-recording toast cap.
         self._route_at_recording_start: Any = None
         self._user_check_in_progress = False
+        # (state, output name) of the last routing check that was reported.
+        self._last_route: tuple[Any, str] | None = None
         self._health_rows_shown: list[str] = []
         self._health_items: list[Any] = []
         self._meter_items: dict[str, Any] = {}
@@ -1337,7 +1339,13 @@ class MenuBarApp(HealthPanelMixin, SettingsMenuMixin):
         try:
             status = self._check_routing()
             self._route_at_recording_start = status.state
-            self._report_audio_routing(status)
+            # Only a *changed* route is news. With the speakers as default
+            # output and the meeting app playing into the Otis device, the
+            # check says "not routed" every time while the stream works; the
+            # row then carries newer live evidence ("signal ok") that an
+            # unchanged verdict must not overwrite with a false alarm.
+            if (status.state, status.default_output_name) != self._last_route:
+                self._report_audio_routing(status)
         except Exception:
             logger.exception("Routing check at recording start raised")
         try:

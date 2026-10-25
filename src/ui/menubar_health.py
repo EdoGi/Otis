@@ -55,6 +55,7 @@ class HealthPanelMixin:
         _recorder: Any
         _routing_check: Callable[[], Any] | None
         _route_at_recording_start: Any
+        _last_route: tuple[Any, str] | None
         _user_check_in_progress: bool
         _live_meters: dict[str, str]
         _health_rows_shown: list[str]
@@ -385,6 +386,8 @@ class HealthPanelMixin:
     def _report_audio_routing(self, status: Any) -> None:
         """Fold a routing check result into the health registry."""
         from src.audio.blackhole_check import RoutingState
+
+        self._last_route = (status.state, status.default_output_name)
 
         if status.state is RoutingState.OK:
             self._health.report(

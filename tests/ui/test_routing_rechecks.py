@@ -111,3 +111,33 @@ def test_a_failing_routing_check_never_blocks_recording(tmp_path, registry) -> N
     while not app._events.empty():
         events.append(app._events.get_nowait()[0])
     assert "recorder_started" in events
+
+
+SPEAKERS = RoutingStatus(state=RoutingState.NOT_ROUTED,
+                         default_output_name="Altoparlanti MacBook Pro", suggested_device="Otis")
+
+
+def test_an_unchanged_route_does_not_re_alarm_at_every_meeting(tmp_path, registry) -> None:
+    """Review finding: with the speakers as default output and the meeting app
+    playing into the Otis device, the launch check says "not routed", the
+    first recording's live signal says OK — and every later recording opened
+    with a fresh "will record as silence" alarm, then "recovered" seconds
+    later. The route had not changed, so there was nothing new to say."""
+    app = _app(tmp_path, registry, SPEAKERS, [])
+    app._report_audio_routing(SPEAKERS)            # launch: FAIL
+    registry.report(SYSTEM_AUDIO, label="System audio", state=HealthState.OK,
+                    detail="signal ok")            # meeting 1: live signal
+    app._drain_main_queue(None)
+    sent = len(app._sent)
+    app._start_recorder_worker()                   # meeting 2 starts
+    app._drain_main_queue(None)
+    assert registry.get(SYSTEM_AUDIO).state is HealthState.OK
+    assert not any("problem" in t for t, _s, _m in app._sent[sent:])
+
+
+def test_a_changed_route_is_still_reported_at_recording_start(tmp_path, registry) -> None:
+    calls: list[str] = []
+    app = _app(tmp_path, registry, EARBUDS, calls)
+    app._report_audio_routing(ROUTED)              # launch: routed through Otis
+    app._start_recorder_worker()                   # earbuds since then
+    assert registry.get(SYSTEM_AUDIO).state is HealthState.FAIL
