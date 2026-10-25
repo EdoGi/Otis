@@ -57,7 +57,6 @@ from src.detection.detector import (
 )
 from src.health import (
     CALENDAR,
-    MICROPHONE,
     SYSTEM_AUDIO,
     HealthRegistry,
     HealthReport,
@@ -100,6 +99,13 @@ from src.ui.notifications import (
     format_process_disappeared,
     format_transcription_complete,
 )
+from src.ui.rumps_support import (
+    SOUND_SETTINGS_URL,
+    _alert,
+    _forget_menu_item,
+    _meter_row,
+    _start_timer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -132,57 +138,6 @@ __all__ = [
     "whitelist_candidates",
     "write_user_config_override",
 ]
-
-
-#: Where 'Fix System Audio…' sends the user when the output bypasses BlackHole.
-SOUND_SETTINGS_URL = "x-apple.systempreferences:com.apple.Sound-Settings.extension"
-
-
-def _start_timer(timer: Any) -> None:
-    """Start a rumps.Timer so it also fires while a modal dialog is open.
-
-    rumps adds every Timer in NSDefaultRunLoopMode only, and NSAlert.runModal
-    runs the loop in NSModalPanelRunLoopMode, so while any alert was open the
-    100 ms drain, the schedule tick and the duration tick all stopped (probe:
-    11 fires per second -> 0). An unanswered 'Fix System Audio…' alert froze an
-    instance on 2026-09-10 — for three days — and again on 2026-10-14.
-
-    Event-tracking mode (a menu held open) is left out on purpose: the drain
-    rebuilds Status submenu items, which must not change under an open menu.
-    """
-    was_running = bool(getattr(timer, "is_alive", lambda: False)())
-    timer.start()
-    if was_running:
-        return
-    try:
-        from AppKit import NSModalPanelRunLoopMode
-        from Foundation import NSRunLoop
-
-        NSRunLoop.currentRunLoop().addTimer_forMode_(timer._nstimer, NSModalPanelRunLoopMode)
-    except Exception:  # pragma: no cover (no AppKit, or rumps internals changed)
-        logger.debug("Timer stays default-mode only", exc_info=True)
-
-
-def _alert(**kwargs: Any) -> Any:
-    """rumps.alert, brought to the front first.
-
-    Otis is an accessory app that rumps activates once, at launch, so a later
-    alert could open behind the frontmost window — invisible, while it blocked
-    the menu. Only deliberate confirmations still use one.
-    """
-    import rumps
-
-    try:
-        from AppKit import NSApplication
-
-        nsapp = NSApplication.sharedApplication()
-        if hasattr(nsapp, "activate"):
-            nsapp.activate()
-        else:  # pragma: no cover (macOS < 14)
-            nsapp.activateIgnoringOtherApps_(True)
-    except Exception:  # pragma: no cover
-        logger.debug("Could not activate before an alert", exc_info=True)
-    return rumps.alert(**kwargs)
 
 
 class MenuBarApp(SettingsMenuMixin):
@@ -285,6 +240,12 @@ class MenuBarApp(SettingsMenuMixin):
         # registry only fires on an actual state change, so a subsystem can
         # report on every poll tick without producing a single extra toast.
         self._health.on_change(self._cb_health_changed)
+        # Live input meters while recording, kept apart from the registry so
+        # they never overwrite a row's reason (see _refresh_level_meters).
+        self._live_meters: dict[str, str] = {}
+        self._health_rows_shown: list[str] = []
+        self._health_items: list[Any] = []
+        self._meter_items: dict[str, Any] = {}
         self._refresh_health_menu()
         # Brand the *application* icon (used in the About box, the force-quit
         # window, Notification Center, etc.) so it isn't the Python framework
@@ -833,6 +794,7 @@ class MenuBarApp(SettingsMenuMixin):
         if self._snapshot.state != UiState.RECORDING:
             self._timer_duration.stop()
             self._app.title = ""
+            self._clear_level_meters()
             self._apply_health_badge()
             return
         self._app.title = self._snapshot.title_text()
@@ -843,6 +805,12 @@ class MenuBarApp(SettingsMenuMixin):
 
         This is the check that would have caught the dead system stream during
         the very first meeting instead of two months later.
+
+        The meters used to be written into each health row's detail with
+        touch() — the only place the row's reason lives — so '✕ System audio —
+        not routed (…)' turned into '✕ System audio — ▃▃▃·····' and stayed so
+        after the meeting. They are their own rows now, one per stream, whether
+        or not that stream has a health row yet (the mic usually has none).
         """
         with self._lock:
             recorder = self._recorder
@@ -852,14 +820,13 @@ class MenuBarApp(SettingsMenuMixin):
             meters = recorder.level_meters(width=8)
         except Exception:  # pragma: no cover (defensive)
             return
-        for label, bar in meters.items():
-            key = SYSTEM_AUDIO if label == "system" else MICROPHONE
-            if self._health.get(key) is None:
-                continue
-            # touch() updates the detail line without touching state, so a
-            # live meter never fires a notification.
-            self._health.touch(key, detail=bar)
+        self._live_meters = {label: meters[label] for label in ("mic", "system") if label in meters}
         self._refresh_health_menu()
+
+    def _clear_level_meters(self) -> None:
+        if self._live_meters:
+            self._live_meters = {}
+            self._refresh_health_menu()
 
     def _on_schedule_tick(self, _timer: Any) -> None:
         """Move into / out of OFF_HOURS based on the working-hours window.
@@ -941,6 +908,8 @@ class MenuBarApp(SettingsMenuMixin):
                 self._app.title = ""
             except Exception:
                 logger.exception("Could not clear menu-bar title")
+        if state not in (UiState.RECORDING, UiState.PAUSED):
+            self._clear_level_meters()
 
         self._refresh_menu_visibility()
 
@@ -1069,31 +1038,57 @@ class MenuBarApp(SettingsMenuMixin):
             )
 
     def _refresh_health_menu(self) -> None:
-        """Rebuild the Status submenu from the registry snapshot."""
-        import rumps
+        """Render the Status submenu: one row per component, then live meters.
 
+        It used to delete and rebuild every item on each call — once a second
+        while recording — and rumps keeps every MenuItem it registers, so each
+        recording hour leaked ~18,000 entries (8-16 MB). Now rows are rebuilt
+        only when their text changes (and the old ones are released), and the
+        meter rows are retitled in place.
+        """
         root = self._mi.get("health_root")
         if root is None:
             return
+        reports = self._health.snapshot()
+        rows = [rep.one_line() for rep in reports] or ["(no checks run yet)"]
+        meters = dict(self._live_meters)
+
+        if rows != self._health_rows_shown or list(meters) != list(self._meter_items):
+            self._rebuild_health_items(root, rows, meters)
+        else:
+            for label, bar in meters.items():
+                text = _meter_row(label, bar)
+                item = self._meter_items[label]
+                if item.title != text:
+                    item.title = text
+
+        overall = self._health.overall()
+        root.title = "Status" if overall is HealthState.OK else f"Status  {_GLYPH_FOR[overall]}"
+
+    def _rebuild_health_items(self, root: Any, rows: list[str], meters: dict[str, str]) -> None:
+        import rumps
+
+        for item in [*self._health_items, *self._meter_items.values()]:
+            _forget_menu_item(item)
         try:
             for key in list(root.keys()):
                 del root[key]
         except Exception:  # pragma: no cover (older rumps)
             pass
 
-        reports = self._health.snapshot()
-        if not reports:
-            item = rumps.MenuItem("(no checks run yet)")
+        self._health_items = []
+        for text in rows:
+            item = rumps.MenuItem(text)
+            item.set_callback(None)  # informational, not clickable
+            root.add(item)
+            self._health_items.append(item)
+        self._meter_items = {}
+        for label, bar in meters.items():
+            item = rumps.MenuItem(_meter_row(label, bar))
             item.set_callback(None)
             root.add(item)
-        else:
-            for rep in reports:
-                item = rumps.MenuItem(rep.one_line())
-                item.set_callback(None)  # informational, not clickable
-                root.add(item)
-
-        overall = self._health.overall()
-        root.title = "Status" if overall is HealthState.OK else f"Status  {_GLYPH_FOR[overall]}"
+            self._meter_items[label] = item
+        self._health_rows_shown = list(rows)
 
     def _apply_health_badge(self) -> None:
         """Show ⚠ next to the icon when something needs attention.
