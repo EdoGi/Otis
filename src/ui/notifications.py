@@ -44,6 +44,8 @@ class NotificationType(StrEnum):
     #: A setting was persisted. Its own type because these used to be sent as
     #: ERROR — "Whitelist saved" arriving as a failure.
     SETTING_SAVED = "setting_saved"
+    #: Otis.app was opened while Otis was already running.
+    ALREADY_RUNNING = "already_running"
     ERROR = "error"
 
 

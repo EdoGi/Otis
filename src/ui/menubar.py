@@ -47,6 +47,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from src import single_instance
 from src.audio.recorder import DualStreamRecorder, RecorderState
 from src.audio.wav_repair import repair_if_needed
 from src.config import Config
@@ -154,6 +155,9 @@ class MenuBarApp(SettingsMenuMixin):
         Where icons live (defaults to ``~/.otis/icons``).
     user_config_path:
         Where to persist Settings changes (defaults to ``~/.otis/config.yaml``).
+    surface_request_path:
+        Where a second launch asks this copy to show itself (``~/.otis/surface``
+        in real use; None disables the check).
     """
 
     def __init__(
@@ -170,8 +174,12 @@ class MenuBarApp(SettingsMenuMixin):
         user_config_path: Path | None = None,
         rumps_app_factory: Callable[..., Any] | None = None,
         health: HealthRegistry | None = None,
+        surface_request_path: Path | None = None,
     ) -> None:
         self._config = config
+        # A second launch drops a file here instead of starting another copy
+        # (src/single_instance.py); the drain timer answers it.
+        self._surface_request_path = surface_request_path
         self._health = health if health is not None else get_health()
         self._detector = detector
         self._recorder_factory = recorder_factory
@@ -476,6 +484,7 @@ class MenuBarApp(SettingsMenuMixin):
     # =====================================================================
     def _drain_main_queue(self, _timer: Any) -> None:
         self._sync_recorder_state()
+        self._answer_surface_request()
         while True:
             try:
                 event_type, payload = self._events.get_nowait()
@@ -485,6 +494,30 @@ class MenuBarApp(SettingsMenuMixin):
                 self._handle_event(event_type, payload)
             except Exception:  # pragma: no cover (defensive)
                 logger.exception("Error handling main-thread event %s", event_type)
+
+    def _answer_surface_request(self) -> None:
+        """Someone opened Otis.app again: show them the copy that is running.
+
+        A menu-bar app has no window to bring forward, and the icon may sit
+        behind the menu-bar overflow — the user relaunched precisely because
+        they could not see it. So: a notification that says so, then the menu
+        opened as if the icon had been clicked.
+        """
+        path = self._surface_request_path
+        if path is None or not single_instance.take_surface_request(path):
+            return
+        logger.info("Otis.app was opened again; showing the running copy.")
+        self._notifications.notify(
+            NotificationType.ALREADY_RUNNING,
+            "Otis is already running",
+            "Its icon is in the menu bar — the menu is open now. "
+            "If you can't see it, close a few menu-bar apps.",
+            force=True,
+        )
+        try:
+            self._app._nsapp.nsstatusitem.button().performClick_(None)
+        except Exception:  # headless tests, or rumps internals changed
+            logger.debug("Could not open the status menu", exc_info=True)
 
     def _sync_recorder_state(self) -> None:
         """Mirror recorder-initiated pause/resume into the UI.

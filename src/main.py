@@ -17,9 +17,11 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
+from src import single_instance
 from src.audio.blackhole_check import format_setup_instructions, verify_blackhole_setup
 from src.audio.devices import DeviceManager
 from src.config import Config, load_user_config
@@ -33,6 +35,17 @@ logger = logging.getLogger("otis")
 #: otherwise write into the user's real log and, at 1 MB with five rotations,
 #: push their actual meeting history out of it.
 LOG_DIR = Path("~/.otis")
+
+#: How long a second launch waits for the running menu bar to answer its
+#: "show yourself" request. Its drain timer polls every 100 ms, so a live copy
+#: answers in well under a second; one that has not answered after this long
+#: is not servicing its run loop (an unanswered modal did this twice).
+SURFACE_WAIT_SECONDS = 2.5
+
+#: Commands that own the mic, the queue and port 8765, and so must not run
+#: twice. check-audio, prune-models and the MCP server stay lock-free: they are
+#: most useful exactly while Otis is running.
+_EXCLUSIVE_COMMANDS = frozenset({"ui", "run"})
 
 
 def _configure_logging(level: str) -> None:
@@ -187,7 +200,7 @@ def _run_daemon(cfg: Config) -> int:
     return daemon.run()
 
 
-def _run_menubar(cfg: Config) -> int:
+def _run_menubar(cfg: Config, *, surface_request_path: Path | None = None) -> int:
     """Build the menu-bar app from config and start its event loop."""
     from src.detection.calendar_poller import build_pollers_from_config
     from src.detection.detector import MeetingDetector
@@ -287,6 +300,7 @@ def _run_menubar(cfg: Config) -> int:
         notifications=notifications,
         transcription_handler=transcription_handler,
         transcript_store=pipeline.store,
+        surface_request_path=surface_request_path,
     )
     app_ref.append(app)
     try:
@@ -324,6 +338,79 @@ def _report_bad_config(exc: BaseException, *, gui: bool = False) -> int:
     return 2
 
 
+def _bring_forward(pid: int) -> None:
+    """Activate another process so a modal it is stuck in comes to the front."""
+    try:
+        from AppKit import (
+            NSApplicationActivateIgnoringOtherApps,
+            NSRunningApplication,
+        )
+
+        running = NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+        if running is not None:
+            running.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
+    except Exception:  # pragma: no cover (no AppKit)
+        logger.debug("Could not bring pid %s forward", pid, exc_info=True)
+
+
+def _notify_from_second_launch(title: str, message: str) -> None:
+    """Best-effort toast from a process that is about to exit."""
+    try:
+        from src.ui.notifications import NotificationManager, NotificationType
+
+        NotificationManager().notify(NotificationType.ERROR, title, message, force=True)
+    except Exception:  # pragma: no cover (headless)
+        logger.debug("Could not post the second-launch notification", exc_info=True)
+
+
+def _defer_to_running_instance(command: str, run_dir: Path) -> int:
+    """Another Otis holds the lock: never start a second copy, but never be silent."""
+    holder = single_instance.read_holder(run_dir / single_instance.LOCK_NAME)
+    who = f"pid {holder.pid}" if holder.pid else "unknown pid"
+    logger.warning(
+        "Otis is already running (%s, %s); not starting a second copy for '%s'.",
+        who, holder.command or "?", command,
+    )
+    if command == "run":
+        print(f"Otis is already running ({who}). Quit it before starting the "
+              f"headless daemon.", file=sys.stderr)
+        return 1
+    if holder.command == "run":
+        _notify_from_second_launch(
+            "Otis daemon is running",
+            f"The headless daemon ({who}) is recording meetings. Stop it before "
+            f"opening the menu-bar app.",
+        )
+        return 1
+
+    surface = run_dir / single_instance.SURFACE_NAME
+    single_instance.request_surface(surface)
+    deadline = time.monotonic() + SURFACE_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        if not surface.exists():
+            logger.info("The running copy (%s) answered; it is showing its menu.", who)
+            return 0
+        time.sleep(0.05)
+
+    # Nobody consumed the request: that copy is alive (it holds the lock) but
+    # its main run loop is not turning. Say so, and try to raise whatever it is
+    # stuck behind. Withdraw the request so its menu does not pop open later.
+    single_instance.take_surface_request(surface)
+    logger.warning(
+        "The running copy (%s) did not respond within %.1fs; its main thread "
+        "looks frozen.", who, SURFACE_WAIT_SECONDS,
+    )
+    if holder.pid:
+        _bring_forward(holder.pid)
+    _notify_from_second_launch(
+        "Otis is running but not responding",
+        f"The copy already running ({who}) did not answer. If a dialog is open, "
+        f"answer it; otherwise quit it (Activity Monitor, or `kill {holder.pid or 'PID'}`) "
+        f"and open Otis again.",
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     _configure_logging(args.log_level)
@@ -333,6 +420,24 @@ def main(argv: list[str] | None = None) -> int:
     # daemon too, instead of silently reverting to bundled defaults.
     command = args.command or ("check-audio" if args.check_audio else "ui")
 
+    if command not in _EXCLUSIVE_COMMANDS:
+        return _dispatch(args, command)
+
+    # Before the config, the pipeline, the web bind and any toast: a duplicate
+    # launch should cost ~100 ms and touch nothing the running copy owns.
+    run_dir = LOG_DIR.expanduser()
+    lock = single_instance.acquire(run_dir / single_instance.LOCK_NAME, command=command)
+    if lock is None:
+        return _defer_to_running_instance(command, run_dir)
+    try:
+        return _dispatch(args, command, surface_request_path=run_dir / single_instance.SURFACE_NAME)
+    finally:
+        lock.release()
+
+
+def _dispatch(
+    args: argparse.Namespace, command: str, *, surface_request_path: Path | None = None
+) -> int:
     try:
         cfg = load_user_config(args.config)
         validate(dict(cfg.raw))
@@ -350,7 +455,7 @@ def main(argv: list[str] | None = None) -> int:
     if command == "run":
         return _run_daemon(cfg)
     if command == "ui":
-        return _run_menubar(cfg)
+        return _run_menubar(cfg, surface_request_path=surface_request_path)
 
     print("Otis — usage:")
     print("  otis                    start the menu-bar app (default)")
