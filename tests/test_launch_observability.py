@@ -321,3 +321,41 @@ def test_an_unwritable_launch_log_never_blocks_a_launch(tmp_path: Path) -> None:
     finally:
         log.chmod(0o644)
     assert proc.returncode == 0
+
+
+def test_run_sh_keeps_stdout_when_only_stderr_is_silenced(tmp_path: Path) -> None:
+    """Review round 2: the gate checked only stderr, so a user's own
+    `run.sh doctor 2>/dev/null` sent the report to launch.log. Only the
+    applet's case — both streams discarded — is redirected now."""
+    env = {**os.environ, "HOME": str(tmp_path)}
+    proc = subprocess.run(
+        ["bash", str(REPO / "scripts" / "run.sh"), "--help"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        text=True, env=env, timeout=60,
+    )
+    assert "usage: otis" in proc.stdout
+    assert not (tmp_path / ".otis" / "launch.log").exists()
+
+
+@pytest.mark.parametrize(("target", "level"), [("pipe", "INFO"), ("file", "WARNING")])
+def test_console_level_follows_where_stderr_goes(tmp_path: Path, log_dir: Path,
+                                                 monkeypatch, target, level) -> None:
+    """Into a file (run.sh's launch.log) only warnings go, so it does not
+    duplicate otis.log; a pipe — `run.sh run | tee`, a tool — keeps INFO."""
+    import logging
+
+    if target == "pipe":
+        r, w = os.pipe()
+        stream = os.fdopen(w, "w")
+    else:
+        stream = open(tmp_path / "stderr.txt", "w")
+    monkeypatch.setattr(sys, "stderr", stream)
+    try:
+        main_mod._configure_logging("INFO")
+        console = next(h for h in logging.getLogger().handlers
+                       if type(h) is logging.StreamHandler)
+        assert logging.getLevelName(console.level if console.level else logging.INFO) == level
+    finally:
+        stream.close()
+        if target == "pipe":
+            os.close(r)
