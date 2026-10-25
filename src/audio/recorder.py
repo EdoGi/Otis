@@ -533,27 +533,43 @@ class DualStreamRecorder:
     def _make_meter(self, label: str) -> LevelMonitor:
         """Build the level monitor for one stream, wired to the health panel."""
 
+        def on_first_signal(stream_label: str) -> None:
+            # The live stream is the best witness of whether capture works. A
+            # launch-time "not routed" used to stay up until a 60 s silence
+            # and a recovery — 33 minutes of a working meeting on 2026-10-21,
+            # because a meeting app can play straight into the Otis device
+            # while the default output is the speakers. Once per recording.
+            report_stream_health(stream_label, silent=False, detail="signal ok")
+
         def on_silence(stream_label: str, seconds: float) -> None:
             logger.warning(
                 "[%s] no signal for %.0fs — the stream is capturing silence.",
                 stream_label, seconds,
             )
+            # Nothing captured since the first block is the lost-far-side
+            # case. If the row is already FAIL (from launch) the registry
+            # would treat this as "no change" and stay silent, so force it.
+            # A pause after real audio is not forced: far-side pauses are
+            # ordinary.
             report_stream_health(
                 stream_label,
                 silent=True,
                 detail=f"no signal for {int(seconds)}s",
+                force_notify=not meter.has_heard_signal,
             )
 
         def on_signal(stream_label: str) -> None:
             logger.info("[%s] signal returned.", stream_label)
             report_stream_health(stream_label, silent=False, detail="signal ok")
 
-        return LevelMonitor(
+        meter = LevelMonitor(
             label,
             silence_seconds=self._silence_alert_seconds,
             on_silence=on_silence,
             on_signal=on_signal,
+            on_first_signal=on_first_signal,
         )
+        return meter
 
     @property
     def levels(self) -> dict[str, float]:

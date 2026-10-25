@@ -49,6 +49,7 @@ class LevelMonitor:
         clock: Callable[[], float] = time.monotonic,
         on_silence: Callable[[str, float], None] | None = None,
         on_signal: Callable[[str], None] | None = None,
+        on_first_signal: Callable[[str], None] | None = None,
         gap_tolerance_seconds: float = 2.0,
     ) -> None:
         self.label = label
@@ -57,6 +58,11 @@ class LevelMonitor:
         self._clock = clock
         self._on_silence = on_silence
         self._on_signal = on_signal
+        # on_signal means "recovered from a flagged silence" and stays quiet
+        # for a stream that is healthy from the start. This one fires once,
+        # on the first audible block, so a caller can say the stream works.
+        self._on_first_signal = on_first_signal
+        self._heard = False
         # A gap between observations longer than this means capture stopped
         # (pause, sleep) rather than the stream going quiet.
         self._gap_tolerance = float(gap_tolerance_seconds)
@@ -79,6 +85,7 @@ class LevelMonitor:
         now = self._clock()
         fire_silence = False
         fire_signal = False
+        fire_first = False
         silent_for = 0.0
 
         with self._lock:
@@ -100,6 +107,9 @@ class LevelMonitor:
             self._peak = max(self._peak, rms)
 
             if rms >= self._threshold:
+                if not self._heard:
+                    self._heard = True
+                    fire_first = True
                 if self._flagged:
                     fire_signal = True
                 self._silent_since = None
@@ -114,10 +124,18 @@ class LevelMonitor:
 
         # Callbacks fire outside the lock — they end up in the health registry,
         # which has its own lock and its own callbacks.
+        if fire_first and self._on_first_signal is not None:
+            self._safe(self._on_first_signal, self.label)
         if fire_silence and self._on_silence is not None:
             self._safe(self._on_silence, self.label, silent_for)
         if fire_signal and self._on_signal is not None:
             self._safe(self._on_signal, self.label)
+
+    @property
+    def has_heard_signal(self) -> bool:
+        """True once any block has been above the silence threshold."""
+        with self._lock:
+            return self._heard
 
     @staticmethod
     def _safe(fn: Callable[..., Any], *args: Any) -> None:

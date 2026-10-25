@@ -143,8 +143,13 @@ class HealthRegistry:
         state: HealthState,
         detail: str = "",
         hint: str | None = None,
+        force_notify: bool = False,
     ) -> HealthReport:
         """Record a component's state; fire callbacks only on a real change.
+
+        ``force_notify`` fires them for an unchanged state too, for the rare
+        report that is news even though the state is not — a stream that has
+        captured nothing at all while its row was already FAIL from launch.
 
         Returns the stored report. Safe to call on every poll tick — repeated
         identical states are recorded without notifying anyone.
@@ -175,13 +180,15 @@ class HealthRegistry:
                 # UNSET``: render it, but don't announce a "recovery" from a
                 # state that was never broken.
                 changed = prev_state is not state
-                callbacks = list(self._callbacks) if changed else []
+                notify = changed or force_notify
+                callbacks = list(self._callbacks) if notify else []
 
-            if changed:
+            if notify:
                 logger.info(
-                    "health[%s] %s -> %s%s",
+                    "health[%s] %s -> %s%s%s",
                     key, prev_state.value, state.value,
                     f" ({detail})" if detail else "",
+                    "" if changed else " [repeat, notifying]",
                 )
                 for cb in callbacks:
                     try:
@@ -269,6 +276,7 @@ def report_stream_health(
     silent: bool,
     detail: str,
     registry: HealthRegistry | None = None,
+    force_notify: bool = False,
 ) -> None:
     """Report a capture stream as healthy or silent.
 
@@ -286,7 +294,7 @@ def report_stream_health(
     if silent:
         state = HealthState.FAIL if stream == "system" else HealthState.WARN
         reg.report(key, label=label, state=state, detail=detail,
-                   hint=STREAM_HINTS.get(stream))
+                   hint=STREAM_HINTS.get(stream), force_notify=force_notify)
     else:
         reg.report(key, label=label, state=HealthState.OK, detail=detail)
 
