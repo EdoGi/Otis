@@ -129,3 +129,71 @@ def test_a_wake_resume_waits_for_a_stop_in_progress(tmp_path: Path, monkeypatch)
         rec._handle_system_wake()
         assert not ran.wait(0.3), "resume ran while stop() held its lock"
     assert ran.wait(5.0)
+
+
+# ---------------------------------------------------------------------------
+# The capture watchdog's rebuild path (review round 2, deferred at the time)
+# ---------------------------------------------------------------------------
+class _FakeStream:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def stop(self) -> None:
+        self.calls.append("stop")
+
+    def close(self) -> None:
+        self.calls.append("close")
+
+
+def _stream_state(stream):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(label="mic", stream=stream, last_progress_monotonic=0.0)
+
+
+def test_a_rebuild_overlapping_stop_closes_the_stream_it_opened(tmp_path: Path, monkeypatch) -> None:
+    """The watchdog's rebuild set st.stream = None and then opened a new stream
+    outside any lock; a stop() landing in that window skipped the stream,
+    finished, and the new one kept capturing with no owner. The rebuild now
+    opens into a local and attaches it only if the recording is still live."""
+    from src.audio.recorder import RecorderState
+
+    rec = DualStreamRecorder(audio_dir=tmp_path, observe_sleep_wake=False)
+    rec._state = RecorderState.RECORDING
+    old, new = _FakeStream(), _FakeStream()
+    st = _stream_state(old)
+
+    def open_while_stop_lands(_st, sd=None):
+        rec._state = RecorderState.STOPPING  # stop() got the state lock meanwhile
+        return new
+
+    monkeypatch.setattr(rec, "_open_input_stream", open_while_stop_lands)
+    assert rec._revive_stream(st) is False
+    assert new.calls == ["stop", "close"], "the orphan must be shut down"
+    assert st.stream is None
+    assert old.calls == ["stop", "close"]
+
+
+def test_a_rebuild_during_a_live_recording_attaches_the_new_stream(tmp_path: Path, monkeypatch) -> None:
+    from src.audio.recorder import RecorderState
+
+    rec = DualStreamRecorder(audio_dir=tmp_path, observe_sleep_wake=False)
+    rec._state = RecorderState.RECORDING
+    old, new = _FakeStream(), _FakeStream()
+    st = _stream_state(old)
+    monkeypatch.setattr(rec, "_open_input_stream", lambda _st, sd=None: new)
+    assert rec._revive_stream(st) is True
+    assert st.stream is new and new.calls == []
+    assert old.calls == ["stop", "close"]
+
+
+def test_no_rebuild_once_the_recording_has_stopped(tmp_path: Path, monkeypatch) -> None:
+    from src.audio.recorder import RecorderState
+
+    rec = DualStreamRecorder(audio_dir=tmp_path, observe_sleep_wake=False)
+    rec._state = RecorderState.STOPPED
+    opened: list[bool] = []
+    monkeypatch.setattr(rec, "_open_input_stream", lambda _st, sd=None: opened.append(True))
+    st = _stream_state(None)
+    assert rec._revive_stream(st) is False
+    assert opened == []

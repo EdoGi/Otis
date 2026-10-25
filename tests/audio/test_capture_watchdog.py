@@ -189,6 +189,6 @@ def test_revival_failure_is_survivable(recorder, monkeypatch) -> None:
     def boom(_st, sd=None):
         raise RuntimeError("device really is gone")
 
-    monkeypatch.setattr(recorder, "_start_input_stream", boom)
+    monkeypatch.setattr(recorder, "_open_input_stream", boom)
     assert recorder._revive_stream(st) is False
     recorder.stop()  # must not raise

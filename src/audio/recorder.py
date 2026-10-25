@@ -752,12 +752,16 @@ class DualStreamRecorder:
 
     def _start_input_stream(self, st: _StreamState, sd: Any = None) -> None:
         """Create and start the InputStream for ``st``. Raises on failure."""
+        st.stream = self._open_input_stream(st, sd)
+
+    def _open_input_stream(self, st: _StreamState, sd: Any = None) -> Any:
+        """Create and start an InputStream for ``st`` and return it. Raises on failure."""
         if sd is None:
             import sounddevice as _sounddevice
 
             sd = _sounddevice
         try:
-            st.stream = sd.InputStream(
+            stream = sd.InputStream(
                 samplerate=self._sample_rate,
                 channels=self._channels,
                 dtype="int16",
@@ -766,7 +770,8 @@ class DualStreamRecorder:
                 blocksize=CAPTURE_BLOCKSIZE_FRAMES,
                 latency=CAPTURE_LATENCY,
             )
-            st.stream.start()
+            stream.start()
+            return stream
         except Exception as exc:  # pragma: no cover (depends on host)
             if _is_permission_error(exc):
                 raise PermissionDeniedError(str(exc)) from exc
@@ -782,22 +787,44 @@ class DualStreamRecorder:
         recording continues into the same file — the gap is simply missing
         audio, which is a far better outcome than the rest of the meeting
         being silently lost.
+
+        Safe against a concurrent stop(), which sets STOPPING under
+        _state_lock before tearing streams down: the old stream is taken out
+        under that lock (so only one side ever closes it), the new one is
+        opened into a local — the slow part, outside any lock — and attached
+        only if the recording is still live; otherwise it is closed here. The
+        old version set st.stream = None and opened outside the lock, and a
+        stop() in that window left the new stream capturing with no owner.
         """
+        live = (RecorderState.RECORDING, RecorderState.PAUSED)
+        with self._state_lock:
+            if self._state not in live:
+                return False
+            old, st.stream = st.stream, None
         logger.warning("[%s] capture stream looks dead; rebuilding it.", st.label)
+        if old is not None:
+            for step in (old.stop, old.close):
+                try:
+                    step()
+                except Exception:  # pragma: no cover (already dead)
+                    pass
         try:
-            if st.stream is not None:
-                try:
-                    st.stream.stop()
-                except Exception:  # pragma: no cover (already dead)
-                    pass
-                try:
-                    st.stream.close()
-                except Exception:  # pragma: no cover (already dead)
-                    pass
-            st.stream = None
-            self._start_input_stream(st)
+            new = self._open_input_stream(st)
         except Exception as exc:
             logger.error("[%s] could not rebuild the capture stream: %s", st.label, exc)
+            return False
+        with self._state_lock:
+            attached = self._state in live
+            if attached:
+                st.stream = new
+        if not attached:
+            logger.info("[%s] recording stopped during the rebuild; closing the new stream.",
+                        st.label)
+            for step in (new.stop, new.close):
+                try:
+                    step()
+                except Exception:  # pragma: no cover
+                    pass
             return False
         st.last_progress_monotonic = time.monotonic()
         logger.info("[%s] capture stream rebuilt.", st.label)
