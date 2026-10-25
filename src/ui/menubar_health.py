@@ -103,6 +103,46 @@ class HealthPanelMixin:
         except Exception:  # pragma: no cover (defensive)
             logger.exception("Audio routing check raised on startup")
 
+    def _check_microphone_permission(self, *, at_recording_start: bool = False) -> None:
+        """Settle microphone permission now, not at the first recording.
+
+        After a rebuild changes the app's code hash, macOS treats the old grant
+        as undecided; left alone, the prompt would appear the first time a
+        recording opens the mic — mid-meeting, with zeros captured until it is
+        answered. A denial is a failure with its fix, not the "nobody spoke"
+        warning a silent mic otherwise gets.
+        """
+        from src.audio import mic_permission as mp
+
+        status = mp.microphone_authorization()
+        if status == mp.NOT_DETERMINED and not at_recording_start:
+            logger.info("Microphone permission is undecided (a new app signature?); asking now.")
+            if not mp.request_microphone_access(self._on_microphone_answer):
+                logger.warning("Could not ask for microphone access.")
+        elif status in (mp.DENIED, mp.RESTRICTED):
+            self._report_microphone_denied(status, force=at_recording_start)
+
+    def _on_microphone_answer(self, granted: bool) -> None:
+        """Called by AVFoundation on an arbitrary thread."""
+        if granted:
+            logger.info("Microphone access granted.")
+        else:
+            from src.audio import mic_permission as mp
+
+            self._report_microphone_denied(mp.DENIED)
+
+    def _report_microphone_denied(self, status: str, *, force: bool = False) -> None:
+        from src.audio import mic_permission as mp
+
+        logger.warning("Microphone access is %s for Otis.", status)
+        self._health.report(
+            MICROPHONE, label="Microphone", state=HealthState.FAIL,
+            detail=f"access {'restricted' if status == mp.RESTRICTED else 'denied'} — "
+                   "your side of a call records as silence",
+            hint="System Settings → Privacy & Security → Microphone → turn on Otis.",
+            force_notify=force,
+        )
+
     def _check_routing(self) -> Any:
         """check_output_routing(), unless a test injected its own."""
         if self._routing_check is not None:

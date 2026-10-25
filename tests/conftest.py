@@ -249,6 +249,18 @@ def _never_read_the_users_config(tmp_path_factory, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _microphone_is_authorized(monkeypatch):
+    """Never let a test raise the real macOS microphone prompt (it would be
+    asked on behalf of the Python running pytest). Tests of the permission
+    flow install their own stubs."""
+    from src.audio import mic_permission
+
+    monkeypatch.setattr(mic_permission, "microphone_authorization",
+                        lambda: mic_permission.AUTHORIZED)
+    monkeypatch.setattr(mic_permission, "request_microphone_access", lambda cb: True)
+
+
+@pytest.fixture(autouse=True)
 def _restore_signal_handling():
     """MenuBarApp.run() (and OtisDaemon.run()) install SIGTERM/SIGHUP/SIGINT
     handlers and a wakeup fd for the whole process. Left behind, a later

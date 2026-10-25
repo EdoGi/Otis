@@ -65,9 +65,12 @@ Developer ID), so macOS blocks `open` by default. You need to right-click the
 3. Click **Open** in the "unidentified developer" dialog.
 
 After that, double-click and Spotlight work normally. macOS also asks once
-for access to the Documents folder (where the project lives) and, at the
-first recording, to the microphone — and again after a rebuild that changes
-the launcher, since the grants are tied to the app's code signature.
+for access to the Documents folder (where the project lives) and to the
+microphone — Otis asks for the microphone at launch, so the prompt never
+lands in the middle of a meeting. Both are asked again after a rebuild that
+changes the app's code signature (a different launcher or path, or a
+Command Line Tools update); a denied microphone shows as a failure in the
+Status panel, with where to turn it back on.
 
 The bundle's executable is a tiny native launcher
 (`scripts/launcher/otis_launcher.c`, path to `run.sh` compiled in) that starts

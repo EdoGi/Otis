@@ -18,10 +18,11 @@
 # strings), build the icon, and ad-hoc sign the bundle.
 #
 # Permissions: macOS pins the Documents-folder and Microphone grants of an
-# ad-hoc-signed app to its code hash. Rebuilding from the same source and
-# path gives the same hash and keeps them; a different launcher, path or
-# Info.plist means macOS asks once more on the next launch (Documents) and at
-# the next recording (Microphone).
+# ad-hoc-signed app to its code hash. Rebuilding from the same source, path
+# and toolchain gives the same hash and keeps them; a different launcher,
+# path, Info.plist — or a Command Line Tools update that changes clang's
+# output — means macOS asks again on the next launch: Documents first, then
+# the microphone (Otis asks at startup rather than waiting for a recording).
 #
 # Day-to-day workflow after a successful build:
 #   1. Copy dist/Otis.app to /Applications (replace the old one).
@@ -170,8 +171,8 @@ echo "  1. Quit Otis if it is running, then replace the installed copy:"
 echo "       rm -rf /Applications/Otis.app && cp -R \"${APP_DIR}\" /Applications/"
 echo
 echo "  2. FIRST LAUNCH ONLY — in Finder, right-click /Applications/Otis.app → 'Open'."
-echo "     Allow access to the Documents folder when macOS asks, and the"
-echo "     microphone at the first recording."
+echo "     Allow access to the Documents folder, then to the microphone, when"
+echo "     macOS asks (both appear at that launch)."
 echo
 echo "  3. Login Items keep working: they point at /Applications/Otis.app."
 echo

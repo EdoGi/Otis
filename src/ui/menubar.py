@@ -279,6 +279,7 @@ class MenuBarApp(HealthPanelMixin, SettingsMenuMixin):
             os.getcwd(), n_pollers, self._icons_dir,
         )
         self._warn_if_blackhole_missing()
+        self._check_microphone_permission()
         self._drain_transcription_queue()
         # First fill of the two disk-backed menus. Deliberately here and not
         # in __init__: it must not run before the drain timer exists to render
@@ -1481,6 +1482,12 @@ class MenuBarApp(HealthPanelMixin, SettingsMenuMixin):
                 self._report_audio_routing(status)
         except Exception:
             logger.exception("Routing check at recording start raised")
+        # A denied microphone records the local side as silence: say so as
+        # the call starts (forced — the launch toast may be hours old).
+        try:
+            self._check_microphone_permission(at_recording_start=True)
+        except Exception:
+            logger.exception("Microphone permission check at recording start raised")
         try:
             recorder = self._recorder_factory(self._config)
             recorder.on_device_error = self._cb_device_error
