@@ -301,3 +301,31 @@ def test_unused_models_are_reported_with_how_to_reclaim_them(tmp_path) -> None:
 
     none = doctor.check_unused_models("medium", models[:1], free_bytes=16 * 1000**3)
     assert none.verdict is Verdict.OK and none.detail == "none"
+
+
+def test_prune_models_never_deletes_the_model_large_resolves_to(tmp_path) -> None:
+    """Review: doctor understood that config 'large' means large-v3, but the
+    prune-models command it recommends compared names literally and would have
+    deleted large-v3 — the active model, ~3 GB to re-download."""
+    from src.storage.model_cache import prune_models
+
+    hub = tmp_path / "hub"
+    for name in ("large-v3", "small"):
+        snap = hub / f"models--mlx-community--whisper-{name}-mlx" / "snapshots" / "x"
+        snap.mkdir(parents=True)
+        (snap / "config.json").write_text("{}")
+        (snap / "weights.npz").write_bytes(b"\0" * 10)
+    victims = [m.name for m in prune_models("large", hub_dir=hub, dry_run=True)]
+    assert victims == ["small"]
+
+
+def test_the_unused_models_row_judges_the_disk_that_holds_the_cache(tmp_path, monkeypatch) -> None:
+    import src.storage.model_cache as mc
+
+    seen: list[object] = []
+    monkeypatch.setattr(mc, "DEFAULT_HUB_DIR", tmp_path / "hub")
+    monkeypatch.setattr(doctor, "_free_bytes_near", lambda p: seen.append(p) or 10**12)
+    monkeypatch.setattr(doctor, "check_port", lambda *a, **k: Check("port", Verdict.OK))
+    checks = doctor.run_checks(None, run_dir=tmp_path)
+    assert any(c.label == "Unused Whisper models" for c in checks), "the row is part of the report"
+    assert tmp_path / "hub" in seen

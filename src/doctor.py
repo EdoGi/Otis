@@ -279,6 +279,14 @@ def check_unused_models(active: str, cached: list[Any], *, free_bytes: int) -> C
                  "./scripts/run.sh prune-models --dry-run, then without --dry-run")
 
 
+def _free_bytes_near(path: Path) -> int:
+    """Free space on the volume holding ``path`` (or its nearest parent)."""
+    for candidate in (path, *path.parents):
+        if candidate.exists():
+            return shutil.disk_usage(candidate).free
+    return shutil.disk_usage(Path.home()).free
+
+
 def check_calendar_accounts(cfg: Any) -> list[Check]:
     """Token files only — no OAuth refresh, no request to Google."""
     from src.detection.calendar_poller import build_pollers_from_config
@@ -358,19 +366,25 @@ def run_checks(config_path: Path | None = None, *, run_dir: Path | None = None) 
     if cfg is None:
         return checks
     model = str(cfg.get("transcription", "model", default="small"))
+    from src.storage.model_cache import cached_model_names
+
+    # Complete snapshots only: an interrupted download is not "cached".
     checks.append(_guarded("Whisper model", lambda: check_model_cached(
-        model, [m.name for m in list_cached_models()])))
+        model, sorted(cached_model_names()))))
     port = int(cfg.get("web", "port", default=8765))
     checks.append(_guarded(f"Web UI port {port}", check_port,
                            str(cfg.get("web", "host", default="127.0.0.1")), port,
                            otis_command=holder.command if holder else None))
     audio_dir = Path(str(cfg.get("storage", "audio_dir", default="~/Otis/audio"))).expanduser()
     checks.append(_guarded("Disk", check_disk, audio_dir))
+    from src.storage import model_cache
+
     checks.append(_guarded(
         "Unused Whisper models",
         lambda: check_unused_models(
             model, list_cached_models(),
-            free_bytes=shutil.disk_usage(audio_dir if audio_dir.exists() else Path.home()).free,
+            # The disk pruning would free: the cache's, not the audio dir's.
+            free_bytes=_free_bytes_near(model_cache.DEFAULT_HUB_DIR),
         ),
     ))
     calendar = _guarded("Calendar", check_calendar_accounts, cfg)

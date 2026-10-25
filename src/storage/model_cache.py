@@ -78,17 +78,31 @@ def cached_model_names(hub_dir: Path | None = None) -> set[str]:
     return {
         e.name[len(_MODEL_PREFIX):].removesuffix("-mlx")
         for e in entries
-        if e.is_dir() and e.name.startswith(_MODEL_PREFIX)
+        if e.is_dir() and e.name.startswith(_MODEL_PREFIX) and _has_complete_snapshot(e)
     }
+
+
+def _has_complete_snapshot(repo_dir: Path) -> bool:
+    """A snapshot holding config.json and weights — not just a repo folder.
+
+    huggingface_hub creates the folder before any weights arrive, so an
+    interrupted download (network, quit, a full disk) left a directory that
+    looked "cached" while the next transcription downloaded it all again.
+    """
+    for snap in (repo_dir / "snapshots").glob("*"):
+        if (snap / "config.json").exists() and any(snap.glob("weights.*")):
+            return True
+    return False
 
 
 def is_model_cached(model: str, cached: set[str]) -> bool:
     """Whether config model ``model`` is among ``cached`` ("large" is v3)."""
     from src.transcription.whisper_engine import _MODEL_REPO_MAP
 
-    repo = _MODEL_REPO_MAP.get(model, "")
-    name = repo.removeprefix("mlx-community/whisper-").removesuffix("-mlx") or model
-    return name in cached
+    key = str(model).lower()
+    repo = _MODEL_REPO_MAP.get(key, "")
+    name = repo.removeprefix("mlx-community/whisper-").removesuffix("-mlx") or key
+    return name in {c.lower() for c in cached}
 
 
 def list_cached_models(hub_dir: Path | None = None) -> list[CachedModel]:
@@ -108,9 +122,13 @@ def list_cached_models(hub_dir: Path | None = None) -> list[CachedModel]:
 def unused_models(
     active_model: str, hub_dir: Path | None = None
 ) -> list[CachedModel]:
-    """Cached models other than the one currently configured."""
-    active = str(active_model).lower()
-    return [m for m in list_cached_models(hub_dir) if m.name.lower() != active]
+    """Cached models other than the one currently configured.
+
+    Through is_model_cached, so the config alias "large" keeps large-v3: a
+    literal name comparison would have listed — and pruned — the active model.
+    """
+    return [m for m in list_cached_models(hub_dir)
+            if not is_model_cached(str(active_model), {m.name})]
 
 
 def reclaimable_bytes(active_model: str, hub_dir: Path | None = None) -> int:

@@ -232,9 +232,13 @@ def test_a_front_end_with_no_engine_says_restart(tmp_path: Path) -> None:
 # Models that are not downloaded yet
 # ---------------------------------------------------------------------------
 def _hub_with(tmp_path: Path, *names: str) -> Path:
+    """A hub cache holding complete snapshots of ``names``."""
     hub = tmp_path / "hub"
     for name in names:
-        (hub / f"models--mlx-community--whisper-{name}-mlx").mkdir(parents=True)
+        snap = hub / f"models--mlx-community--whisper-{name}-mlx" / "snapshots" / "abc123"
+        snap.mkdir(parents=True)
+        (snap / "config.json").write_text("{}")
+        (snap / "weights.npz").write_bytes(b"\0")
     return hub
 
 
@@ -280,3 +284,48 @@ def test_the_picker_marks_models_that_would_download(tmp_path: Path, monkeypatch
     bar._on_model_picked(bar._model_items["large-v3"])
     assert bar._config.get("transcription", "model") == "large-v3"
     assert any("download" in m.lower() for _t, _s, m in sent)
+
+
+def _complete_model(hub: Path, name: str) -> None:
+    snap = hub / f"models--mlx-community--whisper-{name}-mlx" / "snapshots" / "abc123"
+    snap.mkdir(parents=True, exist_ok=True)
+    (snap / "config.json").write_text("{}")
+    (snap / "weights.npz").write_bytes(b"\0")
+
+
+def test_an_interrupted_download_does_not_count_as_cached(tmp_path: Path) -> None:
+    """Review: huggingface_hub creates the repo folder before any weights
+    arrive, so a dropped 3 GB download made the picker show 'large-v3' as
+    ready — and the next transcription silently downloaded it again."""
+    from src.storage.model_cache import cached_model_names
+
+    hub = tmp_path / "hub"
+    (hub / "models--mlx-community--whisper-large-v3-mlx" / "blobs").mkdir(parents=True)
+    _complete_model(hub, "medium")
+    assert cached_model_names(hub) == {"medium"}
+
+
+def test_the_labels_refresh_after_a_transcription(tmp_path: Path, monkeypatch) -> None:
+    """A transcription is when a download completes; the label must follow."""
+    pytest.importorskip("rumps")
+    import src.storage.model_cache as mc
+    from src.config import Config
+    from src.detection.detector import MeetingDetector
+    from src.ui.menubar import MenuBarApp
+    from src.ui.notifications import NotificationManager
+
+    hub = tmp_path / "hub"
+    _complete_model(hub, "medium")
+    monkeypatch.setattr(mc, "DEFAULT_HUB_DIR", hub)
+    bar = MenuBarApp(
+        config=Config({"transcription": {"model": "large-v3"}}),
+        detector=MeetingDetector(process_monitor=None, calendar_pollers=[]),
+        recorder_factory=lambda _c: None,
+        notifications=NotificationManager(backend=lambda t, s, m: None),
+        icons_dir=tmp_path / "icons", user_config_path=tmp_path / "config.yaml",
+    )
+    assert "download" in bar._model_items["large-v3"].title
+    _complete_model(hub, "large-v3")          # the transcription downloaded it
+    bar._events.put(("refresh_model_menu", None))
+    bar._drain_main_queue(None)
+    assert bar._model_items["large-v3"].title == "large-v3"

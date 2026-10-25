@@ -238,7 +238,7 @@ def _prune_models(cfg: Config, *, dry_run: bool = False) -> int:
     silently deleting a 1.4 GB download the user might switch back to trades a
     long re-download for disk they may not need.
     """
-    from src.storage.model_cache import list_cached_models, prune_models
+    from src.storage.model_cache import is_model_cached, list_cached_models, prune_models
 
     active = str(cfg.get("transcription", "model", default="small"))
     cached = list_cached_models()
@@ -248,7 +248,7 @@ def _prune_models(cfg: Config, *, dry_run: bool = False) -> int:
 
     print(f"Configured model: {active}\n")
     for model in cached:
-        mark = "keep  " if model.name.lower() == active.lower() else "remove"
+        mark = "keep  " if is_model_cached(active, {model.name}) else "remove"
         print(f"  {mark}  {model.name:10s} {model.size_mb:7.0f} MB")
 
     removed = prune_models(active, dry_run=dry_run)
