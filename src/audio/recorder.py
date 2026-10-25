@@ -972,7 +972,17 @@ class DualStreamRecorder:
             logger.exception("Failed to pause on system sleep")
 
     def _handle_system_wake(self) -> None:
+        # Delivered on the main thread (see _SleepWakeObserver). Resuming can
+        # reopen PortAudio streams after CoreAudio re-enumerates, which would
+        # freeze the menu bar, so it runs on its own thread. Sleep stays
+        # synchronous: it is a cheap flag flip that must land before the Mac
+        # sleeps, and by the time a wake arrives the pause has completed.
         logger.info("System wake detected — resuming recording.")
+        threading.Thread(
+            target=self._resume_after_wake, name="otis-wake-resume", daemon=True
+        ).start()
+
+    def _resume_after_wake(self) -> None:
         try:
             self.resume(source="wake")
         except Exception:  # pragma: no cover
@@ -1133,9 +1143,17 @@ def sleep_wake_bridge_class() -> Any:
 class _SleepWakeObserver:
     """Listens for ``NSWorkspaceWillSleepNotification`` / ``DidWakeNotification``.
 
-    Notifications are delivered on a dedicated daemon thread running its own
-    ``NSRunLoop``. If pyobjc/AppKit cannot be imported (e.g. CI on Linux), the
-    observer reports ``start() -> False`` and does nothing.
+    It only registers with NSWorkspace's notification center. A notification
+    is delivered on the thread that posts it, and NSWorkspace posts these on
+    the main thread, so in the menu bar the handlers run on the main run loop.
+
+    This used to own a thread looping on ``runUntilDate_(now + 0.5 s)``. With
+    no input sources that call returns at once, so the loop spun: 2.95 s of
+    CPU per 3 s of wall time, a whole core of the 8 GB M1, for every minute of
+    every recording — and the handlers never ran on that thread anyway.
+
+    If pyobjc/AppKit cannot be imported (e.g. CI on Linux), ``start()``
+    returns False and the observer does nothing.
     """
 
     def __init__(
@@ -1145,67 +1163,46 @@ class _SleepWakeObserver:
     ) -> None:
         self._on_sleep = on_sleep
         self._on_wake = on_wake
-        self._stop_event = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._impl: Any = None  # the Obj-C bridge object
+        self._impl: Any = None  # the Obj-C bridge object, kept alive while registered
 
     def start(self) -> bool:
         try:
-            # Imported here so non-macOS environments don't blow up at import
-            # time. These are availability probes — the real imports happen on
-            # the observer thread — so they are deliberately unused.
-            import objc  # noqa: F401
-            from AppKit import NSWorkspace  # noqa: F401
-            from Foundation import NSObject  # noqa: F401
+            import objc
+            from AppKit import NSWorkspace
         except Exception as exc:  # pragma: no cover
             logger.debug("pyobjc unavailable; sleep/wake observation disabled: %s", exc)
             return False
 
-        self._thread = threading.Thread(
-            target=self._run, name="otis-sleepwake", daemon=True
-        )
-        self._thread.start()
-        return True
-
-    def stop(self) -> None:
-        self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-            self._thread = None
-
-    def _run(self) -> None:  # pragma: no cover (requires macOS GUI session)
-        import objc
-        from AppKit import NSWorkspace
-        from Foundation import NSDate, NSRunLoop
-
         cls = sleep_wake_bridge_class()
         bridge = cls.alloc().init()
         # Handlers live on the instance, not in a closure, because the class
-        # is now shared by every recorder in the process.
+        # is shared by every recorder in the process.
         bridge.otis_on_sleep = self._on_sleep
         bridge.otis_on_wake = self._on_wake
+
+        nc = NSWorkspace.sharedWorkspace().notificationCenter()
+        nc.addObserver_selector_name_object_(
+            bridge,
+            objc.selector(cls.workspaceWillSleep_, signature=b"v@:@"),
+            "NSWorkspaceWillSleepNotification",
+            None,
+        )
+        nc.addObserver_selector_name_object_(
+            bridge,
+            objc.selector(cls.workspaceDidWake_, signature=b"v@:@"),
+            "NSWorkspaceDidWakeNotification",
+            None,
+        )
         self._impl = bridge
+        return True
 
+    def stop(self) -> None:
+        bridge, self._impl = self._impl, None
+        if bridge is None:
+            return
         try:
-            nc = NSWorkspace.sharedWorkspace().notificationCenter()
-            nc.addObserver_selector_name_object_(
-                bridge,
-                objc.selector(cls.workspaceWillSleep_, signature=b"v@:@"),
-                "NSWorkspaceWillSleepNotification",
-                None,
-            )
-            nc.addObserver_selector_name_object_(
-                bridge,
-                objc.selector(cls.workspaceDidWake_, signature=b"v@:@"),
-                "NSWorkspaceDidWakeNotification",
-                None,
-            )
+            from AppKit import NSWorkspace
 
-            run_loop = NSRunLoop.currentRunLoop()
-            while not self._stop_event.is_set():
-                run_loop.runUntilDate_(NSDate.dateWithTimeIntervalSinceNow_(0.5))
-        finally:
-            try:
-                NSWorkspace.sharedWorkspace().notificationCenter().removeObserver_(bridge)
-            except Exception:
-                pass
+            NSWorkspace.sharedWorkspace().notificationCenter().removeObserver_(bridge)
+        except Exception:  # pragma: no cover
+            logger.debug("Could not remove the sleep/wake observer", exc_info=True)

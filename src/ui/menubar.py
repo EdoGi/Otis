@@ -489,8 +489,9 @@ class MenuBarApp(SettingsMenuMixin):
     def _sync_recorder_state(self) -> None:
         """Mirror recorder-initiated pause/resume into the UI.
 
-        The recorder pauses/resumes itself on system sleep/wake (on the
-        sleep-wake observer thread). Without this sync the icon would keep
+        The recorder pauses/resumes itself on system sleep/wake (the pause on
+        the main thread, the resume on a short-lived worker). Without this
+        sync the icon would keep
         showing RECORDING while the recorder is paused. User-initiated
         clicks already update both sides on the main thread, so this only
         fires for the sleep/wake transitions.
