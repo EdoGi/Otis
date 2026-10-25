@@ -57,6 +57,17 @@ logger = logging.getLogger(__name__)
 # Tunables (exposed at module level so tests can patch them)
 # ---------------------------------------------------------------------------
 ECHO_TIME_WINDOW_SECONDS = 1.0
+
+#: Clock drift between the streams. Both start within ~0.1 s and stop together
+#: (the teardown barrier), yet real recordings ended up to 2.1 s different in
+#: length (2026-10-21: +2.09 s over 75.7 min, i.e. ~460 ppm; 09-03: -1.18 s;
+#: 08-31: -1.79 s). The system file should be (mic length - start offset)
+#: long; the difference is spread linearly over the recording. A mismatch
+#: smaller than one capture block (256 ms) is left to the constant offset; one
+#: larger than DRIFT_MAX_RATIO is not drift but a gap that cannot be placed,
+#: and stretching across it would misalign more than it fixes.
+DRIFT_MIN_SECONDS = 0.25
+DRIFT_MAX_RATIO = 0.002
 ECHO_WORD_OVERLAP_THRESHOLD = 0.80
 
 #: Ceiling on one afconvert compression. A 2-hour stream encodes in ~1 s.
@@ -289,7 +300,22 @@ class TranscriptProcessor:
         # Phase 4 — align + dedup + interleave.
         sys_segments = sys_result.segments if sys_result is not None else []
         offset = _compute_offset(mic_anchor, sys_anchor)
-        sys_segments = apply_offset(sys_segments, offset)
+        bytes_per_second = (
+            float(merged_meta.get("sample_rate") or session.sample_rate or 16000)
+            * 2 * int(merged_meta.get("channels") or 1)
+        )
+        scale = compute_drift_scale(
+            merged_meta.get("mic_bytes"), merged_meta.get("system_bytes"),
+            offset, bytes_per_second,
+        )
+        if scale != 1.0:
+            logger.info(
+                "Session %s: correcting %+.0f ppm of mic/system clock drift "
+                "(%.2fs by the end of the recording).",
+                session.session_id, (scale - 1.0) * 1e6,
+                (scale - 1.0) * float(merged_meta.get("system_bytes") or 0) / bytes_per_second,
+            )
+        sys_segments = apply_offset(sys_segments, offset, scale=scale)
         # Which copy is the echo? BlackHole captures system *output*, which
         # cannot contain your microphone — so when the same words appear in
         # both streams, the mic picked them up off the speakers. The system
@@ -685,8 +711,37 @@ def _compute_offset(mic_anchor: float | None, sys_anchor: float | None) -> float
     return float(sys_anchor) - float(mic_anchor)
 
 
-def apply_offset(segments: list[Segment], offset: float) -> list[Segment]:
-    """Return new segments with ``offset`` seconds added to start/end."""
+def compute_drift_scale(
+    mic_bytes: Any, system_bytes: Any, offset: float, bytes_per_second: float,
+) -> float:
+    """Factor that maps system-file time onto the mic timeline (1.0 = none).
+
+    See DRIFT_MIN_SECONDS for the measurements and the limits.
+    """
+    if not isinstance(mic_bytes, (int, float)) or not isinstance(system_bytes, (int, float)):
+        return 1.0
+    if mic_bytes <= 0 or system_bytes <= 0 or bytes_per_second <= 0:
+        return 1.0
+    mic_seconds = mic_bytes / bytes_per_second
+    system_seconds = system_bytes / bytes_per_second
+    expected = mic_seconds - offset
+    if expected <= 0 or abs(expected - system_seconds) < DRIFT_MIN_SECONDS:
+        return 1.0
+    scale = expected / system_seconds
+    if abs(scale - 1.0) > DRIFT_MAX_RATIO:
+        return 1.0
+    return scale
+
+
+def apply_offset(
+    segments: list[Segment], offset: float, *, scale: float = 1.0,
+) -> list[Segment]:
+    """Return new segments mapped as ``offset + t * scale`` (start and end)."""
+    if scale != 1.0:
+        return [
+            Segment(start=offset + s.start * scale, end=offset + s.end * scale, text=s.text)
+            for s in segments
+        ]
     if not offset:
         return list(segments)
     return [
@@ -937,6 +992,7 @@ __all__ = [
     "RecordingSession",
     "TranscriptProcessor",
     "apply_offset",
+    "compute_drift_scale",
     "deduplicate_echo",
     "interleave_with_overlaps",
     "render_markdown_body",
