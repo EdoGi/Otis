@@ -123,9 +123,39 @@ def test_a_port_held_by_another_program_warns() -> None:
         other.bind(("127.0.0.1", 0))
         other.listen()
         port = other.getsockname()[1]
-        assert doctor.check_port("127.0.0.1", port, otis_running=False).verdict is Verdict.WARN
-        # When Otis itself runs, the port being taken is expected.
-        assert doctor.check_port("127.0.0.1", port, otis_running=True).verdict is Verdict.OK
+        assert doctor.check_port("127.0.0.1", port, otis_command=None).verdict is Verdict.WARN
+        # The daemon never serves the web UI: a busy port is still someone else.
+        assert doctor.check_port("127.0.0.1", port, otis_command="run").verdict is Verdict.WARN
+
+
+def test_a_running_menu_bar_must_actually_answer_on_the_port() -> None:
+    """Review finding: any lock holder made the port '✓ held by the running
+    Otis', even a menu bar that lost the port to another program."""
+    otis_page = "<html><head><title>Transcripts — Otis</title>"
+    ok = doctor.check_port("127.0.0.1", 8765, otis_command="ui", fetch=lambda h, p: otis_page)
+    assert ok.verdict is Verdict.OK
+    foreign = doctor.check_port("127.0.0.1", 8765, otis_command="ui",
+                                fetch=lambda h, p: '{"error": "not found"}')
+    assert foreign.verdict is Verdict.WARN
+    silent = doctor.check_port("127.0.0.1", 8765, otis_command="ui", fetch=lambda h, p: None)
+    assert silent.verdict is Verdict.WARN
+
+
+def test_a_check_that_raises_becomes_a_row_not_a_lost_report(tmp_path, monkeypatch) -> None:
+    """Review finding: with sounddevice missing (or PortAudio failing to load)
+    the BlackHole check raised and the whole report — including the row that
+    named the missing package — was never printed."""
+    import src.audio.blackhole_check as bc
+
+    def no_portaudio(*a, **k):
+        raise OSError("PortAudio library not found")
+
+    monkeypatch.setattr(bc, "verify_blackhole_setup", no_portaudio)
+    monkeypatch.setattr(doctor, "check_port", lambda *a, **k: Check("port", Verdict.OK))
+    checks = doctor.run_checks(None, run_dir=tmp_path)
+    row = next(c for c in checks if c.label == "BlackHole")
+    assert row.verdict is Verdict.FAIL and "PortAudio" in row.detail
+    assert any(c.label == "Disk" for c in checks), "the rest of the report still ran"
 
 
 def test_a_running_otis_is_reported(tmp_path: Path) -> None:

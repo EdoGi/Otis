@@ -178,24 +178,56 @@ def check_routing(route: Callable[[], Any]) -> Check:
     return Check("System audio routing", Verdict.WARN, status.message())
 
 
-def check_running_instance(run_dir: Path) -> Check:
+def running_holder(run_dir: Path) -> Any:
+    """The Holder of the Otis lock, or None when no Otis is running."""
     from src import single_instance
 
     lock_path = run_dir / single_instance.LOCK_NAME
     lock = single_instance.acquire(lock_path, command="doctor")
     if lock is not None:
         lock.release()
+        return None
+    return single_instance.read_holder(lock_path)
+
+
+def check_running_instance(run_dir: Path) -> Check:
+    holder = running_holder(run_dir)
+    if holder is None:
         return Check("Otis process", Verdict.OK, "not running")
-    holder = single_instance.read_holder(lock_path)
     return Check("Otis process", Verdict.OK,
                  f"running (pid {holder.pid}, {holder.command or 'unknown command'})")
 
 
-def check_port(host: str, port: int, *, otis_running: bool) -> Check:
-    """Port 8765 is Otis's when Otis runs; otherwise someone else has it."""
+def _fetch_page(host: str, port: int) -> str | None:
+    """GET / from the local web UI (loopback only). None if nothing answers."""
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(f"http://{host}:{port}/", timeout=2) as resp:
+            return resp.read(8192).decode("utf-8", "replace")
+    except Exception:
+        return None
+
+
+def check_port(
+    host: str, port: int, *, otis_command: str | None,
+    fetch: Callable[[str, int], str | None] = _fetch_page,
+) -> Check:
+    """Is the web UI port Otis's — and if Otis runs, is Otis actually on it?
+
+    Only the menu bar serves the web UI (the daemon never binds it), and a menu
+    bar that found the port taken runs without it — so "Otis is running" says
+    nothing about who answers on the port. Ask the port itself.
+    """
     label = f"Web UI port {port}"
-    if otis_running:
-        return Check(label, Verdict.OK, "held by the running Otis")
+    if otis_command == "ui":
+        page = fetch(host, port)
+        if page is not None and "Otis</title>" in page:
+            return Check(label, Verdict.OK, "served by the running Otis")
+        return Check(label, Verdict.WARN,
+                     f"Otis is running but {host}:{port} is not serving its web UI",
+                     "Another program may hold the port; see 'Web UI disabled' in "
+                     "~/.otis/otis.log.")
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         try:
             sock.bind((host, port))
@@ -256,33 +288,57 @@ def check_crash_log(run_dir: Path) -> Check:
 
 
 # ---------------------------------------------------------------------------
+def _guarded(label: str, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """Run one check; an exception becomes a failed row, not a lost report.
+
+    Without this, a missing sounddevice or a PortAudio that will not load
+    raised out of the BlackHole check and the whole report — including the row
+    that named the missing package — was never printed.
+    """
+    try:
+        return fn(*args, **kwargs)
+    except Exception as exc:
+        return Check(label, Verdict.FAIL, f"check raised {type(exc).__name__}: {exc}")
+
+
 def run_checks(config_path: Path | None = None, *, run_dir: Path | None = None) -> list[Check]:
     from src.audio.blackhole_check import check_output_routing, verify_blackhole_setup
     from src.storage.model_cache import list_cached_models
 
     run_dir = (run_dir or Path("~/.otis")).expanduser()
-    checks = [check_python(), check_modules(), check_mcp_version()]
-    config_check, cfg = check_config(config_path)
+    checks = [_guarded("Python", check_python),
+              _guarded("Python packages", check_modules),
+              _guarded("MCP library", check_mcp_version)]
+    config_result = _guarded("Config", check_config, config_path)
+    config_check, cfg = config_result if isinstance(config_result, tuple) else (config_result, None)
     checks.append(config_check)
-    checks += [check_notification_identity(), check_afconvert()]
-    checks.append(check_blackhole(verify_blackhole_setup))
+    checks += [_guarded("Notifications", check_notification_identity),
+               _guarded("FLAC encoder", check_afconvert)]
+    checks.append(_guarded("BlackHole", check_blackhole, verify_blackhole_setup))
     if checks[-1].verdict is Verdict.OK:
-        checks.append(check_routing(check_output_routing))
-    running = check_running_instance(run_dir)
-    checks.append(running)
-    checks.append(check_crash_log(run_dir))
+        checks.append(_guarded("System audio routing", check_routing, check_output_routing))
+    holder = _guarded("Otis process", running_holder, run_dir)
+    if isinstance(holder, Check):  # the lock check itself failed
+        checks.append(holder)
+        holder = None
+    else:
+        checks.append(Check("Otis process", Verdict.OK,
+                            "not running" if holder is None else
+                            f"running (pid {holder.pid}, {holder.command or 'unknown command'})"))
+    checks.append(_guarded("Crash log", check_crash_log, run_dir))
     if cfg is None:
         return checks
     model = str(cfg.get("transcription", "model", default="small"))
-    checks.append(check_model_cached(model, [m.name for m in list_cached_models()]))
-    checks.append(check_port(
-        str(cfg.get("web", "host", default="127.0.0.1")),
-        int(cfg.get("web", "port", default=8765)),
-        otis_running=running.detail.startswith("running"),
-    ))
-    checks.append(check_disk(Path(str(cfg.get("storage", "audio_dir",
-                                              default="~/Otis/audio"))).expanduser()))
-    checks += check_calendar_accounts(cfg)
+    checks.append(_guarded("Whisper model", lambda: check_model_cached(
+        model, [m.name for m in list_cached_models()])))
+    port = int(cfg.get("web", "port", default=8765))
+    checks.append(_guarded(f"Web UI port {port}", check_port,
+                           str(cfg.get("web", "host", default="127.0.0.1")), port,
+                           otis_command=holder.command if holder else None))
+    checks.append(_guarded("Disk", check_disk, Path(str(cfg.get(
+        "storage", "audio_dir", default="~/Otis/audio"))).expanduser()))
+    calendar = _guarded("Calendar", check_calendar_accounts, cfg)
+    checks += calendar if isinstance(calendar, list) else [calendar]
     return checks
 
 
