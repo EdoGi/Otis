@@ -46,6 +46,9 @@ class NotificationType(StrEnum):
     SETTING_SAVED = "setting_saved"
     #: Otis.app was opened while Otis was already running.
     ALREADY_RUNNING = "already_running"
+    #: The answer to a user-initiated check or repair (Fix System Audio…,
+    #: Reconnect Calendar…) — the job modal alerts used to do.
+    STATUS = "status"
     ERROR = "error"
 
 

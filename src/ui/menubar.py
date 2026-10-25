@@ -134,6 +134,57 @@ __all__ = [
 ]
 
 
+#: Where 'Fix System Audio…' sends the user when the output bypasses BlackHole.
+SOUND_SETTINGS_URL = "x-apple.systempreferences:com.apple.Sound-Settings.extension"
+
+
+def _start_timer(timer: Any) -> None:
+    """Start a rumps.Timer so it also fires while a modal dialog is open.
+
+    rumps adds every Timer in NSDefaultRunLoopMode only, and NSAlert.runModal
+    runs the loop in NSModalPanelRunLoopMode, so while any alert was open the
+    100 ms drain, the schedule tick and the duration tick all stopped (probe:
+    11 fires per second -> 0). An unanswered 'Fix System Audio…' alert froze an
+    instance on 2026-09-10 — for three days — and again on 2026-10-14.
+
+    Event-tracking mode (a menu held open) is left out on purpose: the drain
+    rebuilds Status submenu items, which must not change under an open menu.
+    """
+    was_running = bool(getattr(timer, "is_alive", lambda: False)())
+    timer.start()
+    if was_running:
+        return
+    try:
+        from AppKit import NSModalPanelRunLoopMode
+        from Foundation import NSRunLoop
+
+        NSRunLoop.currentRunLoop().addTimer_forMode_(timer._nstimer, NSModalPanelRunLoopMode)
+    except Exception:  # pragma: no cover (no AppKit, or rumps internals changed)
+        logger.debug("Timer stays default-mode only", exc_info=True)
+
+
+def _alert(**kwargs: Any) -> Any:
+    """rumps.alert, brought to the front first.
+
+    Otis is an accessory app that rumps activates once, at launch, so a later
+    alert could open behind the frontmost window — invisible, while it blocked
+    the menu. Only deliberate confirmations still use one.
+    """
+    import rumps
+
+    try:
+        from AppKit import NSApplication
+
+        nsapp = NSApplication.sharedApplication()
+        if hasattr(nsapp, "activate"):
+            nsapp.activate()
+        else:  # pragma: no cover (macOS < 14)
+            nsapp.activateIgnoringOtherApps_(True)
+    except Exception:  # pragma: no cover
+        logger.debug("Could not activate before an alert", exc_info=True)
+    return rumps.alert(**kwargs)
+
+
 class MenuBarApp(SettingsMenuMixin):
     """The thing you see in the menu bar.
 
@@ -364,8 +415,8 @@ class MenuBarApp(SettingsMenuMixin):
         self._timer_duration = rumps.Timer(self._on_duration_tick, DURATION_INTERVAL)
         self._timer_schedule = rumps.Timer(self._on_schedule_tick, SCHEDULE_CHECK_INTERVAL)
 
-        self._timer_drain.start()
-        self._timer_schedule.start()
+        _start_timer(self._timer_drain)
+        _start_timer(self._timer_schedule)
         # Blink + duration are started on demand when entering DETECTED / RECORDING.
 
         return app
@@ -546,7 +597,7 @@ class MenuBarApp(SettingsMenuMixin):
         elif recorder.state == RecorderState.RECORDING and ui_state == UiState.PAUSED:
             logger.info("Recorder resumed itself (system wake); updating UI.")
             self._set_state(UiState.RECORDING)
-            self._timer_duration.start()
+            _start_timer(self._timer_duration)
 
     def _handle_event(self, event_type: str, payload: Any) -> None:
         # Background detector signals must never demote the UI out of an
@@ -698,7 +749,7 @@ class MenuBarApp(SettingsMenuMixin):
                 return
             self._recorder.resume()
         self._set_state(UiState.RECORDING)
-        self._timer_duration.start()
+        _start_timer(self._timer_duration)
 
     def _on_stop_clicked(self, _sender: Any) -> None:
         self._do_stop_and_transcribe()
@@ -716,8 +767,7 @@ class MenuBarApp(SettingsMenuMixin):
         self._open_in_finder(path)
 
     def _on_about(self, _sender: Any) -> None:
-        import rumps
-        rumps.alert(
+        _alert(
             title="About Otis",
             message="Otis — local macOS meeting transcription.\n\n"
                     "Mic + system audio recording, on-device Whisper "
@@ -752,7 +802,7 @@ class MenuBarApp(SettingsMenuMixin):
                     "transcribes. Nothing is running — it is saved and will "
                     "resume next launch. Quit?"
                 )
-            response = rumps.alert(
+            response = _alert(
                 title="Transcription pending",
                 message=message,
                 ok="Quit anyway",
@@ -927,7 +977,7 @@ class MenuBarApp(SettingsMenuMixin):
     def _start_blink(self) -> None:
         self._blink_phase = 0
         if not self._timer_blink.is_alive():
-            self._timer_blink.start()
+            _start_timer(self._timer_blink)
 
     def _stop_blink(self) -> None:
         if self._timer_blink.is_alive():
@@ -1059,17 +1109,17 @@ class MenuBarApp(SettingsMenuMixin):
             logger.exception("Could not set health badge")
 
     def _on_reconnect_calendar(self, _sender: Any) -> None:
-        """Run the interactive OAuth flow for every configured account."""
-        import rumps
+        """Run the interactive OAuth flow for every configured account.
 
-        rumps.alert(
-            title="Reconnect Calendar",
-            message=(
-                "Otis will open your browser to re-authorise Google Calendar.\n\n"
-                "If you have more than one account, run this from a terminal "
-                "instead:\n\n    ./scripts/setup_google_cal.sh\n"
-                "    ./scripts/setup_google_cal.sh work"
-            ),
+        This used to explain itself in a modal alert first, which stopped the
+        app's timers until it was dismissed (see _start_timer). A notification
+        says the same without blocking anything.
+        """
+        self._notifications.notify(
+            NotificationType.STATUS,
+            "Reconnecting Google Calendar",
+            "Your browser will open — sign in there, once per account.",
+            force=True,
         )
         threading.Thread(
             target=self._run_calendar_reauth, name="otis-calendar-reauth", daemon=True
@@ -1100,14 +1150,39 @@ class MenuBarApp(SettingsMenuMixin):
         )
 
     def _on_fix_audio(self, _sender: Any) -> None:
-        """Explain exactly what's wrong with system-audio routing right now."""
-        import rumps
+        """Re-check system-audio routing, show the result, and open the fix.
 
-        from src.audio.blackhole_check import check_output_routing
+        This used to explain the result in a modal alert and only update the
+        panel after it was dismissed. Twice that alert was never answered and
+        the instance stayed frozen (see _start_timer). Now the panel repaints
+        at once, one notification carries the explanation, and the settings
+        that fix the problem open.
+        """
+        from src.audio.blackhole_check import RoutingState, check_output_routing
 
         status = check_output_routing()
-        rumps.alert(title="System audio", message=status.message())
+        before = self._health.get(SYSTEM_AUDIO)
         self._report_audio_routing(status)
+        after = self._health.get(SYSTEM_AUDIO)
+        # Repaint now rather than on the next 100 ms tick. A state change
+        # also raises its own "problem"/"recovered" toast in the drain.
+        self._drain_main_queue(None)
+
+        toasted_by_registry = (
+            after is not None
+            and (before.state if before else HealthState.UNSET) is not after.state
+            and after.state is not HealthState.UNKNOWN
+            and not (before is None and after.state is HealthState.OK)
+        )
+        if not toasted_by_registry:
+            self._notifications.notify(
+                NotificationType.STATUS, "System audio", status.message(), force=True,
+            )
+
+        if status.state is RoutingState.NOT_ROUTED:
+            self._open_url(SOUND_SETTINGS_URL)
+        elif status.state is RoutingState.INAUDIBLE:
+            self._open_app("Audio MIDI Setup")
 
     def _report_audio_routing(self, status: Any) -> None:
         """Fold a routing check result into the health registry."""
@@ -1496,7 +1571,7 @@ class MenuBarApp(SettingsMenuMixin):
             logger.exception("Detector user_started_recording raised")
         self._stop_blink()
         self._set_state(UiState.RECORDING)
-        self._timer_duration.start()
+        _start_timer(self._timer_duration)
         self._notifications.notify(
             NotificationType.RECORDING_STARTED,
             "Recording started",
@@ -1802,6 +1877,14 @@ class MenuBarApp(SettingsMenuMixin):
             webbrowser.open(url)
         except Exception:
             logger.exception("Could not open URL %s", url)
+
+    @staticmethod
+    def _open_app(name: str) -> None:
+        try:
+            import subprocess
+            subprocess.Popen(["open", "-a", name])
+        except Exception:
+            logger.exception("Could not open %s", name)
 
     @staticmethod
     def _open_in_finder(path: Path) -> None:
